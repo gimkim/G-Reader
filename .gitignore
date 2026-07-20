@@ -1,0 +1,12 @@
+.vs/
+bin/
+obj/
+*.user
+*.suo
+*.tmp
+*.log
+
+# Local build outputs and preserved binary snapshots
+/release/
+/release-g-reader/
+/versions/
