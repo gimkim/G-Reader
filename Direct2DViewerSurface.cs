@@ -23,6 +23,13 @@ internal sealed class Direct2DViewerSurface : Control
         public LinkedListNode<Bitmap> LruNode { get; } = lruNode;
     }
 
+    private sealed class ZoomDetailLayer(Bitmap source, ID2D1Bitmap bitmap, Rectangle bounds)
+    {
+        public Bitmap Source { get; } = source;
+        public ID2D1Bitmap Bitmap { get; } = bitmap;
+        public Rectangle Bounds { get; set; } = bounds;
+    }
+
     private const long GpuCacheLimitBytes = 512L * 1024 * 1024;
     private const long GpuCleanupHeadroomBytes = 128L * 1024 * 1024;
     private readonly ID2D1Factory _factory;
@@ -33,8 +40,12 @@ internal sealed class Direct2DViewerSurface : Control
     private ID2D1HwndRenderTarget? _renderTarget;
     private ID2D1Bitmap? _leftBitmap;
     private ID2D1Bitmap? _rightBitmap;
+    private ID2D1Bitmap? _zoomBaseBitmap;
+    private readonly List<ZoomDetailLayer> _zoomDetailLayers = [];
     private Rectangle _leftBounds;
     private Rectangle _rightBounds;
+    private Rectangle _zoomBaseBounds;
+    private bool _zoomMode;
     private long _gpuCacheBytes;
     private System.Drawing.Color _backgroundColor = System.Drawing.Color.FromArgb(30, 32, 38);
 
@@ -54,7 +65,9 @@ internal sealed class Direct2DViewerSurface : Control
         SetStyle(ControlStyles.AllPaintingInWmPaint |
                  ControlStyles.UserPaint |
                  ControlStyles.Opaque |
-                 ControlStyles.ResizeRedraw, true);
+                 ControlStyles.ResizeRedraw |
+                 ControlStyles.StandardClick |
+                 ControlStyles.StandardDoubleClick, true);
         TabStop = false;
         _factory = D2D1CreateFactory<ID2D1Factory>(FactoryType.SingleThreaded, DebugLevel.None);
         _gpuTrimTimer.Tick += (_, _) =>
@@ -85,6 +98,68 @@ internal sealed class Direct2DViewerSurface : Control
     {
         _leftBounds = leftBounds;
         _rightBounds = rightBounds;
+        DrawFrame();
+    }
+
+    public void PresentAnimatedPage(bool rightPage, Bitmap frame)
+    {
+        EnsureRenderTarget();
+        var bitmap = GetOrCreateBitmap(frame);
+        if (rightPage) _rightBitmap = bitmap;
+        else _leftBitmap = bitmap;
+        DrawFrame();
+    }
+
+    public void BeginZoom(bool useRightPage, Rectangle baseBounds)
+    {
+        _zoomMode = true;
+        _zoomBaseBitmap = useRightPage ? _rightBitmap : _leftBitmap;
+        _zoomBaseBounds = baseBounds;
+        _zoomDetailLayers.Clear();
+        DrawFrame();
+    }
+
+    public void UpdateZoomLayout(Rectangle baseBounds, bool clearDetail)
+    {
+        _zoomBaseBounds = baseBounds;
+        if (clearDetail)
+            _zoomDetailLayers.Clear();
+        DrawFrame();
+    }
+
+    public void PanZoomLayout(Rectangle baseBounds, Point detailOffset)
+    {
+        _zoomBaseBounds = baseBounds;
+        foreach (var layer in _zoomDetailLayers)
+        {
+            var bounds = layer.Bounds;
+            bounds.Offset(detailOffset);
+            layer.Bounds = bounds;
+        }
+        DrawFrame();
+    }
+
+    public void AddZoomDetail(Bitmap detail, Rectangle bounds)
+    {
+        if (!_zoomMode) return;
+        if (GetOrCreateBitmap(detail) is not { } bitmap) return;
+        _zoomDetailLayers.Add(new ZoomDetailLayer(detail, bitmap, bounds));
+        DrawFrame();
+    }
+
+    public void RemoveZoomDetail(Bitmap detail)
+    {
+        _zoomDetailLayers.RemoveAll(layer => ReferenceEquals(layer.Source, detail));
+    }
+
+    public void ClearZoomDetails() => _zoomDetailLayers.Clear();
+
+    public void EndZoom()
+    {
+        _zoomMode = false;
+        _zoomBaseBitmap = null;
+        _zoomDetailLayers.Clear();
+        _zoomBaseBounds = Rectangle.Empty;
         DrawFrame();
     }
 
@@ -191,8 +266,13 @@ internal sealed class Direct2DViewerSurface : Control
     {
         if (_gpuCacheBytes <= GpuCacheLimitBytes) return;
         var protectedItems = 0;
+        var disposedItems = 0;
+        long releasedBytes = 0;
+        const int maximumItemsPerTick = 8;
+        const long maximumBytesPerTick = 64L * 1024 * 1024;
         while (_gpuCacheBytes > GpuCacheLimitBytes &&
-               _gpuLru.First is { } oldest && protectedItems < _gpuLru.Count)
+               _gpuLru.First is { } oldest && protectedItems < _gpuLru.Count &&
+               disposedItems < maximumItemsPerTick && releasedBytes < maximumBytesPerTick)
         {
             var source = oldest.Value;
             if (!_gpuCache.TryGetValue(source, out var item))
@@ -201,7 +281,9 @@ internal sealed class Direct2DViewerSurface : Control
                 continue;
             }
             if (ReferenceEquals(item.Bitmap, _leftBitmap) ||
-                ReferenceEquals(item.Bitmap, _rightBitmap))
+                ReferenceEquals(item.Bitmap, _rightBitmap) ||
+                ReferenceEquals(item.Bitmap, _zoomBaseBitmap) ||
+                _zoomDetailLayers.Any(layer => ReferenceEquals(item.Bitmap, layer.Bitmap)))
             {
                 _gpuLru.Remove(oldest);
                 _gpuLru.AddLast(oldest);
@@ -211,8 +293,12 @@ internal sealed class Direct2DViewerSurface : Control
             _gpuLru.Remove(oldest);
             _gpuCache.Remove(source);
             _gpuCacheBytes -= item.Bytes;
+            disposedItems++;
+            releasedBytes += item.Bytes;
             item.Bitmap.Dispose();
         }
+        if (_gpuCacheBytes > GpuCacheLimitBytes)
+            _gpuTrimTimer.Start();
     }
 
     private void DrawFrame()
@@ -229,8 +315,17 @@ internal sealed class Direct2DViewerSurface : Control
                 _backgroundColor.G / 255f,
                 _backgroundColor.B / 255f,
                 1f));
-            DrawBitmap(_leftBitmap, _leftBounds);
-            DrawBitmap(_rightBitmap, _rightBounds);
+            if (_zoomMode)
+            {
+                DrawBitmap(_zoomBaseBitmap, _zoomBaseBounds);
+                foreach (var layer in _zoomDetailLayers)
+                    DrawBitmap(layer.Bitmap, layer.Bounds);
+            }
+            else
+            {
+                DrawBitmap(_leftBitmap, _leftBounds);
+                DrawBitmap(_rightBitmap, _rightBounds);
+            }
             var result = _renderTarget.EndDraw();
             if (result.Failure) DiscardDeviceResources();
         }
@@ -260,6 +355,8 @@ internal sealed class Direct2DViewerSurface : Control
         _gpuTrimTimer.Stop();
         _leftBitmap = null;
         _rightBitmap = null;
+        _zoomBaseBitmap = null;
+        _zoomDetailLayers.Clear();
         foreach (var item in _gpuCache.Values) item.Bitmap.Dispose();
         _gpuCache.Clear();
         _gpuLru.Clear();

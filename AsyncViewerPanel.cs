@@ -17,17 +17,45 @@ internal sealed class AsyncViewerPanel : Panel
         public long Sequence { get; set; } = sequence;
         public long Bytes { get; } = (long)bitmap.Width * bitmap.Height * 4;
         public int ActiveReaders { get; set; }
+        public bool Retired { get; set; }
+    }
+    private sealed class ZoomDetailPatch(Bitmap bitmap, Rectangle bounds)
+    {
+        public Bitmap Bitmap { get; } = bitmap;
+        public Rectangle Bounds { get; set; } = bounds;
+    }
+    private readonly record struct ZoomCropRequest(Rectangle Source, Rectangle Destination);
+    private sealed class ActiveAnimation(AnimationFrameSet frames, bool rightPage)
+    {
+        public AnimationFrameSet Frames { get; } = frames;
+        public bool RightPage { get; set; } = rightPage;
+        public int FrameIndex { get; set; }
+        public long NextFrameAt { get; set; }
     }
 
     private readonly PictureBox _left = CreatePictureBox();
     private readonly PictureBox _right = CreatePictureBox();
     private readonly Direct2DViewerSurface _direct2DSurface = new() { Dock = DockStyle.Fill };
+    private readonly Label _loadingPlaceholder = new()
+    {
+        Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleCenter,
+        BackColor = Color.FromArgb(30, 32, 38), ForeColor = Color.FromArgb(190, 198, 212),
+        Font = new Font("Segoe UI Semibold", 13f), Visible = false
+    };
     private readonly System.Windows.Forms.Timer _resizeDebounce = new() { Interval = 140 };
+    private readonly System.Windows.Forms.Timer _zoomRenderDebounce = new() { Interval = 35 };
+    private readonly System.Windows.Forms.Timer _zoomTransitionTimer = new() { Interval = 15 };
+    private readonly System.Windows.Forms.Timer _animationTimer = new();
     private readonly object _renderCacheGate = new();
+    private readonly object _previewCacheGate = new();
     private readonly object _sourceLeaseGate = new();
     private readonly Dictionary<RenderKey, RenderCacheItem> _renderCache = [];
     private readonly Dictionary<RenderLookupKey, RenderKey> _renderLookup = [];
+    private readonly Dictionary<RenderKey, RenderCacheItem> _previewCache = [];
+    private readonly Dictionary<RenderLookupKey, RenderKey> _previewLookup = [];
     private readonly System.Collections.Concurrent.ConcurrentDictionary<int, long> _renderBytesByPage = [];
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(long Context, int Page), long>
+        _renderBytesByContextPage = [];
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(long Context, int Page), int> _cachedPageCounts = [];
     private readonly Dictionary<Image, int> _sourceReaders = [];
     private readonly HashSet<Image> _retiredSources = [];
@@ -43,13 +71,47 @@ internal sealed class AsyncViewerPanel : Panel
     private int _renderVersion;
     private long _renderCacheSequence;
     private long _renderCacheBytes;
+    private long _previewCacheBytes;
+    private long _previewCacheLimitBytes;
     private long _renderContextVersion = 1;
     private long _displayedContextVersion;
+    private bool _displayedPreview;
     private Size _lastRenderControlSize;
     private float _zoom = 1f;
     private int _lanczosQuality = 1;
+    private CancellationTokenSource? _zoomRenderCancellation;
+    private readonly List<ZoomDetailPatch> _zoomDetailPatches = [];
+    private readonly Dictionary<int, ActiveAnimation> _activeAnimations = [];
+    private Rectangle _zoomBaseBounds;
+    private Size _zoomOriginalSize;
+    private Point _zoomPanLast;
+    private Point _pendingZoomAnchor;
+    private int _zoomPageIndex = -1;
+    private int _zoomInteractionVersion;
+    private int _reportedZoomPercent = -1;
+    private float _zoomScale = 1f;
+    private float _zoomTransitionTargetScale = 1f;
+    private Point _zoomTransitionAnchor;
+    private double _zoomTransitionSourceX;
+    private double _zoomTransitionSourceY;
+    private Rectangle _zoomTransitionFitBounds;
+    private long _zoomTransitionLastTick;
+    private bool _zoomTransitionExitToFit;
+    private double _pendingEntryZoomFactor = 1d;
+    private float? _pendingEntryAbsoluteScale;
+    private bool _zoomMode;
+    private bool _zoomUseRightPage;
+    private bool _zoomPanning;
+    private bool _zoomEntering;
 
     public event EventHandler<bool>? RenderingStateChanged;
+    public event EventHandler? ViewportRenderContextChanged;
+    public event EventHandler<bool>? ZoomModeChanged;
+    public event EventHandler<int>? ZoomPercentChanged;
+
+    public Func<int, CancellationToken, Task<Size>>? ZoomSourceSizeRequested { get; set; }
+    public Func<int, Rectangle, Size, bool, CancellationToken, Task<Bitmap>>?
+        ZoomCropRequested { get; set; }
 
     public bool FitToScreen { get; set; } = true;
     public bool JapaneseMode { get; set; }
@@ -61,6 +123,9 @@ internal sealed class AsyncViewerPanel : Panel
 
     public Image? CurrentImage => _first;
     public long RenderCacheBytes => Volatile.Read(ref _renderCacheBytes);
+    public long PreviewCacheBytes => Volatile.Read(ref _previewCacheBytes);
+    public bool IsShowingPreview => _displayedPreview;
+    public bool IsZoomMode => _zoomMode;
 
     public int LanczosQuality => _lanczosQuality;
 
@@ -71,30 +136,129 @@ internal sealed class AsyncViewerPanel : Panel
         {
             BackColor = value;
             _direct2DSurface.ViewerBackgroundColor = value;
+            _loadingPlaceholder.BackColor = value;
         }
     }
 
-    public void ApplyReaderSettings(int lanczosQuality, Color backgroundColor)
+    public void ApplyReaderSettings(
+        int lanczosQuality, Color backgroundColor, long previewCacheLimitBytes)
     {
         var quality = Math.Clamp(lanczosQuality, 0, 3);
         var qualityChanged = _lanczosQuality != quality;
         _lanczosQuality = quality;
+        Volatile.Write(ref _previewCacheLimitBytes, Math.Max(0, previewCacheLimitBytes));
         ViewerBackgroundColor = backgroundColor;
         if (!qualityChanged) return;
         _renderContextVersion++;
         ClearRenderCache();
+        ClearPreviewCache();
         BeginRender();
     }
 
     public long GetDirectionalRenderBytes(int center, bool ahead)
-        => _renderBytesByPage
-            .Where(pair => ahead ? pair.Key >= center : pair.Key < center)
+    {
+        var context = Volatile.Read(ref _renderContextVersion);
+        return _renderBytesByContextPage
+            .Where(pair => pair.Key.Context == context &&
+                (ahead ? pair.Key.Page >= center : pair.Key.Page < center))
             .Sum(pair => pair.Value);
+    }
 
     public void TrimRenderCacheDirectional(int center, long aheadBytes, long behindBytes)
     {
         TrimRenderSide(center, true, aheadBytes);
         TrimRenderSide(center, false, behindBytes);
+    }
+
+    public void TrimPreviewCache(int center, long maximumBytes)
+    {
+        if (PreviewCacheBytes <= maximumBytes) return;
+        KeyValuePair<RenderKey, RenderCacheItem>[] candidates;
+        lock (_previewCacheGate)
+            candidates = _previewCache.ToArray();
+
+        // Preview eviction has its own lock and quota. Keep the pages nearest to
+        // the current position without touching the high-quality render cache.
+        Array.Sort(candidates, (left, right) =>
+            Math.Abs(right.Key.PageIndex - center).CompareTo(
+                Math.Abs(left.Key.PageIndex - center)));
+        List<Bitmap> evicted = [];
+        const int batchSize = 24;
+        for (var offset = 0; offset < candidates.Length &&
+            PreviewCacheBytes > maximumBytes; offset += batchSize)
+        {
+            lock (_previewCacheGate)
+            {
+                foreach (var candidate in candidates.Skip(offset).Take(batchSize))
+                {
+                    if (_previewCacheBytes <= maximumBytes) break;
+                    if (!_previewCache.TryGetValue(candidate.Key, out var item) ||
+                        item.ActiveReaders != 0 || !_previewCache.Remove(candidate.Key)) continue;
+                    _previewCacheBytes -= item.Bytes;
+                    _previewLookup.Remove(new RenderLookupKey(
+                        candidate.Key.PageIndex, candidate.Key.PageKey,
+                        candidate.Key.VisiblePageCount, candidate.Key.ContextVersion));
+                    evicted.Add(item.Bitmap);
+                }
+            }
+            Thread.Yield();
+        }
+        foreach (var bitmap in evicted) lock (bitmap) bitmap.Dispose();
+    }
+
+    public Task DiscardStaleRenderContextsAsync()
+    {
+        var currentContext = Volatile.Read(ref _renderContextVersion);
+        return Task.Run(() =>
+        {
+            List<Bitmap> evicted = [];
+            KeyValuePair<RenderKey, RenderCacheItem>[] renderCandidates;
+            lock (_renderCacheGate)
+                renderCandidates = _renderCache
+                    .Where(pair => pair.Key.ContextVersion != currentContext).ToArray();
+            const int batchSize = 24;
+            for (var offset = 0; offset < renderCandidates.Length; offset += batchSize)
+            {
+                lock (_renderCacheGate)
+                {
+                    foreach (var candidate in renderCandidates.Skip(offset).Take(batchSize))
+                    {
+                        if (candidate.Value.ActiveReaders != 0 ||
+                            !_renderCache.Remove(candidate.Key)) continue;
+                        _renderCacheBytes -= candidate.Value.Bytes;
+                        SubtractRenderStats(candidate.Key, candidate.Value.Bytes);
+                        _renderLookup.Remove(new RenderLookupKey(
+                            candidate.Key.PageIndex, candidate.Key.PageKey,
+                            candidate.Key.VisiblePageCount, candidate.Key.ContextVersion));
+                        evicted.Add(candidate.Value.Bitmap);
+                    }
+                }
+                Thread.Yield();
+            }
+
+            KeyValuePair<RenderKey, RenderCacheItem>[] previewCandidates;
+            lock (_previewCacheGate)
+                previewCandidates = _previewCache
+                    .Where(pair => pair.Key.ContextVersion != currentContext).ToArray();
+            for (var offset = 0; offset < previewCandidates.Length; offset += batchSize)
+            {
+                lock (_previewCacheGate)
+                {
+                    foreach (var candidate in previewCandidates.Skip(offset).Take(batchSize))
+                    {
+                        if (candidate.Value.ActiveReaders != 0 ||
+                            !_previewCache.Remove(candidate.Key)) continue;
+                        _previewCacheBytes -= candidate.Value.Bytes;
+                        _previewLookup.Remove(new RenderLookupKey(
+                            candidate.Key.PageIndex, candidate.Key.PageKey,
+                            candidate.Key.VisiblePageCount, candidate.Key.ContextVersion));
+                        evicted.Add(candidate.Value.Bitmap);
+                    }
+                }
+                Thread.Yield();
+            }
+            foreach (var bitmap in evicted) lock (bitmap) bitmap.Dispose();
+        });
     }
 
     private void TrimRenderSide(int center, bool ahead, long maximumBytes)
@@ -114,21 +278,26 @@ internal sealed class AsyncViewerPanel : Panel
             : left.Key.PageIndex.CompareTo(right.Key.PageIndex));
         List<Bitmap> evicted = [];
         var sideBytes = GetDirectionalRenderBytes(center, ahead);
-        lock (_renderCacheGate)
+        const int batchSize = 24;
+        for (var offset = 0; offset < candidates.Length && sideBytes > maximumBytes; offset += batchSize)
         {
-            foreach (var candidate in candidates)
+            lock (_renderCacheGate)
             {
-                if (sideBytes <= maximumBytes) break;
-                if (!_renderCache.TryGetValue(candidate.Key, out var item) ||
-                    item.ActiveReaders != 0 || !_renderCache.Remove(candidate.Key)) continue;
-                sideBytes -= item.Bytes;
-                _renderCacheBytes -= item.Bytes;
-                SubtractRenderStats(candidate.Key, item.Bytes);
-                _renderLookup.Remove(new RenderLookupKey(
-                    candidate.Key.PageIndex, candidate.Key.PageKey,
-                    candidate.Key.VisiblePageCount, candidate.Key.ContextVersion));
-                evicted.Add(item.Bitmap);
+                foreach (var candidate in candidates.Skip(offset).Take(batchSize))
+                {
+                    if (sideBytes <= maximumBytes) break;
+                    if (!_renderCache.TryGetValue(candidate.Key, out var item) ||
+                        item.ActiveReaders != 0 || !_renderCache.Remove(candidate.Key)) continue;
+                    sideBytes -= item.Bytes;
+                    _renderCacheBytes -= item.Bytes;
+                    SubtractRenderStats(candidate.Key, item.Bytes);
+                    _renderLookup.Remove(new RenderLookupKey(
+                        candidate.Key.PageIndex, candidate.Key.PageKey,
+                        candidate.Key.VisiblePageCount, candidate.Key.ContextVersion));
+                    evicted.Add(item.Bitmap);
+                }
             }
+            Thread.Yield();
         }
         foreach (var bitmap in evicted) lock (bitmap) bitmap.Dispose();
     }
@@ -140,7 +309,13 @@ internal sealed class AsyncViewerPanel : Panel
         DoubleBuffered = true;
         Controls.AddRange([_left, _right]);
         Controls.Add(_direct2DSurface);
+        Controls.Add(_loadingPlaceholder);
         _direct2DSurface.BringToFront();
+        _direct2DSurface.MouseDoubleClick += OnViewerMouseDoubleClick;
+        _direct2DSurface.MouseDown += OnViewerMouseDown;
+        _direct2DSurface.MouseMove += OnViewerMouseMove;
+        _direct2DSurface.MouseUp += OnViewerMouseUp;
+        _direct2DSurface.MouseCaptureChanged += OnViewerMouseCaptureChanged;
         AccessibleName = "Hardware-accelerated Direct2D comic viewer";
         Scroll += (_, _) => _direct2DSurface.UpdateLayout(_left.Bounds, _right.Bounds);
         _lastRenderControlSize = Size;
@@ -151,6 +326,18 @@ internal sealed class AsyncViewerPanel : Panel
             // every pre-rendered page.
             if (Size == _lastRenderControlSize) return;
             _lastRenderControlSize = Size;
+            if (_zoomMode)
+            {
+                StopZoomTransition(scheduleDetail: false);
+                _zoomInteractionVersion++;
+                CancelAndDisposeZoomRender();
+                ClampZoomBounds();
+                _direct2DSurface.UpdateZoomLayout(_zoomBaseBounds, clearDetail: true);
+                ClearZoomDetail();
+                ScheduleZoomDetailRender();
+                return;
+            }
+            RelayoutDisplayedFrame();
             _resizeDebounce.Stop();
             _resizeDebounce.Start();
         };
@@ -159,7 +346,15 @@ internal sealed class AsyncViewerPanel : Panel
             _resizeDebounce.Stop();
             _renderContextVersion++;
             BeginRender();
+            ViewportRenderContextChanged?.Invoke(this, EventArgs.Empty);
         };
+        _zoomRenderDebounce.Tick += (_, _) =>
+        {
+            _zoomRenderDebounce.Stop();
+            _ = RenderZoomDetailAsync();
+        };
+        _zoomTransitionTimer.Tick += (_, _) => AdvanceZoomTransition();
+        _animationTimer.Tick += (_, _) => AdvanceAnimations();
     }
 
     public void SetPages(
@@ -178,24 +373,114 @@ internal sealed class AsyncViewerPanel : Panel
         BeginRender();
     }
 
+    public void SetAnimationFrames(int pageIndex, AnimationFrameSet frames)
+    {
+        if (frames.Frames.Length <= 1 || frames.Delays.Length != frames.Frames.Length ||
+            (pageIndex != _firstIndex && pageIndex != _secondIndex))
+        {
+            DisposeAnimationFramesInBackground(frames);
+            return;
+        }
+        if (_activeAnimations.Remove(pageIndex, out var previous))
+            DisposeAnimationFramesInBackground(previous.Frames);
+        var leftPageIndex = JapaneseMode ? _secondIndex : _firstIndex;
+        var animation = new ActiveAnimation(frames, pageIndex != leftPageIndex)
+        {
+            NextFrameAt = Environment.TickCount64 + frames.Delays[0]
+        };
+        _activeAnimations[pageIndex] = animation;
+        _direct2DSurface.PresentAnimatedPage(animation.RightPage, frames.Frames[0]);
+        ScheduleAnimationTimer();
+    }
+
+    public void StopAnimations()
+    {
+        if (_activeAnimations.Count == 0)
+        {
+            if (_animationTimer.Enabled) _animationTimer.Stop();
+            return;
+        }
+        _animationTimer.Stop();
+        var animations = _activeAnimations.Values.ToArray();
+        _activeAnimations.Clear();
+        foreach (var animation in animations)
+            DisposeAnimationFramesInBackground(animation.Frames);
+    }
+
+    public void PresentImmediatePreview(
+        Bitmap first, Bitmap? second, int firstIndex, int secondIndex)
+    {
+        CancelRender();
+        _renderVersion++;
+        RetireSource(_first);
+        RetireSource(_second);
+        _first = null;
+        _second = null;
+        _firstKey = null;
+        _secondKey = null;
+        _firstIndex = firstIndex;
+        _secondIndex = secondIndex;
+
+        var pages = JapaneseMode
+            ? new Bitmap?[] { second, first }
+            : [first, second];
+        const int gap = 10;
+        var availableWidth = Math.Max(100, ClientSize.Width - gap * 3);
+        var availableHeight = Math.Max(100, ClientSize.Height - gap * 2);
+        var visible = pages.Count(page => page is not null);
+        var targetWidth = visible == 2 ? availableWidth / 2 : availableWidth;
+        var sizes = pages.Select(page => page is null
+            ? Size.Empty
+            : CalculateSize(page, targetWidth, availableHeight, true, 1f)).ToArray();
+        ApplyRendered(pages[0], pages[1], sizes, availableHeight, gap);
+        _displayedPreview = true;
+    }
+
     public bool TryPresentCachedPages(
         string firstKey, string? secondKey, int firstIndex, int secondIndex)
     {
         var visiblePageCount = secondIndex >= 0 ? 2 : 1;
         RenderCacheItem? firstItem;
         RenderCacheItem? secondItem;
+        var firstIsPreview = false;
+        var secondIsPreview = false;
         lock (_renderCacheGate)
         {
             firstItem = AcquireCurrentRender(firstIndex, firstKey, visiblePageCount);
             secondItem = secondIndex >= 0 && secondKey is not null
                 ? AcquireCurrentRender(secondIndex, secondKey, visiblePageCount)
                 : null;
-            if (firstItem is null || (secondIndex >= 0 && secondItem is null))
+        }
+        if (firstItem is null || (secondIndex >= 0 && secondItem is null))
+        {
+            lock (_previewCacheGate)
             {
-                ReleaseRender(firstItem);
-                ReleaseRender(secondItem);
-                return false;
+                if (firstItem is null)
+                {
+                    firstItem = AcquireCurrentPreview(firstIndex, firstKey, visiblePageCount);
+                    firstIsPreview = firstItem is not null;
+                }
+                if (secondIndex >= 0 && secondItem is null && secondKey is not null)
+                {
+                    secondItem = AcquireCurrentPreview(secondIndex, secondKey, visiblePageCount);
+                    secondIsPreview = secondItem is not null;
+                }
             }
+        }
+        if (firstItem is null || (secondIndex >= 0 && secondItem is null))
+        {
+            if (firstIsPreview || secondIsPreview)
+                lock (_previewCacheGate)
+                {
+                    if (firstIsPreview) ReleaseCacheItem(firstItem);
+                    if (secondIsPreview) ReleaseCacheItem(secondItem);
+                }
+            lock (_renderCacheGate)
+            {
+                if (!firstIsPreview) ReleaseCacheItem(firstItem);
+                if (!secondIsPreview) ReleaseCacheItem(secondItem);
+            }
+            return false;
         }
         try
         {
@@ -216,15 +501,22 @@ internal sealed class AsyncViewerPanel : Panel
             const int gap = 10;
             var availableHeight = Math.Max(100, ClientSize.Height - gap * 2);
             ApplyRendered(rendered[0], rendered[1], sizes, availableHeight, gap, retainBitmaps: false);
+            _displayedPreview = firstIsPreview || secondIsPreview;
             RenderingStateChanged?.Invoke(this, false);
             return true;
         }
         finally
         {
+            if (firstIsPreview || secondIsPreview)
+                lock (_previewCacheGate)
+                {
+                    if (firstIsPreview) ReleaseCacheItem(firstItem);
+                    if (secondIsPreview) ReleaseCacheItem(secondItem);
+                }
             lock (_renderCacheGate)
             {
-                ReleaseRender(firstItem);
-                ReleaseRender(secondItem);
+                if (!firstIsPreview) ReleaseCacheItem(firstItem);
+                if (!secondIsPreview) ReleaseCacheItem(secondItem);
             }
         }
     }
@@ -242,7 +534,7 @@ internal sealed class AsyncViewerPanel : Panel
         RetireSource(_second);
         _first = first;
         _second = second;
-        if (_displayedContextVersion != _renderContextVersion) BeginRender();
+        if (_displayedPreview || _displayedContextVersion != _renderContextVersion) BeginRender();
     }
 
     public PreRenderContext CapturePreRenderContext() =>
@@ -255,6 +547,12 @@ internal sealed class AsyncViewerPanel : Panel
         lock (_renderCacheGate)
             return _renderLookup.TryGetValue(lookup, out var key) && _renderCache.ContainsKey(key);
     }
+
+    public HashSet<int> GetStaleCachedPages(long currentContextVersion) =>
+        _cachedPageCounts
+            .Where(pair => pair.Value > 0 && pair.Key.Context != currentContextVersion)
+            .Select(pair => pair.Key.Page)
+            .ToHashSet();
 
     public (int BehindStart, int AheadEnd) GetCachedPageRange(int center)
     {
@@ -273,6 +571,8 @@ internal sealed class AsyncViewerPanel : Panel
 
     public void ClearBookCache()
     {
+        StopAnimations();
+        ReturnToFit();
         CancelRender();
         _renderVersion++;
         RetireSource(_first);
@@ -283,13 +583,24 @@ internal sealed class AsyncViewerPanel : Panel
         _secondKey = null;
         _firstIndex = -1;
         _secondIndex = -1;
+        _displayedPreview = false;
+        _loadingPlaceholder.Visible = false;
         DisposeRendered();
         ClearRenderCache();
+        ClearPreviewCache();
         _left.Visible = false;
         _right.Visible = false;
         AutoScrollPosition = Point.Empty;
         AutoScrollMinSize = Size.Empty;
         Invalidate();
+    }
+
+    public void ShowLoadingPlaceholder(string text)
+    {
+        _loadingPlaceholder.Text = text;
+        _loadingPlaceholder.BackColor = BackColor;
+        _loadingPlaceholder.Visible = true;
+        _loadingPlaceholder.BringToFront();
     }
 
     public async Task PreRenderAsync(
@@ -309,9 +620,17 @@ internal sealed class AsyncViewerPanel : Panel
             pageIndex, pageKey, size.Width, size.Height, visiblePageCount, context.Version);
         if (ContainsRender(key)) return;
 
+        if (Volatile.Read(ref _previewCacheLimitBytes) > 0 && !ContainsPreview(key))
+        {
+            var preview = await RenderWorkScheduler.RunFastAsync(
+                threads => ResizeFastPreview(source, size, threads, cancellationToken),
+                cancellationToken);
+            if (preview is not null && !AddPreviewOwned(key, preview)) preview.Dispose();
+        }
+
         // The caller owns this source clone until the await completes, so another
         // full-size defensive copy only adds allocation pressure and GC pauses.
-        var rendered = await Task.Run(
+        var rendered = await RenderWorkScheduler.RunFullAsync(
             () => ResizeLanczosForPrecache(
                 source, size, context.LanczosQuality, cancellationToken), cancellationToken);
         if (rendered is null) return;
@@ -320,42 +639,706 @@ internal sealed class AsyncViewerPanel : Panel
         if (!AddRenderOwned(key, rendered)) rendered.Dispose();
     }
 
-    public void SwapReadingDirection() => BeginRender();
+    public async Task PreRenderEncodedJpegAsync(
+        int pageIndex, string pageKey, PageEntry page, int visiblePageCount,
+        int rotation, PreRenderContext context, bool generatePreview,
+        CancellationToken cancellationToken)
+    {
+        if (HasCachedRender(
+                pageIndex, pageKey, visiblePageCount, context.Version)) return;
+
+        if (generatePreview && Volatile.Read(ref _previewCacheLimitBytes) > 0)
+        {
+            var preview = await RenderWorkScheduler.RunFastAsync(
+                _ => EncodedJpegRenderer.RenderReader(
+                    page, context.ClientSize, visiblePageCount, rotation,
+                    context.LanczosQuality, fastPreview: true, cancellationToken),
+                cancellationToken).ConfigureAwait(false);
+            var previewKey = new RenderKey(
+                pageIndex, pageKey, preview.Bitmap.Width, preview.Bitmap.Height,
+                visiblePageCount, context.Version);
+            if (!AddPreviewOwned(previewKey, preview.Bitmap)) preview.Bitmap.Dispose();
+        }
+
+        var rendered = await RenderWorkScheduler.RunFullAsync(
+            () => EncodedJpegRenderer.RenderReader(
+                page, context.ClientSize, visiblePageCount, rotation,
+                context.LanczosQuality, fastPreview: false, cancellationToken),
+            cancellationToken).ConfigureAwait(false);
+        var renderKey = new RenderKey(
+            pageIndex, pageKey, rendered.Bitmap.Width, rendered.Bitmap.Height,
+            visiblePageCount, context.Version);
+        if (!AddRenderOwned(renderKey, rendered.Bitmap)) rendered.Bitmap.Dispose();
+    }
+
+    public void ZoomAtWheel(int delta, Point clientAnchor)
+    {
+        if (delta == 0) return;
+        var factor = Math.Pow(1.0015d, delta);
+        if (!_zoomMode)
+        {
+            _pendingEntryZoomFactor *= factor;
+            _pendingZoomAnchor = clientAnchor;
+            if (!_zoomEntering) _ = EnterZoomAsync(clientAnchor, fromFitWheel: true);
+            return;
+        }
+        ApplyZoomFactor(factor, clientAnchor);
+    }
+
+    public void ReturnToFit()
+    {
+        if (_zoomEntering)
+        {
+            _zoomInteractionVersion++;
+            _pendingEntryZoomFactor = 1d;
+            _pendingEntryAbsoluteScale = null;
+        }
+        ExitZoomMode();
+    }
+
+    private async void OnViewerMouseDoubleClick(object? sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left) return;
+        if (_zoomMode) StartReturnToFitTransition();
+        else await EnterZoomAsync(e.Location, fromFitWheel: false);
+    }
+
+    private async Task EnterZoomAsync(Point anchor, bool fromFitWheel)
+    {
+        if (_zoomEntering || _zoomMode || ZoomSourceSizeRequested is null) return;
+        if (!TryGetZoomPage(anchor, out var useRight, out var pageIndex, out var fitBounds)) return;
+        _zoomEntering = true;
+        var version = ++_zoomInteractionVersion;
+        using var cancellation = new CancellationTokenSource();
+        try
+        {
+            var originalSize = await ZoomSourceSizeRequested(pageIndex, cancellation.Token);
+            if (version != _zoomInteractionVersion || originalSize.Width <= 0 || originalSize.Height <= 0)
+                return;
+            anchor = fromFitWheel ? _pendingZoomAnchor : anchor;
+            if (!TryGetZoomPage(anchor, out useRight, out var currentPageIndex, out fitBounds) ||
+                currentPageIndex != pageIndex) return;
+            var fitScale = Math.Min(
+                (double)fitBounds.Width / originalSize.Width,
+                (double)fitBounds.Height / originalSize.Height);
+            var requestedScale = fromFitWheel
+                ? _pendingEntryAbsoluteScale ?? fitScale * _pendingEntryZoomFactor
+                : 1d;
+            _pendingEntryZoomFactor = 1d;
+            _pendingEntryAbsoluteScale = null;
+            _zoomOriginalSize = originalSize;
+            _zoomPageIndex = pageIndex;
+            _zoomUseRightPage = useRight;
+            var targetScale = (float)Math.Clamp(requestedScale, 0.05d, 8d);
+            _zoomScale = (float)Math.Clamp(fitScale, 0.05d, 8d);
+            var normalizedX = fitBounds.Width <= 0
+                ? 0.5d : Math.Clamp((double)(anchor.X - fitBounds.Left) / fitBounds.Width, 0d, 1d);
+            var normalizedY = fitBounds.Height <= 0
+                ? 0.5d : Math.Clamp((double)(anchor.Y - fitBounds.Top) / fitBounds.Height, 0d, 1d);
+            var width = Math.Max(1, (int)Math.Round(originalSize.Width * _zoomScale));
+            var height = Math.Max(1, (int)Math.Round(originalSize.Height * _zoomScale));
+            _zoomBaseBounds = new Rectangle(
+                anchor.X - (int)Math.Round(normalizedX * width),
+                anchor.Y - (int)Math.Round(normalizedY * height), width, height);
+            ClampZoomBounds();
+            FitToScreen = false;
+            _zoomMode = true;
+            ReportZoomPercent();
+            Cursor = Cursors.Hand;
+            _animationTimer.Stop();
+            CancelRender();
+            _direct2DSurface.BeginZoom(useRight, _zoomBaseBounds);
+            ZoomModeChanged?.Invoke(this, true);
+            if (Math.Abs(targetScale - _zoomScale) > 0.0001f)
+                StartZoomTransition(targetScale, anchor);
+            else
+                ScheduleZoomDetailRender();
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception exception)
+        {
+            System.Diagnostics.Debug.WriteLine($"Cannot enter zoom mode: {exception}");
+        }
+        finally
+        {
+            _zoomEntering = false;
+            if (!_zoomMode)
+            {
+                _pendingEntryZoomFactor = 1d;
+                _pendingEntryAbsoluteScale = null;
+            }
+        }
+    }
+
+    private void ExitZoomMode(bool notify = true)
+    {
+        if (!_zoomMode) return;
+        StopZoomTransition(scheduleDetail: false);
+        _zoomMode = false;
+        _zoomPanning = false;
+        _zoomPageIndex = -1;
+        _zoomInteractionVersion++;
+        FitToScreen = true;
+        _zoomRenderDebounce.Stop();
+        CancelAndDisposeZoomRender();
+        ClearZoomDetail();
+        _direct2DSurface.Capture = false;
+        _direct2DSurface.EndZoom();
+        Cursor = Cursors.Default;
+        RenderingStateChanged?.Invoke(this, false);
+        ScheduleAnimationTimer();
+        _reportedZoomPercent = -1;
+        ZoomPercentChanged?.Invoke(this, 0);
+        if (notify) ZoomModeChanged?.Invoke(this, false);
+    }
+
+    private void ApplyZoomFactor(double factor, Point anchor)
+    {
+        if (!_zoomMode || _zoomOriginalSize.Width <= 0 || _zoomOriginalSize.Height <= 0) return;
+        var basis = _zoomTransitionTimer.Enabled ? _zoomTransitionTargetScale : _zoomScale;
+        StartZoomTransition((float)Math.Clamp(basis * factor, 0.05d, 8d), anchor);
+    }
+
+    private void StartZoomTransition(float targetScale, Point anchor)
+    {
+        if (!_zoomMode || _zoomOriginalSize.Width <= 0 || _zoomOriginalSize.Height <= 0) return;
+        _zoomRenderDebounce.Stop();
+        _zoomInteractionVersion++;
+        CancelAndDisposeZoomRender();
+        RenderingStateChanged?.Invoke(this, false);
+        ClearZoomDetail();
+
+        _zoomTransitionAnchor = anchor;
+        _zoomTransitionExitToFit = false;
+        _zoomTransitionSourceX =
+            (anchor.X - _zoomBaseBounds.Left) / Math.Max(0.0001d, _zoomScale);
+        _zoomTransitionSourceY =
+            (anchor.Y - _zoomBaseBounds.Top) / Math.Max(0.0001d, _zoomScale);
+        _zoomTransitionTargetScale = Math.Clamp(targetScale, 0.05f, 8f);
+        _zoomTransitionLastTick = Environment.TickCount64;
+        if (Math.Abs(_zoomTransitionTargetScale - _zoomScale) <= 0.0001f)
+        {
+            ApplyZoomScaleFrame(_zoomTransitionTargetScale);
+            ScheduleZoomDetailRender();
+            return;
+        }
+        _zoomTransitionTimer.Start();
+    }
+
+    private void AdvanceZoomTransition()
+    {
+        if (!_zoomMode)
+        {
+            StopZoomTransition(scheduleDetail: false);
+            return;
+        }
+
+        var now = Environment.TickCount64;
+        var elapsed = Math.Clamp(now - _zoomTransitionLastTick, 1L, 50L);
+        _zoomTransitionLastTick = now;
+        // Time-based exponential easing remains smooth when the UI message pump
+        // occasionally delivers a frame late, and repeated wheel input simply
+        // extends the existing target instead of starting visible scale steps.
+        var blend = 1d - Math.Exp(-elapsed / 45d);
+        if (_zoomTransitionExitToFit)
+        {
+            var nextBounds = InterpolateRectangle(
+                _zoomBaseBounds, _zoomTransitionFitBounds, blend);
+            var finishedBounds = RectangleDistance(nextBounds, _zoomTransitionFitBounds) <= 2;
+            _zoomBaseBounds = finishedBounds ? _zoomTransitionFitBounds : nextBounds;
+            _zoomScale = _zoomBaseBounds.Width /
+                         (float)Math.Max(1, _zoomOriginalSize.Width);
+            ReportZoomPercent();
+            _direct2DSurface.UpdateZoomLayout(_zoomBaseBounds, clearDetail: false);
+            if (!finishedBounds) return;
+
+            _zoomTransitionTimer.Stop();
+            _zoomTransitionExitToFit = false;
+            ExitZoomMode();
+            return;
+        }
+
+        var nextScale = (float)(_zoomScale +
+            (_zoomTransitionTargetScale - _zoomScale) * blend);
+        var finished = Math.Abs(_zoomTransitionTargetScale - nextScale) <=
+                       Math.Max(0.0002f, _zoomTransitionTargetScale * 0.0008f);
+        ApplyZoomScaleFrame(finished ? _zoomTransitionTargetScale : nextScale);
+        if (!finished) return;
+
+        _zoomTransitionTimer.Stop();
+        ScheduleZoomDetailRender();
+    }
+
+    private void ApplyZoomScaleFrame(float scale)
+    {
+        _zoomScale = scale;
+        ReportZoomPercent();
+        var width = Math.Max(1, (int)Math.Round(_zoomOriginalSize.Width * _zoomScale));
+        var height = Math.Max(1, (int)Math.Round(_zoomOriginalSize.Height * _zoomScale));
+        _zoomBaseBounds = new Rectangle(
+            _zoomTransitionAnchor.X - (int)Math.Round(_zoomTransitionSourceX * _zoomScale),
+            _zoomTransitionAnchor.Y - (int)Math.Round(_zoomTransitionSourceY * _zoomScale),
+            width, height);
+        ClampZoomBounds();
+        _direct2DSurface.UpdateZoomLayout(_zoomBaseBounds, clearDetail: false);
+    }
+
+    private void ReportZoomPercent()
+    {
+        if (!_zoomMode) return;
+        var percent = Math.Max(1, (int)Math.Round(_zoomScale * 100f));
+        if (percent == _reportedZoomPercent) return;
+        _reportedZoomPercent = percent;
+        ZoomPercentChanged?.Invoke(this, percent);
+    }
+
+    private void StopZoomTransition(bool scheduleDetail)
+    {
+        _zoomTransitionTimer.Stop();
+        _zoomTransitionExitToFit = false;
+        if (scheduleDetail && _zoomMode) ScheduleZoomDetailRender();
+    }
+
+    private void StartReturnToFitTransition()
+    {
+        if (!_zoomMode || _zoomOriginalSize.Width <= 0 || _zoomOriginalSize.Height <= 0)
+        {
+            ExitZoomMode();
+            return;
+        }
+
+        _zoomRenderDebounce.Stop();
+        _zoomInteractionVersion++;
+        CancelAndDisposeZoomRender();
+        RenderingStateChanged?.Invoke(this, false);
+        ClearZoomDetail();
+        _zoomTransitionFitBounds = _zoomUseRightPage ? _right.Bounds : _left.Bounds;
+        if (_zoomTransitionFitBounds.Width <= 0 || _zoomTransitionFitBounds.Height <= 0)
+        {
+            ExitZoomMode();
+            return;
+        }
+        _zoomTransitionExitToFit = true;
+        _zoomTransitionLastTick = Environment.TickCount64;
+        _zoomTransitionTimer.Start();
+    }
+
+    private static Rectangle InterpolateRectangle(Rectangle from, Rectangle to, double amount) =>
+        new(
+            InterpolateInt(from.X, to.X, amount),
+            InterpolateInt(from.Y, to.Y, amount),
+            Math.Max(1, InterpolateInt(from.Width, to.Width, amount)),
+            Math.Max(1, InterpolateInt(from.Height, to.Height, amount)));
+
+    private static int InterpolateInt(int from, int to, double amount) =>
+        (int)Math.Round(from + (to - from) * amount);
+
+    private static int RectangleDistance(Rectangle first, Rectangle second) =>
+        Math.Max(
+            Math.Max(Math.Abs(first.X - second.X), Math.Abs(first.Y - second.Y)),
+            Math.Max(Math.Abs(first.Width - second.Width), Math.Abs(first.Height - second.Height)));
+
+    private void OnViewerMouseDown(object? sender, MouseEventArgs e)
+    {
+        if (!_zoomMode || e.Button != MouseButtons.Left) return;
+        StopZoomTransition(scheduleDetail: false);
+        _zoomPanning = true;
+        _zoomPanLast = e.Location;
+        _zoomRenderDebounce.Stop();
+        // Invalidate an in-flight crop, but retain the last completed sharp crop.
+        // Direct2D can translate it with the page while dragging, leaving only
+        // newly exposed edges backed by the lower-resolution base preview.
+        _zoomInteractionVersion++;
+        CancelAndDisposeZoomRender();
+        RenderingStateChanged?.Invoke(this, false);
+        _direct2DSurface.Capture = true;
+        Cursor = Cursors.SizeAll;
+    }
+
+    private void OnViewerMouseMove(object? sender, MouseEventArgs e)
+    {
+        if (!_zoomMode || !_zoomPanning) return;
+        var dx = e.X - _zoomPanLast.X;
+        var dy = e.Y - _zoomPanLast.Y;
+        if (dx == 0 && dy == 0) return;
+        _zoomPanLast = e.Location;
+        var previousLocation = _zoomBaseBounds.Location;
+        _zoomBaseBounds.Offset(dx, dy);
+        ClampZoomBounds();
+        var actualOffset = new Point(
+            _zoomBaseBounds.Left - previousLocation.X,
+            _zoomBaseBounds.Top - previousLocation.Y);
+        if (actualOffset.X == 0 && actualOffset.Y == 0) return;
+        foreach (var patch in _zoomDetailPatches)
+        {
+            var bounds = patch.Bounds;
+            bounds.Offset(actualOffset);
+            patch.Bounds = bounds;
+        }
+        _direct2DSurface.PanZoomLayout(_zoomBaseBounds, actualOffset);
+        PruneZoomDetailPatches();
+    }
+
+    private void OnViewerMouseUp(object? sender, MouseEventArgs e)
+    {
+        if (!_zoomMode || e.Button != MouseButtons.Left || !_zoomPanning) return;
+        _zoomPanning = false;
+        _direct2DSurface.Capture = false;
+        Cursor = Cursors.Hand;
+        ScheduleZoomDetailRender();
+    }
+
+    private void OnViewerMouseCaptureChanged(object? sender, EventArgs e)
+    {
+        if (!_zoomMode || !_zoomPanning || _direct2DSurface.Capture) return;
+        _zoomPanning = false;
+        Cursor = Cursors.Hand;
+        ScheduleZoomDetailRender();
+    }
+
+    private void ClampZoomBounds()
+    {
+        var x = _zoomBaseBounds.Width <= ClientSize.Width
+            ? (ClientSize.Width - _zoomBaseBounds.Width) / 2
+            : Math.Clamp(_zoomBaseBounds.X, ClientSize.Width - _zoomBaseBounds.Width, 0);
+        var y = _zoomBaseBounds.Height <= ClientSize.Height
+            ? (ClientSize.Height - _zoomBaseBounds.Height) / 2
+            : Math.Clamp(_zoomBaseBounds.Y, ClientSize.Height - _zoomBaseBounds.Height, 0);
+        _zoomBaseBounds.Location = new Point(x, y);
+    }
+
+    private bool TryGetZoomPage(
+        Point point, out bool useRightPage, out int pageIndex, out Rectangle fitBounds)
+    {
+        var leftAvailable = _left.Visible;
+        var rightAvailable = _right.Visible;
+        useRightPage = rightAvailable && (!leftAvailable || _right.Bounds.Contains(point) ||
+            DistanceSquared(point, _right.Bounds) < DistanceSquared(point, _left.Bounds));
+        fitBounds = useRightPage ? _right.Bounds : _left.Bounds;
+        pageIndex = useRightPage
+            ? (JapaneseMode ? _firstIndex : _secondIndex)
+            : (JapaneseMode ? _secondIndex : _firstIndex);
+        return pageIndex >= 0 && fitBounds.Width > 0 && fitBounds.Height > 0;
+    }
+
+    private static long DistanceSquared(Point point, Rectangle bounds)
+    {
+        var x = Math.Clamp(point.X, bounds.Left, bounds.Right);
+        var y = Math.Clamp(point.Y, bounds.Top, bounds.Bottom);
+        var dx = (long)point.X - x;
+        var dy = (long)point.Y - y;
+        return dx * dx + dy * dy;
+    }
+
+    private void ScheduleZoomDetailRender()
+    {
+        if (!_zoomMode || _zoomPanning || ZoomCropRequested is null) return;
+        _zoomRenderDebounce.Stop();
+        _zoomRenderDebounce.Start();
+    }
+
+    private async Task RenderZoomDetailAsync()
+    {
+        var renderer = ZoomCropRequested;
+        if (!_zoomMode || _zoomPanning || renderer is null) return;
+        CancelAndDisposeZoomRender();
+        var cancellation = new CancellationTokenSource();
+        _zoomRenderCancellation = cancellation;
+        var version = ++_zoomInteractionVersion;
+        var visible = Rectangle.Intersect(ClientRectangle, _zoomBaseBounds);
+        if (visible.Width <= 0 || visible.Height <= 0)
+        {
+            _zoomRenderCancellation = null;
+            cancellation.Dispose();
+            return;
+        }
+        var uncovered = GetUncoveredZoomAreas(visible);
+        if (uncovered.Count == 0)
+        {
+            _zoomRenderCancellation = null;
+            cancellation.Dispose();
+            return;
+        }
+
+        // Give Lanczos a tiny overlap into existing sharp pixels. This avoids a
+        // visible filter seam while still rendering only the newly exposed edge.
+        var requests = uncovered
+            .Select(area => Rectangle.Intersect(visible, Rectangle.Inflate(area, 2, 2)))
+            .Distinct()
+            .Select(CreateZoomCropRequest)
+            .Where(request => request.HasValue)
+            .Select(request => request!.Value)
+            .ToArray();
+        if (requests.Length == 0)
+        {
+            _zoomRenderCancellation = null;
+            cancellation.Dispose();
+            return;
+        }
+
+        (ZoomCropRequest Request, Bitmap? Bitmap)[] results = [];
+        try
+        {
+            RenderingStateChanged?.Invoke(this, true);
+            // Progressive viewport refinement: first replace the heavily scaled
+            // Fit bitmap with a quick medium-resolution crop, then layer the
+            // final full-size Lanczos crop over it.
+            var fastTasks = requests.Select(request => RenderZoomPatchAsync(
+                renderer, request, fastPreview: true, cancellation.Token)).ToArray();
+            results = await Task.WhenAll(fastTasks);
+            cancellation.Token.ThrowIfCancellationRequested();
+            if (!_zoomMode || version != _zoomInteractionVersion) return;
+
+            var fastPatches = new Dictionary<Rectangle, Bitmap>();
+            foreach (var result in results)
+            {
+                if (result.Bitmap is not { } bitmap) continue;
+                fastPatches[result.Request.Destination] = bitmap;
+                _zoomDetailPatches.Add(new ZoomDetailPatch(bitmap, result.Request.Destination));
+                _direct2DSurface.AddZoomDetail(bitmap, result.Request.Destination);
+            }
+            results = [];
+
+            var tasks = requests.Select(request => RenderZoomPatchAsync(
+                renderer, request, fastPreview: false, cancellation.Token)).ToArray();
+            results = await Task.WhenAll(tasks);
+            cancellation.Token.ThrowIfCancellationRequested();
+            if (!_zoomMode || version != _zoomInteractionVersion) return;
+
+            foreach (var result in results)
+            {
+                if (result.Bitmap is not { } bitmap) continue;
+                _zoomDetailPatches.Add(new ZoomDetailPatch(bitmap, result.Request.Destination));
+                _direct2DSurface.AddZoomDetail(bitmap, result.Request.Destination);
+                if (fastPatches.Remove(result.Request.Destination, out var fastBitmap))
+                    RemoveZoomDetailPatch(fastBitmap);
+            }
+            results = [];
+            PruneZoomDetailPatches();
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception exception)
+        {
+            System.Diagnostics.Debug.WriteLine($"Zoom detail render failed: {exception}");
+        }
+        finally
+        {
+            foreach (var result in results)
+                if (result.Bitmap is { } bitmap) DisposeSourceInBackground(bitmap);
+            if (ReferenceEquals(_zoomRenderCancellation, cancellation))
+            {
+                _zoomRenderCancellation = null;
+                cancellation.Dispose();
+            }
+            if (version == _zoomInteractionVersion)
+                RenderingStateChanged?.Invoke(this, false);
+        }
+    }
+
+    private async Task<(ZoomCropRequest Request, Bitmap? Bitmap)> RenderZoomPatchAsync(
+        Func<int, Rectangle, Size, bool, CancellationToken, Task<Bitmap>> renderer,
+        ZoomCropRequest request, bool fastPreview, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var bitmap = await renderer(
+                _zoomPageIndex, request.Source, request.Destination.Size,
+                fastPreview, cancellationToken);
+            return (request, bitmap);
+        }
+        catch (OperationCanceledException) { return (request, null); }
+        catch (Exception exception)
+        {
+            System.Diagnostics.Debug.WriteLine($"Zoom patch render failed: {exception}");
+            return (request, null);
+        }
+    }
+
+    private ZoomCropRequest? CreateZoomCropRequest(Rectangle destination)
+    {
+        var sourceLeft = Math.Max(0, (int)Math.Floor(
+            (destination.Left - _zoomBaseBounds.Left) / (double)_zoomScale));
+        var sourceTop = Math.Max(0, (int)Math.Floor(
+            (destination.Top - _zoomBaseBounds.Top) / (double)_zoomScale));
+        var sourceRight = Math.Min(_zoomOriginalSize.Width, (int)Math.Ceiling(
+            (destination.Right - _zoomBaseBounds.Left) / (double)_zoomScale));
+        var sourceBottom = Math.Min(_zoomOriginalSize.Height, (int)Math.Ceiling(
+            (destination.Bottom - _zoomBaseBounds.Top) / (double)_zoomScale));
+        var source = Rectangle.FromLTRB(sourceLeft, sourceTop, sourceRight, sourceBottom);
+        return source.Width > 0 && source.Height > 0 &&
+            destination.Width > 0 && destination.Height > 0
+            ? new ZoomCropRequest(source, destination)
+            : null;
+    }
+
+    private List<Rectangle> GetUncoveredZoomAreas(Rectangle visible)
+    {
+        var uncovered = new List<Rectangle> { visible };
+        foreach (var patch in _zoomDetailPatches)
+        {
+            if (!patch.Bounds.IntersectsWith(visible)) continue;
+            var next = new List<Rectangle>(uncovered.Count + 3);
+            foreach (var area in uncovered) SubtractRectangle(area, patch.Bounds, next);
+            uncovered = next;
+            if (uncovered.Count == 0) break;
+        }
+        return uncovered;
+    }
+
+    private static void SubtractRectangle(
+        Rectangle area, Rectangle cover, List<Rectangle> output)
+    {
+        var overlap = Rectangle.Intersect(area, cover);
+        if (overlap.Width <= 0 || overlap.Height <= 0)
+        {
+            output.Add(area);
+            return;
+        }
+        AddNonEmpty(output, Rectangle.FromLTRB(area.Left, area.Top, area.Right, overlap.Top));
+        AddNonEmpty(output, Rectangle.FromLTRB(area.Left, overlap.Bottom, area.Right, area.Bottom));
+        AddNonEmpty(output, Rectangle.FromLTRB(area.Left, overlap.Top, overlap.Left, overlap.Bottom));
+        AddNonEmpty(output, Rectangle.FromLTRB(overlap.Right, overlap.Top, area.Right, overlap.Bottom));
+    }
+
+    private static void AddNonEmpty(List<Rectangle> output, Rectangle area)
+    {
+        if (area.Width > 0 && area.Height > 0) output.Add(area);
+    }
+
+    private void PruneZoomDetailPatches()
+    {
+        var retention = Rectangle.Inflate(
+            ClientRectangle, Math.Max(1, ClientSize.Width), Math.Max(1, ClientSize.Height));
+        for (var index = _zoomDetailPatches.Count - 1; index >= 0; index--)
+        {
+            var patch = _zoomDetailPatches[index];
+            if (patch.Bounds.IntersectsWith(retention)) continue;
+            _zoomDetailPatches.RemoveAt(index);
+            _direct2DSurface.RemoveZoomDetail(patch.Bitmap);
+            RetireSource(patch.Bitmap);
+        }
+    }
+
+    private void ClearZoomDetail()
+    {
+        _direct2DSurface.ClearZoomDetails();
+        foreach (var patch in _zoomDetailPatches) RetireSource(patch.Bitmap);
+        _zoomDetailPatches.Clear();
+    }
+
+    private void RemoveZoomDetailPatch(Bitmap bitmap)
+    {
+        var index = _zoomDetailPatches.FindIndex(
+            patch => ReferenceEquals(patch.Bitmap, bitmap));
+        if (index >= 0) _zoomDetailPatches.RemoveAt(index);
+        _direct2DSurface.RemoveZoomDetail(bitmap);
+        RetireSource(bitmap);
+    }
+
+    private void CancelAndDisposeZoomRender()
+    {
+        var cancellation = _zoomRenderCancellation;
+        _zoomRenderCancellation = null;
+        if (cancellation is not null) _ = CancelAndDisposeAsync(cancellation);
+    }
+
+    public void SwapReadingDirection()
+    {
+        var leftPageIndex = JapaneseMode ? _secondIndex : _firstIndex;
+        foreach (var pair in _activeAnimations)
+            pair.Value.RightPage = pair.Key != leftPageIndex;
+        BeginRender();
+    }
 
     public void ZoomBy(float factor)
     {
-        FitToScreen = false;
-        _zoom = Math.Clamp(_zoom * factor, 0.1f, 8f);
-        _renderContextVersion++;
-        BeginRender();
+        factor = Math.Clamp(factor, 0.05f, 20f);
+        var center = new Point(ClientSize.Width / 2, ClientSize.Height / 2);
+        if (_zoomMode) ApplyZoomFactor(factor, center);
+        else
+        {
+            _pendingEntryZoomFactor *= factor;
+            _pendingZoomAnchor = center;
+            if (!_zoomEntering) _ = EnterZoomAsync(center, fromFitWheel: true);
+        }
     }
 
     public void SetZoom(float value)
     {
-        FitToScreen = false;
-        _zoom = Math.Clamp(value, 0.1f, 8f);
-        _renderContextVersion++;
-        BeginRender();
+        value = Math.Clamp(value, 0.05f, 8f);
+        var center = new Point(ClientSize.Width / 2, ClientSize.Height / 2);
+        if (_zoomMode) ApplyZoomFactor(value / Math.Max(0.0001f, _zoomScale), center);
+        else
+        {
+            _pendingEntryAbsoluteScale = value;
+            _pendingZoomAnchor = center;
+            if (!_zoomEntering) _ = EnterZoomAsync(center, fromFitWheel: true);
+        }
     }
 
-    public void ResetFit()
+    public void ResetFit() => ReturnToFit();
+
+    private void AdvanceAnimations()
     {
-        FitToScreen = true;
-        _renderContextVersion++;
-        BeginRender();
+        _animationTimer.Stop();
+        if (_zoomMode || _activeAnimations.Count == 0) return;
+        var now = Environment.TickCount64;
+        foreach (var animation in _activeAnimations.Values)
+        {
+            if (now < animation.NextFrameAt) continue;
+            var guard = animation.Frames.Frames.Length;
+            do
+            {
+                animation.FrameIndex =
+                    (animation.FrameIndex + 1) % animation.Frames.Frames.Length;
+                animation.NextFrameAt += animation.Frames.Delays[animation.FrameIndex];
+            }
+            while (now >= animation.NextFrameAt && --guard > 0);
+            _direct2DSurface.PresentAnimatedPage(
+                animation.RightPage, animation.Frames.Frames[animation.FrameIndex]);
+        }
+        ScheduleAnimationTimer();
     }
+
+    private void ScheduleAnimationTimer()
+    {
+        _animationTimer.Stop();
+        if (_zoomMode || _activeAnimations.Count == 0 || IsDisposed || Disposing) return;
+        var now = Environment.TickCount64;
+        var remaining = _activeAnimations.Values.Min(animation => animation.NextFrameAt - now);
+        _animationTimer.Interval = (int)Math.Clamp(remaining, 10L, 1000L);
+        _animationTimer.Start();
+    }
+
+    private void ReapplyAnimatedFrames()
+    {
+        if (_zoomMode) return;
+        foreach (var animation in _activeAnimations.Values)
+            _direct2DSurface.PresentAnimatedPage(
+                animation.RightPage, animation.Frames.Frames[animation.FrameIndex]);
+    }
+
+    private static void DisposeAnimationFramesInBackground(AnimationFrameSet frames) =>
+        _ = Task.Run(frames.Dispose);
 
     protected override void Dispose(bool disposing)
     {
         if (disposing)
         {
             _resizeDebounce.Dispose();
+            _zoomRenderDebounce.Dispose();
+            _zoomTransitionTimer.Dispose();
+            StopAnimations();
+            _animationTimer.Dispose();
+            CancelAndDisposeZoomRender();
+            ClearZoomDetail();
             CancelRender();
             _direct2DSurface.Dispose();
             RetireSource(_first);
             RetireSource(_second);
             DisposeRendered();
             ClearRenderCache();
+            ClearPreviewCache();
         }
         base.Dispose(disposing);
     }
@@ -390,40 +1373,93 @@ internal sealed class AsyncViewerPanel : Panel
         var renderKeys = pageKeys.Select((key, index) => key is null || sizes[index].IsEmpty
             ? null : new RenderKey(pageIndices[index], key, sizes[index].Width, sizes[index].Height,
                 visible, _renderContextVersion)).ToArray();
-        var rendered = renderKeys.Select(key => key is null ? null : GetRenderClone(key)).ToArray();
-        if (rendered.Where((bitmap, index) => sources[index] is not null).All(bitmap => bitmap is not null))
+        var qualityRendered = await Task.WhenAll(renderKeys.Select(key => key is null
+            ? Task.FromResult<Bitmap?>(null)
+            : GetRenderCloneAsync(key, cancellation.Token)));
+        if (cancellation.IsCancellationRequested || version != _renderVersion || IsDisposed)
         {
-            ApplyRendered(rendered[0], rendered[1], sizes, availableHeight, gap);
+            foreach (var rendered in qualityRendered) RetireSource(rendered);
+            return;
+        }
+        if (qualityRendered.Where((bitmap, index) => sources[index] is not null).All(bitmap => bitmap is not null))
+        {
+            ApplyRendered(qualityRendered[0], qualityRendered[1], sizes, availableHeight, gap);
+            _displayedPreview = false;
             RenderingStateChanged?.Invoke(this, false);
             return;
         }
 
         var renderSources = sources.Select((source, index) =>
-            source is null || rendered[index] is not null ? null : source as Bitmap).ToArray();
+            source is null || qualityRendered[index] is not null ? null : source as Bitmap).ToArray();
         foreach (var source in renderSources) AcquireSource(source);
         RenderingStateChanged?.Invoke(this, true);
+        var qualityTasksOwnResults = false;
 
         try
         {
-            var leftTask = rendered[0] is not null ? Task.FromResult(rendered[0]) :
-                Task.Run(() => ResizeLanczos(renderSources[0], sizes[0], _lanczosQuality, cancellation.Token), cancellation.Token);
-            var rightTask = rendered[1] is not null ? Task.FromResult(rendered[1]) :
-                Task.Run(() => ResizeLanczos(renderSources[1], sizes[1], _lanczosQuality, cancellation.Token), cancellation.Token);
-            rendered = await Task.WhenAll(leftTask, rightTask);
+            // Always show a complete fast frame first when any visible page is
+            // missing its Lanczos render. This avoids a half-updated two-page view.
+            // If TryPresentCachedPages already put the matching preview on the
+            // Direct2D surface, leave it there and spend no time cloning/uploading it again.
+            var previewAlreadyVisible = _displayedPreview &&
+                _displayedContextVersion == _renderContextVersion;
+            if (!previewAlreadyVisible)
+            {
+                var previews = await Task.WhenAll(renderKeys.Select(key => key is null
+                    ? Task.FromResult<Bitmap?>(null)
+                    : GetPreviewCloneAsync(key, cancellation.Token)));
+                cancellation.Token.ThrowIfCancellationRequested();
+                var previewTasks = previews.Select((preview, index) =>
+                    preview is not null || sources[index] is null
+                        ? Task.FromResult(preview)
+                        : RenderWorkScheduler.RunFastAsync(threads => ResizeFastPreview(
+                            sources[index] as Bitmap, sizes[index], threads, cancellation.Token),
+                            cancellation.Token))
+                    .ToArray();
+                previews = await AwaitBitmapTasksOwnedAsync(previewTasks);
+                if (cancellation.IsCancellationRequested || version != _renderVersion || IsDisposed)
+                {
+                    foreach (var preview in previews) RetireSource(preview);
+                    foreach (var rendered in qualityRendered) RetireSource(rendered);
+                    return;
+                }
+                ApplyRendered(previews[0], previews[1], sizes, availableHeight, gap);
+                _displayedPreview = true;
+                for (var i = 0; i < previews.Length; i++)
+                    if (renderKeys[i] is not null && previews[i] is not null)
+                        CachePreviewCopyInBackground(renderKeys[i]!, previews[i]!);
+            }
+
+            var leftTask = qualityRendered[0] is not null ? Task.FromResult(qualityRendered[0]) :
+                RenderWorkScheduler.RunFullAsync(() => ResizeLanczos(
+                    renderSources[0], sizes[0], _lanczosQuality, cancellation.Token), cancellation.Token);
+            var rightTask = qualityRendered[1] is not null ? Task.FromResult(qualityRendered[1]) :
+                RenderWorkScheduler.RunFullAsync(() => ResizeLanczos(
+                    renderSources[1], sizes[1], _lanczosQuality, cancellation.Token), cancellation.Token);
+            qualityTasksOwnResults = true;
+            qualityRendered = await AwaitBitmapTasksOwnedAsync([leftTask, rightTask]);
+            qualityTasksOwnResults = false;
             if (cancellation.IsCancellationRequested || version != _renderVersion || IsDisposed)
             {
-                RetireSource(rendered[0]);
-                RetireSource(rendered[1]);
+                foreach (var rendered in qualityRendered) RetireSource(rendered);
                 return;
             }
-            ApplyRendered(rendered[0], rendered[1], sizes, availableHeight, gap);
-            for (var i = 0; i < rendered.Length; i++)
-                if (renderKeys[i] is not null && rendered[i] is not null)
-                    CacheRenderCopyInBackground(renderKeys[i]!, rendered[i]!);
+            ApplyRendered(qualityRendered[0], qualityRendered[1], sizes, availableHeight, gap);
+            qualityTasksOwnResults = true;
+            _displayedPreview = false;
+            for (var i = 0; i < qualityRendered.Length; i++)
+                if (renderKeys[i] is not null && qualityRendered[i] is not null)
+                    CacheRenderCopyInBackground(renderKeys[i]!, qualityRendered[i]!);
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException)
+        {
+            if (!qualityTasksOwnResults)
+                foreach (var rendered in qualityRendered) RetireSource(rendered);
+        }
         catch (Exception exception)
         {
+            if (!qualityTasksOwnResults)
+                foreach (var rendered in qualityRendered) RetireSource(rendered);
             // BeginRender is an async UI event path. Never allow a worker-side
             // decode/resample failure to escape it and terminate the WinForms app.
             System.Diagnostics.Debug.WriteLine($"Page render failed: {exception}");
@@ -446,6 +1482,40 @@ internal sealed class AsyncViewerPanel : Panel
             : zoom;
         scale = Math.Max(0.02f, scale);
         return new Size(Math.Max(1, (int)(source.Width * scale)), Math.Max(1, (int)(source.Height * scale)));
+    }
+
+    private void RelayoutDisplayedFrame()
+    {
+        if (!FitToScreen) return;
+        var boxes = new[] { _left, _right };
+        var visible = boxes.Where(box => box.Visible && box.Width > 0 && box.Height > 0).ToArray();
+        if (visible.Length == 0) return;
+
+        const int gap = 10;
+        var availableWidth = Math.Max(100, ClientSize.Width - gap * 3);
+        var availableHeight = Math.Max(100, ClientSize.Height - gap * 2);
+        var targetWidth = visible.Length == 2 ? availableWidth / 2 : availableWidth;
+        var sizes = visible.Select(box =>
+        {
+            var scale = Math.Min((float)targetWidth / box.Width, (float)availableHeight / box.Height);
+            return new Size(Math.Max(1, (int)Math.Round(box.Width * scale)),
+                Math.Max(1, (int)Math.Round(box.Height * scale)));
+        }).ToArray();
+        var contentWidth = sizes.Sum(size => size.Width) + Math.Max(0, sizes.Length - 1) * gap;
+        var x = Math.Max(gap, (ClientSize.Width - contentWidth) / 2);
+        SuspendLayout();
+        try
+        {
+            for (var i = 0; i < visible.Length; i++)
+            {
+                visible[i].SetBounds(x,
+                    gap + Math.Max(0, (availableHeight - sizes[i].Height) / 2),
+                    sizes[i].Width, sizes[i].Height, BoundsSpecified.All);
+                x += sizes[i].Width + gap;
+            }
+        }
+        finally { ResumeLayout(false); }
+        _direct2DSurface.UpdateLayout(_left.Bounds, _right.Bounds);
     }
 
     private static Bitmap? ResizeLanczos(
@@ -481,18 +1551,139 @@ internal sealed class AsyncViewerPanel : Panel
         return CreateBitmapFromBgra(output, outputWidth, outputHeight);
     }
 
-    internal static Bitmap CreateLanczosThumbnail(
-        Bitmap source, int maximumEdge, int quality, CancellationToken cancellationToken)
+    private static unsafe Bitmap? ResizeFastPreview(
+        Bitmap? source, Size size, int threadsPerWorker,
+        CancellationToken cancellationToken)
     {
-        maximumEdge = Math.Max(32, maximumEdge);
-        var scale = Math.Min(1f, Math.Min(
-            (float)maximumEdge / source.Width,
-            (float)maximumEdge / source.Height));
-        var size = new Size(
-            Math.Max(1, (int)Math.Round(source.Width * scale)),
-            Math.Max(1, (int)Math.Round(source.Height * scale)));
+        if (source is null || size.IsEmpty) return null;
+        cancellationToken.ThrowIfCancellationRequested();
+        var preview = new Bitmap(size.Width, size.Height, PixelFormat.Format32bppArgb);
+        BitmapData? sourceData = null;
+        BitmapData? destinationData = null;
+        var completed = false;
+        try
+        {
+            sourceData = source.LockBits(
+                new Rectangle(0, 0, source.Width, source.Height),
+                ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+            destinationData = preview.LockBits(
+                new Rectangle(0, 0, size.Width, size.Height),
+                ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+            var sourceScan0 = sourceData.Scan0;
+            var destinationScan0 = destinationData.Scan0;
+            var sourceStride = sourceData.Stride;
+            var destinationStride = destinationData.Stride;
+            var sourceWidth = source.Width;
+            var sourceHeight = source.Height;
+            var outputWidth = size.Width;
+            var outputHeight = size.Height;
+            var workerCount = Math.Clamp(threadsPerWorker, 1, 64);
+            var rowsPerRange = Math.Max(1, (outputHeight + workerCount - 1) / workerCount);
+            Parallel.ForEach(
+                System.Collections.Concurrent.Partitioner.Create(0, outputHeight, rowsPerRange),
+                new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = workerCount,
+                    CancellationToken = cancellationToken
+                },
+                range =>
+                {
+                    var thread = Thread.CurrentThread;
+                    var previousPriority = thread.Priority;
+                    try
+                    {
+                        // Do not outrank the WinForms UI; full-quality work is
+                        // explicitly BelowNormal, so fast preview still wins.
+                        thread.Priority = ThreadPriority.Normal;
+                        for (var y = range.Item1; y < range.Item2; y++)
+                        {
+                            if ((y & 31) == 0) cancellationToken.ThrowIfCancellationRequested();
+                            var sourceY = (int)((long)y * sourceHeight / outputHeight);
+                            var sourceRow = (byte*)sourceScan0.ToPointer() + sourceY * sourceStride;
+                            var destinationRow = (byte*)destinationScan0.ToPointer() + y * destinationStride;
+                            for (var x = 0; x < outputWidth; x++)
+                            {
+                                var sourceX = (int)((long)x * sourceWidth / outputWidth);
+                                *(int*)(destinationRow + x * 4) = *(int*)(sourceRow + sourceX * 4);
+                            }
+                        }
+                    }
+                    finally { thread.Priority = previousPriority; }
+                });
+            cancellationToken.ThrowIfCancellationRequested();
+            completed = true;
+            return preview;
+        }
+        finally
+        {
+            if (destinationData is not null) preview.UnlockBits(destinationData);
+            if (sourceData is not null) source.UnlockBits(sourceData);
+            if (!completed) preview.Dispose();
+        }
+    }
+
+    internal static Bitmap CreateLanczosThumbnail(
+        Bitmap source, Size bounds, int quality, CancellationToken cancellationToken)
+    {
+        var size = CalculateThumbnailSize(source, bounds);
         return ResizeLanczosForPrecache(source, size, quality, cancellationToken)
             ?? throw new InvalidOperationException("Cannot create thumbnail.");
+    }
+
+    internal static Bitmap CreateFastThumbnail(
+        Bitmap source, Size bounds, int threadsPerWorker,
+        CancellationToken cancellationToken)
+    {
+        var size = CalculateThumbnailSize(source, bounds);
+        return ResizeFastPreview(source, size, threadsPerWorker, cancellationToken)
+            ?? throw new InvalidOperationException("Cannot create thumbnail preview.");
+    }
+
+    internal static Bitmap CreateLanczosViewport(
+        Bitmap source, Rectangle sourceCrop, Size outputSize, int quality,
+        CancellationToken cancellationToken)
+    {
+        sourceCrop.Intersect(new Rectangle(Point.Empty, source.Size));
+        if (sourceCrop.Width <= 0 || sourceCrop.Height <= 0 || outputSize.IsEmpty)
+            throw new ArgumentOutOfRangeException(nameof(sourceCrop));
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var inputPixels = CopyBitmapCropToBgra(source, sourceCrop);
+        // At the normal double-click 100% zoom, one source pixel maps to one
+        // screen pixel. Bypass ImageMagick entirely and publish the exact cached
+        // pixels; filtering cannot improve a 1:1 copy.
+        if (sourceCrop.Size == outputSize)
+            return CreateBitmapFromBgra(inputPixels, sourceCrop.Width, sourceCrop.Height);
+        var readSettings = new PixelReadSettings(
+            (uint)sourceCrop.Width, (uint)sourceCrop.Height,
+            StorageType.Char, PixelMapping.BGRA);
+        using var magick = new MagickImage(inputPixels, readSettings);
+        magick.FilterType = Math.Clamp(quality, 0, 3) switch
+        {
+            0 => FilterType.Lanczos2,
+            2 => FilterType.LanczosSharp,
+            3 => FilterType.LanczosRadius,
+            _ => FilterType.Lanczos
+        };
+        if (magick.Width != outputSize.Width || magick.Height != outputSize.Height)
+            magick.Resize((uint)outputSize.Width, (uint)outputSize.Height);
+        cancellationToken.ThrowIfCancellationRequested();
+        using var outputPixels = magick.GetPixels();
+        var output = outputPixels.ToByteArray(PixelMapping.BGRA)
+            ?? throw new InvalidOperationException("Magick.NET returned no zoom pixels.");
+        return CreateBitmapFromBgra(output, checked((int)magick.Width), checked((int)magick.Height));
+    }
+
+    private static Size CalculateThumbnailSize(Bitmap source, Size bounds)
+    {
+        var maximumWidth = Math.Max(32, bounds.Width);
+        var maximumHeight = Math.Max(32, bounds.Height);
+        var scale = Math.Min(1f, Math.Min(
+            (float)maximumWidth / source.Width,
+            (float)maximumHeight / source.Height));
+        return new Size(
+            Math.Max(1, (int)Math.Round(source.Width * scale)),
+            Math.Max(1, (int)Math.Round(source.Height * scale)));
     }
 
     private static Bitmap? ResizeLanczosForPrecache(
@@ -536,6 +1727,24 @@ internal sealed class AsyncViewerPanel : Panel
         return pixels;
     }
 
+    private static byte[] CopyBitmapCropToBgra(Bitmap source, Rectangle crop)
+    {
+        var rowBytes = checked(crop.Width * 4);
+        var pixels = GC.AllocateUninitializedArray<byte>(checked(rowBytes * crop.Height));
+        var data = source.LockBits(crop, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        try
+        {
+            for (var y = 0; y < crop.Height; y++)
+            {
+                var sourceRow = IntPtr.Add(data.Scan0, y * data.Stride);
+                System.Runtime.InteropServices.Marshal.Copy(
+                    sourceRow, pixels, y * rowBytes, rowBytes);
+            }
+        }
+        finally { source.UnlockBits(data); }
+        return pixels;
+    }
+
     private static Bitmap CreateBitmapFromBgra(byte[] pixels, int width, int height)
     {
         var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
@@ -567,6 +1776,7 @@ internal sealed class AsyncViewerPanel : Panel
         Bitmap? left, Bitmap? right, Size[] sizes, int availableHeight, int gap,
         bool retainBitmaps = true)
     {
+        _loadingPlaceholder.Visible = false;
         DisposeRendered(clearSurface: false);
         _leftRendered = retainBitmaps ? left : null;
         _rightRendered = retainBitmaps ? right : null;
@@ -606,6 +1816,7 @@ internal sealed class AsyncViewerPanel : Panel
         }
         finally { ResumeLayout(false); }
         _direct2DSurface.Present(left, right, _left.Bounds, _right.Bounds);
+        ReapplyAnimatedFrames();
         _displayedContextVersion = _renderContextVersion;
     }
 
@@ -614,6 +1825,24 @@ internal sealed class AsyncViewerPanel : Panel
         if (_renderCancellation is not null)
             _ = CancelAndDisposeAsync(_renderCancellation);
         _renderCancellation = null;
+    }
+
+    private static async Task<Bitmap?[]> AwaitBitmapTasksOwnedAsync(Task<Bitmap?>[] tasks)
+    {
+        try { return await Task.WhenAll(tasks); }
+        catch
+        {
+            // When one side is cancelled, Task.WhenAll does not return the other
+            // completed bitmap. Dispose every successful result asynchronously.
+            foreach (var task in tasks)
+                _ = task.ContinueWith(completed =>
+                {
+                    if (completed.IsCompletedSuccessfully && completed.Result is { } bitmap)
+                        lock (bitmap) bitmap.Dispose();
+                }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+            throw;
+        }
     }
 
     private static async Task CancelAndDisposeAsync(CancellationTokenSource cancellation)
@@ -678,6 +1907,11 @@ internal sealed class AsyncViewerPanel : Panel
         lock (_renderCacheGate) return _renderCache.ContainsKey(key);
     }
 
+    private bool ContainsPreview(RenderKey key)
+    {
+        lock (_previewCacheGate) return _previewCache.ContainsKey(key);
+    }
+
     private RenderCacheItem? AcquireCurrentRender(
         int pageIndex, string pageKey, int visiblePageCount)
     {
@@ -685,42 +1919,128 @@ internal sealed class AsyncViewerPanel : Panel
         if (!_renderLookup.TryGetValue(lookup, out var key) ||
             !_renderCache.TryGetValue(key, out var item)) return null;
         item.ActiveReaders++;
-        item.Sequence = ++_renderCacheSequence;
+        item.Sequence = Interlocked.Increment(ref _renderCacheSequence);
         return item;
     }
 
-    private static void ReleaseRender(RenderCacheItem? item)
+    private RenderCacheItem? AcquireCurrentPreview(
+        int pageIndex, string pageKey, int visiblePageCount)
     {
-        if (item is not null) item.ActiveReaders--;
+        var lookup = new RenderLookupKey(pageIndex, pageKey, visiblePageCount, _renderContextVersion);
+        if (!_previewLookup.TryGetValue(lookup, out var key) ||
+            !_previewCache.TryGetValue(key, out var item)) return null;
+        item.ActiveReaders++;
+        item.Sequence = Interlocked.Increment(ref _renderCacheSequence);
+        return item;
     }
 
-    private Bitmap? GetRenderClone(RenderKey key)
+    private void ReleaseCacheItem(RenderCacheItem? item)
     {
+        if (item is null) return;
+        item.ActiveReaders--;
+        if (item.ActiveReaders == 0 && item.Retired)
+            _ = Task.Run(() => { lock (item.Bitmap) item.Bitmap.Dispose(); });
+    }
+
+    private async Task<Bitmap?> GetRenderCloneAsync(
+        RenderKey key, CancellationToken cancellationToken)
+    {
+        RenderCacheItem? item;
         lock (_renderCacheGate)
         {
-            if (!_renderCache.TryGetValue(key, out var item)) return null;
-            item.Sequence = ++_renderCacheSequence;
-            lock (item.Bitmap) return new Bitmap(item.Bitmap);
+            if (!_renderCache.TryGetValue(key, out item)) return null;
+            item.ActiveReaders++;
+            item.Sequence = Interlocked.Increment(ref _renderCacheSequence);
+        }
+        try
+        {
+            return await Task.Run(() =>
+            {
+                lock (item.Bitmap) return new Bitmap(item.Bitmap);
+            }, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { return null; }
+        catch (Exception exception)
+        {
+            System.Diagnostics.Debug.WriteLine($"Render cache clone failed: {exception}");
+            return null;
+        }
+        finally
+        {
+            lock (_renderCacheGate) ReleaseCacheItem(item);
+        }
+    }
+
+    private async Task<Bitmap?> GetPreviewCloneAsync(
+        RenderKey key, CancellationToken cancellationToken)
+    {
+        RenderCacheItem? item;
+        lock (_previewCacheGate)
+        {
+            if (!_previewCache.TryGetValue(key, out item)) return null;
+            item.ActiveReaders++;
+            item.Sequence = Interlocked.Increment(ref _renderCacheSequence);
+        }
+        try
+        {
+            return await RenderWorkScheduler.RunFastAsync(_ =>
+            {
+                lock (item.Bitmap) return new Bitmap(item.Bitmap);
+            }, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { return null; }
+        catch (Exception exception)
+        {
+            System.Diagnostics.Debug.WriteLine($"Preview cache clone failed: {exception}");
+            return null;
+        }
+        finally
+        {
+            lock (_previewCacheGate) ReleaseCacheItem(item);
         }
     }
 
     private bool AddRenderOwned(RenderKey key, Bitmap bitmap)
     {
+        if (key.ContextVersion != Volatile.Read(ref _renderContextVersion)) return false;
         lock (_renderCacheGate)
         {
             if (_renderCache.TryGetValue(key, out var existing))
             {
-                existing.Sequence = ++_renderCacheSequence;
+                existing.Sequence = Interlocked.Increment(ref _renderCacheSequence);
                 return false;
             }
-            var item = new RenderCacheItem(bitmap, ++_renderCacheSequence);
+            var item = new RenderCacheItem(bitmap, Interlocked.Increment(ref _renderCacheSequence));
             _renderCache[key] = item;
             _renderLookup[new RenderLookupKey(
                 key.PageIndex, key.PageKey, key.VisiblePageCount, key.ContextVersion)] = key;
             _renderCacheBytes += item.Bytes;
             _renderBytesByPage.AddOrUpdate(key.PageIndex, item.Bytes, (_, bytes) => bytes + item.Bytes);
+            _renderBytesByContextPage.AddOrUpdate(
+                (key.ContextVersion, key.PageIndex), item.Bytes,
+                (_, bytes) => bytes + item.Bytes);
             _cachedPageCounts.AddOrUpdate(
                 (key.ContextVersion, key.PageIndex), 1, (_, count) => count + 1);
+            return true;
+        }
+    }
+
+    private bool AddPreviewOwned(RenderKey key, Bitmap bitmap)
+    {
+        if (Volatile.Read(ref _previewCacheLimitBytes) <= 0 ||
+            key.ContextVersion != Volatile.Read(ref _renderContextVersion)) return false;
+        lock (_previewCacheGate)
+        {
+            if (_previewCache.TryGetValue(key, out var existing))
+            {
+                existing.Sequence = Interlocked.Increment(ref _renderCacheSequence);
+                return false;
+            }
+            var item = new RenderCacheItem(bitmap, Interlocked.Increment(ref _renderCacheSequence));
+            _previewCache[key] = item;
+            _previewLookup[new RenderLookupKey(
+                key.PageIndex, key.PageKey, key.VisiblePageCount, key.ContextVersion)] = key;
+            _previewCacheBytes += item.Bytes;
             return true;
         }
     }
@@ -734,6 +2054,14 @@ internal sealed class AsyncViewerPanel : Panel
             var remaining = pageBytes - bytes;
             if (remaining > 0) _renderBytesByPage[key.PageIndex] = remaining;
             else _renderBytesByPage.TryRemove(key.PageIndex, out _);
+        }
+
+        var contextPage = (key.ContextVersion, key.PageIndex);
+        if (_renderBytesByContextPage.TryGetValue(contextPage, out var contextBytes))
+        {
+            var remaining = contextBytes - bytes;
+            if (remaining > 0) _renderBytesByContextPage[contextPage] = remaining;
+            else _renderBytesByContextPage.TryRemove(contextPage, out _);
         }
 
         var pageKey = (key.ContextVersion, key.PageIndex);
@@ -759,17 +2087,59 @@ internal sealed class AsyncViewerPanel : Panel
         });
     }
 
+    private void CachePreviewCopyInBackground(RenderKey key, Bitmap bitmap)
+    {
+        if (Volatile.Read(ref _previewCacheLimitBytes) <= 0 || ContainsPreview(key)) return;
+        AcquireSource(bitmap);
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                Bitmap stored;
+                lock (bitmap) stored = new Bitmap(bitmap);
+                if (!AddPreviewOwned(key, stored)) stored.Dispose();
+            }
+            finally { ReleaseSource(bitmap); }
+        });
+    }
+
     private void ClearRenderCache()
     {
         Bitmap[] images;
         lock (_renderCacheGate)
         {
-            images = _renderCache.Values.Select(item => item.Bitmap).ToArray();
+            images = _renderCache.Values
+                .Where(item => item.ActiveReaders == 0)
+                .Select(item => item.Bitmap).ToArray();
+            foreach (var item in _renderCache.Values.Where(item => item.ActiveReaders > 0))
+                item.Retired = true;
             _renderCache.Clear();
             _renderLookup.Clear();
             _renderBytesByPage.Clear();
+            _renderBytesByContextPage.Clear();
             _cachedPageCounts.Clear();
             _renderCacheBytes = 0;
+        }
+        if (images.Length > 0)
+            _ = Task.Run(() =>
+            {
+                foreach (var image in images) lock (image) image.Dispose();
+            });
+    }
+
+    private void ClearPreviewCache()
+    {
+        Bitmap[] images;
+        lock (_previewCacheGate)
+        {
+            images = _previewCache.Values
+                .Where(item => item.ActiveReaders == 0)
+                .Select(item => item.Bitmap).ToArray();
+            foreach (var item in _previewCache.Values.Where(item => item.ActiveReaders > 0))
+                item.Retired = true;
+            _previewCache.Clear();
+            _previewLookup.Clear();
+            _previewCacheBytes = 0;
         }
         if (images.Length > 0)
             _ = Task.Run(() =>

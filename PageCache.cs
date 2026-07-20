@@ -45,6 +45,42 @@ internal sealed class PageCache : IDisposable
         }
     }
 
+    public Size? TryGetLoadedSize(int index)
+    {
+        lock (_gate)
+        {
+            return _items.TryGetValue(index, out var item) && item.Task.IsCompletedSuccessfully
+                ? item.Task.Result.Size
+                : null;
+        }
+    }
+
+    public async Task<T?> TryUseLoadedAsync<T>(
+        int index, Func<Bitmap, T> work, CancellationToken cancellationToken)
+        where T : class
+    {
+        CacheItem? item;
+        lock (_gate)
+        {
+            if (!_items.TryGetValue(index, out item) || !item.Task.IsCompletedSuccessfully)
+                return null;
+            item.ActiveReaders++;
+        }
+        try
+        {
+            var bitmap = item.Task.Result;
+            return await Task.Run(() =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                lock (bitmap) return work(bitmap);
+            }, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_gate) item.ActiveReaders--;
+        }
+    }
+
     public long GetDirectionalBytes(int center, bool ahead)
         => _pageBytes.Where(pair => ahead ? pair.Key >= center : pair.Key < center)
             .Sum(pair => pair.Value);
@@ -73,18 +109,23 @@ internal sealed class PageCache : IDisposable
             : left.Key.CompareTo(right.Key));
         List<Bitmap> evicted = [];
         var sideBytes = GetDirectionalBytes(center, ahead);
-        lock (_gate)
+        const int batchSize = 24;
+        for (var offset = 0; offset < candidates.Length && sideBytes > maximumBytes; offset += batchSize)
         {
-            foreach (var candidate in candidates)
+            lock (_gate)
             {
-                if (sideBytes <= maximumBytes) break;
-                if (!_items.TryGetValue(candidate.Key, out var item) ||
-                    item.ActiveReaders != 0 || item.Bytes == 0 || !_items.Remove(candidate.Key)) continue;
-                sideBytes -= item.Bytes;
-                _cachedBytes -= item.Bytes;
-                _pageBytes.TryRemove(candidate.Key, out _);
-                evicted.Add(item.Task.Result);
+                foreach (var candidate in candidates.Skip(offset).Take(batchSize))
+                {
+                    if (sideBytes <= maximumBytes) break;
+                    if (!_items.TryGetValue(candidate.Key, out var item) ||
+                        item.ActiveReaders != 0 || item.Bytes == 0 || !_items.Remove(candidate.Key)) continue;
+                    sideBytes -= item.Bytes;
+                    _cachedBytes -= item.Bytes;
+                    _pageBytes.TryRemove(candidate.Key, out _);
+                    evicted.Add(item.Task.Result);
+                }
             }
+            Thread.Yield();
         }
         foreach (var bitmap in evicted) DisposeBitmap(bitmap);
     }

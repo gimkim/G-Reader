@@ -57,6 +57,23 @@ internal static class ToolbarIconFactory
         g.DrawLine(accent, 20, 4, 13, 11);
     });
 
+    public static Image MoveUp() => Draw(g =>
+    {
+        using var folderPen = Pen(Ink, 1.7f);
+        using var folderFill = new SolidBrush(Color.FromArgb(72, 120, 196));
+        var folder = new GraphicsPath();
+        folder.AddPolygon(new Point[]
+        {
+            new(2, 9), new(9, 9), new(11, 12), new(22, 12), new(20, 21), new(3, 21)
+        });
+        g.FillPath(folderFill, folder);
+        g.DrawPath(folderPen, folder);
+        using var arrow = Pen(Accent, 2.5f);
+        g.DrawLine(arrow, 12, 15, 12, 3);
+        g.DrawLine(arrow, 12, 3, 7, 8);
+        g.DrawLine(arrow, 12, 3, 17, 8);
+    });
+
     public static Image Boundary(bool pointsRight, bool start) => Draw(g =>
     {
         using var pen = Pen(Ink, 2.2f); using var accent = Pen(Accent, 2.5f);

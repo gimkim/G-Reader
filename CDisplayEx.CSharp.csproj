@@ -13,6 +13,7 @@
     <AssemblyTitle>G Reader</AssemblyTitle>
     <Product>G Reader</Product>
     <Description>Hardware-accelerated comic and image reader</Description>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Magick.NET-Q8-x64" Version="14.14.0" />

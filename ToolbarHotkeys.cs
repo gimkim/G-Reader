@@ -10,6 +10,7 @@ internal static class ToolbarHotkeyCatalog
     public const string OpenFolder = "open_folder";
     public const string OpenRandom = "open_random";
     public const string OpenInExplorer = "open_in_explorer";
+    public const string MoveUp = "move_up";
     public const string Start = "start";
     public const string Left = "left";
     public const string Right = "right";
@@ -26,6 +27,7 @@ internal static class ToolbarHotkeyCatalog
         new(OpenFolder, "Open folder", Keys.Control | Keys.O),
         new(OpenRandom, "Open random", Keys.Control | Keys.R),
         new(OpenInExplorer, "Open in Explorer", Keys.Control | Keys.Shift | Keys.E),
+        new(MoveUp, "Move up", Keys.Alt | Keys.Up),
         new(Start, "Start", Keys.Home),
         new(Left, "Left", Keys.Left),
         new(Right, "Right", Keys.Right),

@@ -2,31 +2,40 @@ namespace CDisplayEx.CSharp;
 
 internal static class CommandLineOptions
 {
+    internal readonly record struct OpenRequest(string? Path, bool ForceFullPage);
+
     private static readonly string[] PathOptions =
     [
         "--open", "--file", "--folder", "-o", "/open", "/file", "/folder"
     ];
 
-    public static string? GetInitialPath(IReadOnlyList<string> args)
+    public static OpenRequest GetInitialRequest(IReadOnlyList<string> args)
     {
+        var forceFullPage = false;
         for (var index = 0; index < args.Count; index++)
         {
             var argument = Clean(args[index]);
             if (string.IsNullOrWhiteSpace(argument)) continue;
 
+            if (argument.Equals("--explorer", StringComparison.OrdinalIgnoreCase))
+            {
+                forceFullPage = true;
+                continue;
+            }
+
             var optionValue = GetInlineOptionValue(argument);
-            if (optionValue is not null) return NormalizePath(optionValue);
+            if (optionValue is not null) return new(NormalizePath(optionValue), forceFullPage);
 
             if (PathOptions.Contains(argument, StringComparer.OrdinalIgnoreCase))
             {
-                if (++index < args.Count) return NormalizePath(Clean(args[index]));
-                return null;
+                if (++index < args.Count) return new(NormalizePath(Clean(args[index])), forceFullPage);
+                return new(null, forceFullPage);
             }
 
             if (argument.StartsWith('-')) continue;
-            return NormalizePath(argument);
+            return new(NormalizePath(argument), forceFullPage);
         }
-        return null;
+        return new(null, forceFullPage);
     }
 
     private static string? GetInlineOptionValue(string argument)

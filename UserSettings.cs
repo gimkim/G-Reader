@@ -4,6 +4,11 @@ namespace CDisplayEx.CSharp;
 
 internal sealed class UserSettings
 {
+    public static int DefaultImageMagickThreadsPerImage =>
+        Math.Clamp(Environment.ProcessorCount / 4, 2, 8);
+    public static int DefaultZoomImageMagickThreadsPerImage =>
+        Math.Clamp(Environment.ProcessorCount / 2, 4, 32);
+
     public bool DoublePage { get; set; } = true;
     public bool DoublePageOffset { get; set; }
     public bool AutoSingleLandscape { get; set; } = true;
@@ -16,12 +21,25 @@ internal sealed class UserSettings
     public bool Shadow { get; set; } = true;
     public bool FitToScreen { get; set; } = true;
     public int LanczosQuality { get; set; } = 1;
+    public bool AutoOptimizePerformance { get; set; }
     public int CacheAheadMB { get; set; } = 3072;
     public int CacheBehindMB { get; set; } = 1024;
+    public int PreviewCacheMB { get; set; } = 512;
+    public int ThumbnailCacheMB { get; set; } = 512;
+    public int ThumbnailFastPreviewCacheMB { get; set; } = 256;
+    public int ThumbnailMaxPreviewSizePx { get; set; } = 360;
+    public int FastPreviewWorkerCount { get; set; } = 4;
+    public int FastPreviewThreadsPerWorker { get; set; } = 2;
+    public int PrecacheWorkerCount { get; set; } = 3;
+    public int ImageMagickThreadsPerImage { get; set; } = DefaultImageMagickThreadsPerImage;
+    public int ZoomImageMagickThreadsPerImage { get; set; } = DefaultZoomImageMagickThreadsPerImage;
     public int BackgroundArgb { get; set; } = Color.FromArgb(30, 32, 38).ToArgb();
-    // 0 = off, 1 = natural file name, 2 = last-write time (oldest to newest).
-    public int AdjacentBookOrder { get; set; }
-    public bool IncludeFoldersInAdjacentBooks { get; set; }
+    public PageSortMode FolderPageSort { get; set; } = PageSortMode.NameNumeric;
+    public PageSortMode ArchivePageSort { get; set; } = PageSortMode.NameNumeric;
+    public bool FolderPageSortDescending { get; set; }
+    public bool ArchivePageSortDescending { get; set; }
+    // 0 = off, 1 = folders, 2 = archives/PDFs, 3 = both.
+    public int AutoMoveMode { get; set; }
     public string RandomLibraryPath { get; set; } = string.Empty;
     public bool HasWindowBounds { get; set; }
     public bool WindowMaximized { get; set; }
@@ -45,9 +63,26 @@ internal sealed class UserSettings
             var path = File.Exists(FilePath) ? FilePath : LegacyFilePath;
             return File.Exists(path)
                 ? JsonSerializer.Deserialize<UserSettings>(File.ReadAllText(path)) ?? new()
-                : new();
+                : CreateFirstRunDefaults();
         }
-        catch { return new(); }
+        catch { return CreateFirstRunDefaults(); }
+    }
+
+    private static UserSettings CreateFirstRunDefaults()
+    {
+        var settings = new UserSettings { AutoOptimizePerformance = true };
+        var profile = PerformanceProfile.Detect();
+        settings.CacheAheadMB = profile.CacheAheadMB;
+        settings.CacheBehindMB = profile.CacheBehindMB;
+        settings.PreviewCacheMB = profile.PreviewCacheMB;
+        settings.ThumbnailCacheMB = profile.ThumbnailCacheMB;
+        settings.ThumbnailFastPreviewCacheMB = profile.ThumbnailFastPreviewCacheMB;
+        settings.FastPreviewWorkerCount = profile.FastPreviewWorkerCount;
+        settings.FastPreviewThreadsPerWorker = profile.FastPreviewThreadsPerWorker;
+        settings.PrecacheWorkerCount = profile.PrecacheWorkerCount;
+        settings.ImageMagickThreadsPerImage = profile.ImageMagickThreadsPerImage;
+        settings.ZoomImageMagickThreadsPerImage = profile.ZoomImageMagickThreadsPerImage;
+        return settings;
     }
 
     public void Save()
