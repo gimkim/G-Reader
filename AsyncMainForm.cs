@@ -2484,7 +2484,17 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     public bool PreFilterMessage(ref Message message)
     {
         const int WmMouseWheel = 0x020A;
-        return message.Msg == WmMouseWheel && _book is not null && IsPointOverReader(Cursor.Position);
+        if (message.Msg != WmMouseWheel || _book is null ||
+            !IsPointOverReader(Cursor.Position)) return false;
+
+        // Focused input uses the standard message so precision-touchpad deltas
+        // are preserved. Raw Input remains the asynchronous unfocused fallback.
+        if (ContainsFocus || Form.ActiveForm == this)
+        {
+            var delta = unchecked((short)((message.WParam.ToInt64() >> 16) & 0xffff));
+            if (delta != 0) OnHoveredMouseWheel(delta);
+        }
+        return true;
     }
 
     protected override void OnHandleCreated(EventArgs e)
@@ -2502,6 +2512,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     protected override void WndProc(ref Message message)
     {
         if (message.Msg == RawMouseWheelInput.WindowMessage &&
+            !ContainsFocus && Form.ActiveForm != this &&
             RawMouseWheelInput.TryGetWheelDelta(message.LParam, out var delta) &&
             IsPointOverReader(Cursor.Position))
             OnHoveredMouseWheel(delta);

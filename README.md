@@ -55,6 +55,7 @@ The project focuses on immediate interaction: opening, scrolling, page navigatio
 - Single-click selects an item; double-click or `Enter` opens it.
 - Arrow keys always move the thumbnail selection. Home and End move to the first and last item across folders, archives, PDFs, and images.
 - `Ctrl+mouse wheel` changes the number of images per row.
+- Mouse-wheel and precision-touchpad input scrolls by continuous pixels with browser-style easing instead of fixed lines.
 - `Ctrl+C` copies the selected image file.
 - Selection changes update the bottom position slider and file information.
 - An address bar opens an entered folder or file path.
@@ -118,7 +119,7 @@ G Reader separates interactive display work from decoding, preview generation, L
 - Cache cleanup is delayed and coalesced with temporary headroom rather than enforcing a strict limit during interaction.
 - Thumbnail completion notifications are coalesced, and off-screen completions do not enqueue unnecessary UI repaints.
 - Thumbnail scrolling reuses the previous window pixels and repaints only exposed strips and dirty cells.
-- High-frequency raw wheel input is combined to match display update cadence.
+- High-frequency wheel input is combined to match display update cadence. Focused precision-touchpad input preserves sub-notch deltas, while asynchronous Raw Input keeps hover scrolling available when the app is unfocused.
 
 Animated files are inspected and decoded only when the matching page is visible. Static images continue through the normal fast cache path without animation overhead.
 

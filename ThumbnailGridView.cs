@@ -12,6 +12,7 @@ internal sealed class ThumbnailGridView : Panel
     private readonly ThumbnailRenderCache _browsePreviewCache = new();
     private readonly System.Windows.Forms.Timer _renderSizeDebounce = new() { Interval = 180 };
     private readonly System.Windows.Forms.Timer _priorityRefreshDebounce = new() { Interval = 45 };
+    private readonly System.Windows.Forms.Timer _smoothScrollTimer = new() { Interval = 8 };
     private readonly SolidBrush _selectedBrush = new(Color.FromArgb(65, 103, 170));
     private readonly SolidBrush _normalBrush = new(Color.FromArgb(42, 45, 52));
     private readonly SolidBrush _backgroundBrush = new(Color.FromArgb(26, 28, 33));
@@ -52,6 +53,9 @@ internal sealed class ThumbnailGridView : Panel
     private int _maximumScrollOffset;
     private int _firstVisibleItem;
     private int _lastVisibleItem = -1;
+    private double _smoothScrollPosition;
+    private double _smoothScrollTarget;
+    private long _smoothScrollLastTick;
     private bool _showOverlayScrollBar;
     private bool _overlayScrollDragging;
     private bool _overlayScrollInteraction;
@@ -155,6 +159,7 @@ internal sealed class ThumbnailGridView : Panel
             _renderSizeDebounce.Stop();
             BrowsePriorityChanged?.Invoke(this, EventArgs.Empty);
         };
+        _smoothScrollTimer.Tick += (_, _) => AdvanceSmoothScroll();
     }
 
     public void SetCacheLimits(long fullCacheBytes, long fastPreviewCacheBytes)
@@ -306,10 +311,54 @@ internal sealed class ThumbnailGridView : Panel
 
     public void ScrollByWheel(int delta)
     {
-        var notches = delta / Math.Max(1, SystemInformation.MouseWheelScrollDelta);
-        if (notches == 0) return;
-        SetScrollOffset(Math.Max(
-            0, ScrollOffset - notches * Math.Max(48, _cellHeight / 3)));
+        if (delta == 0 || !_showOverlayScrollBar || _maximumScrollOffset <= 0) return;
+        var startingGesture = !_smoothScrollTimer.Enabled;
+        if (startingGesture)
+        {
+            _smoothScrollPosition = _scrollOffset;
+            _smoothScrollTarget = _scrollOffset;
+            _smoothScrollLastTick = System.Diagnostics.Stopwatch.GetTimestamp();
+        }
+
+        // Keep the original wheel delta as a continuous value. Precision
+        // touchpads commonly send values smaller than WHEEL_DELTA (120).
+        var pixelsPerNotch = Math.Max(64d, _cellHeight * 0.46d);
+        _smoothScrollTarget = Math.Clamp(
+            _smoothScrollTarget - delta * pixelsPerNotch /
+                Math.Max(1, SystemInformation.MouseWheelScrollDelta),
+            0d, _maximumScrollOffset);
+        if (Math.Abs(_smoothScrollTarget - _smoothScrollPosition) < 0.01d) return;
+        if (startingGesture)
+        {
+            _renderSizeDebounce.Stop();
+            ThumbnailInteractionStarted?.Invoke(this, EventArgs.Empty);
+        }
+        _smoothScrollTimer.Start();
+    }
+
+    private void AdvanceSmoothScroll()
+    {
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        var elapsed = Math.Clamp(
+            (now - _smoothScrollLastTick) /
+                (double)System.Diagnostics.Stopwatch.Frequency,
+            1d / 240d, 0.05d);
+        _smoothScrollLastTick = now;
+        var remaining = _smoothScrollTarget - _smoothScrollPosition;
+        if (Math.Abs(remaining) <= 0.35d)
+        {
+            _smoothScrollPosition = _smoothScrollTarget;
+            SetScrollOffsetCore((int)Math.Round(_smoothScrollPosition));
+            _smoothScrollTimer.Stop();
+            QueueThumbnailRefresh();
+            return;
+        }
+
+        // Exponential response is frame-rate independent and lets additional
+        // wheel/touchpad input retarget the same motion without animation queues.
+        var response = 1d - Math.Exp(-elapsed / 0.052d);
+        _smoothScrollPosition += remaining * response;
+        SetScrollOffsetCore((int)Math.Round(_smoothScrollPosition));
     }
 
     public void MoveSelection(Keys direction)
@@ -506,6 +555,11 @@ internal sealed class ThumbnailGridView : Panel
 
     protected override void OnMouseDown(MouseEventArgs e)
     {
+        if (_smoothScrollTimer.Enabled)
+        {
+            StopSmoothScroll();
+            QueueThumbnailRefresh();
+        }
         _overlayScrollInteraction = false;
         if (e.Button == MouseButtons.Left && _showOverlayScrollBar &&
             GetOverlayTrackBounds().Contains(e.Location))
@@ -606,6 +660,7 @@ internal sealed class ThumbnailGridView : Panel
         {
             _renderSizeDebounce.Dispose();
             _priorityRefreshDebounce.Dispose();
+            _smoothScrollTimer.Dispose();
             _fullCache.Dispose();
             _fastPreviewCache.Dispose();
             _browsePreviewCache.Dispose();
@@ -634,6 +689,7 @@ internal sealed class ThumbnailGridView : Panel
     private void UpdateVirtualLayout()
     {
         if (IsDisposed) return;
+        StopSmoothScroll();
         var unconstrainedWidth = Math.Max(160, ClientSize.Width);
         var rows = (ItemCount + _imagesPerRow - 1) / _imagesPerRow;
         var unconstrainedCellWidth = Math.Max(72, unconstrainedWidth / _imagesPerRow);
@@ -654,6 +710,8 @@ internal sealed class ThumbnailGridView : Panel
             ? Math.Max(0, virtualHeight - ClientSize.Height)
             : 0;
         _scrollOffset = Math.Clamp(_scrollOffset, 0, _maximumScrollOffset);
+        _smoothScrollPosition = _scrollOffset;
+        _smoothScrollTarget = _scrollOffset;
         UpdateVisibleItemRange();
         Invalidate();
     }
@@ -840,6 +898,20 @@ internal sealed class ThumbnailGridView : Panel
 
     private void SetScrollOffset(int value)
     {
+        StopSmoothScroll();
+        value = _showOverlayScrollBar
+            ? Math.Clamp(value, 0, _maximumScrollOffset)
+            : 0;
+        if (_scrollOffset == value) return;
+        SetScrollOffsetCore(value);
+        // Painting the new viewport takes precedence over contact sheets that
+        // belonged to the old viewport. The debounce starts fresh work at rest.
+        ThumbnailInteractionStarted?.Invoke(this, EventArgs.Empty);
+        QueueThumbnailRefresh();
+    }
+
+    private void SetScrollOffsetCore(int value)
+    {
         value = _showOverlayScrollBar
             ? Math.Clamp(value, 0, _maximumScrollOffset)
             : 0;
@@ -847,11 +919,14 @@ internal sealed class ThumbnailGridView : Panel
         var previous = _scrollOffset;
         _scrollOffset = value;
         UpdateVisibleItemRange();
-        // Painting the new viewport takes precedence over contact sheets that
-        // belonged to the old viewport. The debounce starts fresh work at rest.
-        ThumbnailInteractionStarted?.Invoke(this, EventArgs.Empty);
         ScrollPaintedContent(previous - value);
-        QueueThumbnailRefresh();
+    }
+
+    private void StopSmoothScroll()
+    {
+        if (_smoothScrollTimer.Enabled) _smoothScrollTimer.Stop();
+        _smoothScrollPosition = _scrollOffset;
+        _smoothScrollTarget = _scrollOffset;
     }
 
     private void ScrollPaintedContent(int deltaY)
