@@ -10,14 +10,31 @@ internal static class RenderWorkScheduler
 
     private static readonly object PriorityGate = new();
     private static FastLane _fastLane = new(4, 2);
+    private static int _fastCodecConcurrency = 8;
+    private static int _batchCodecConcurrency = 8;
     private static int _pendingFastWork;
     private static TaskCompletionSource _fastWorkDrained = CreateCompletedSignal();
 
-    public static void Configure(int fastPreviewWorkers, int fastPreviewThreadsPerWorker)
+    public static int FastCodecConcurrency =>
+        Volatile.Read(ref _fastCodecConcurrency);
+
+    public static int BatchCodecConcurrency =>
+        Volatile.Read(ref _batchCodecConcurrency);
+
+    public static void Configure(
+        int fastPreviewWorkers, int fastPreviewThreadsPerWorker,
+        int batchWorkers, int batchThreadsPerImage)
     {
         Volatile.Write(ref _fastLane, new FastLane(
             Math.Clamp(fastPreviewWorkers, 1, 64),
             Math.Clamp(fastPreviewThreadsPerWorker, 1, 64)));
+        var logicalCpu = Math.Clamp(Environment.ProcessorCount, 1, 64);
+        Volatile.Write(ref _fastCodecConcurrency, Math.Clamp(
+            checked(fastPreviewWorkers * fastPreviewThreadsPerWorker),
+            1, logicalCpu));
+        Volatile.Write(ref _batchCodecConcurrency, Math.Clamp(
+            checked(batchWorkers * batchThreadsPerImage),
+            1, logicalCpu));
     }
 
     public static async Task<T> RunFastAsync<T>(
@@ -60,6 +77,22 @@ internal static class RenderWorkScheduler
         return await Task.Run(
             () => RunAtPriority(work, ThreadPriority.BelowNormal),
             cancellationToken).ConfigureAwait(false);
+    }
+
+    public static async Task<T> RunFastCodecAsync<T>(
+        Func<T> work, CancellationToken cancellationToken)
+    {
+        // JPEG/libjpeg decoding does not scale across the configured threads
+        // inside one image. Its outer caller uses FastCodecConcurrency to turn
+        // that otherwise-idle per-image budget into parallel image decodes.
+        RegisterFastWork();
+        try
+        {
+            return await Task.Run(
+                () => RunAtPriority(work, ThreadPriority.BelowNormal),
+                cancellationToken).ConfigureAwait(false);
+        }
+        finally { UnregisterFastWork(); }
     }
 
     public static async Task<T> RunUrgentAsync<T>(

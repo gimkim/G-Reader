@@ -18,6 +18,14 @@
   <ItemGroup>
     <PackageReference Include="Magick.NET-Q8-x64" Version="14.14.0" />
     <PackageReference Include="SharpCompress" Version="0.49.1" />
+    <PackageReference Include="turbojpeg-VC" Version="3.1.1" />
     <PackageReference Include="Vortice.Direct2D1" Version="3.8.3" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="$(NuGetPackageRoot)turbojpeg-vc.redist\3.1.1\build\native\bin\x64\turbojpeg.dll"
+             Link="turbojpeg.dll"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest"
+             Visible="false" />
   </ItemGroup>
 </Project>

@@ -1,38 +1,16 @@
-using System.Drawing.Drawing2D;
-using System.Runtime.InteropServices;
-
 namespace CDisplayEx.CSharp;
 
 internal readonly record struct ThumbnailPreviewWorkItem(bool IsBrowse, int Index);
 
-internal sealed class ThumbnailGridView : Panel
+internal sealed partial class ThumbnailGridView : Panel
 {
+    private const int ScrollingViewportRefreshIntervalMs = 180;
     private readonly ThumbnailRenderCache _fullCache = new();
     private readonly ThumbnailRenderCache _fastPreviewCache = new();
     private readonly ThumbnailRenderCache _browsePreviewCache = new();
     private readonly System.Windows.Forms.Timer _renderSizeDebounce = new() { Interval = 180 };
     private readonly System.Windows.Forms.Timer _priorityRefreshDebounce = new() { Interval = 45 };
     private readonly System.Windows.Forms.Timer _smoothScrollTimer = new() { Interval = 8 };
-    private readonly SolidBrush _selectedBrush = new(Color.FromArgb(65, 103, 170));
-    private readonly SolidBrush _normalBrush = new(Color.FromArgb(42, 45, 52));
-    private readonly SolidBrush _backgroundBrush = new(Color.FromArgb(26, 28, 33));
-    private readonly Pen _borderPen = new(Color.FromArgb(78, 82, 92));
-    private readonly Pen _selectedPen = new(Color.FromArgb(107, 166, 255), 2f);
-    private readonly Font _nameFont = new("Segoe UI", 9f, FontStyle.Regular, GraphicsUnit.Point);
-    private readonly Font _numberFont = new("Segoe UI", 8f, FontStyle.Bold, GraphicsUnit.Point);
-    private readonly SolidBrush _numberBrush = new(Color.FromArgb(205, 20, 22, 27));
-    private readonly Pen _numberBorder = new(Color.FromArgb(125, 160, 170, 190));
-    private readonly SolidBrush _placeholderBrush = new(Color.FromArgb(34, 37, 44));
-    private readonly Pen _placeholderPen = new(Color.FromArgb(82, 89, 103), 1.2f);
-    private readonly SolidBrush _folderBrush = new(Color.FromArgb(224, 174, 65));
-    private readonly SolidBrush _parentFolderBrush = new(Color.FromArgb(111, 151, 205));
-    private readonly SolidBrush _archiveBrush = new(Color.FromArgb(103, 137, 188));
-    private readonly SolidBrush _pdfBrush = new(Color.FromArgb(198, 72, 72));
-    private readonly Pen _browseIconBorder = new(Color.FromArgb(235, 238, 244), 1.2f);
-    private readonly Font _containerFontSmall = new(
-        "Segoe UI", 8f, FontStyle.Bold, GraphicsUnit.Point);
-    private readonly Font _containerFontLarge = new(
-        "Segoe UI", 14f, FontStyle.Bold, GraphicsUnit.Point);
     private readonly System.Collections.Concurrent.ConcurrentDictionary<int, string>
         _generationStates = new();
     private readonly object _invalidationGate = new();
@@ -62,6 +40,9 @@ internal sealed class ThumbnailGridView : Panel
     private int _overlayDragStartY;
     private int _overlayDragStartOffset;
     private bool _visibleLayoutRefreshPending;
+    private long _lastScrollingViewportRefreshTick;
+    private int _lastScrollingViewportFirstItem = -1;
+    private int _lastScrollingViewportLastItem = -1;
 
     public event EventHandler<int>? PageActivated;
     public event EventHandler<string>? FolderActivated;
@@ -69,6 +50,7 @@ internal sealed class ThumbnailGridView : Panel
     public event EventHandler? BrowsePriorityChanged;
     public event EventHandler? ThumbnailInteractionStarted;
     public event EventHandler? ThumbnailRefreshRequested;
+    public event EventHandler? VisiblePreviewRefreshRequested;
 
     public int PageCount => _pageCount;
     public string? SelectedBrowsePath =>
@@ -137,19 +119,20 @@ internal sealed class ThumbnailGridView : Panel
     public ThumbnailGridView()
     {
         SetStyle(ControlStyles.StandardClick | ControlStyles.StandardDoubleClick |
-            ControlStyles.Opaque, true);
+            ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
+            ControlStyles.Opaque | ControlStyles.ResizeRedraw, true);
         Dock = DockStyle.Fill;
         AutoScroll = false;
-        DoubleBuffered = true;
+        DoubleBuffered = false;
         ResizeRedraw = true;
-        BackColor = Color.FromArgb(26, 28, 33);
+        BackColor = System.Drawing.Color.FromArgb(26, 28, 33);
         TabStop = true;
+        InitializeDirect2D();
         Resize += (_, _) => UpdateVirtualLayout();
         _renderSizeDebounce.Tick += (_, _) =>
         {
             _renderSizeDebounce.Stop();
-            // A final complete frame removes any transient artifacts left by
-            // the fast scroll blit before background refinement resumes.
+            // Draw a final settled GPU frame before background refinement resumes.
             Invalidate();
             ThumbnailRefreshRequested?.Invoke(this, EventArgs.Empty);
         };
@@ -171,6 +154,7 @@ internal sealed class ThumbnailGridView : Panel
                 16L * 1024 * 1024, 128L * 1024 * 1024);
         Volatile.Write(ref _browsePreviewCacheLimitBytes, browseLimit);
         _browsePreviewCache.SetLimit(browseLimit);
+        SetGpuCacheLimit(fullCacheBytes, fastPreviewCacheBytes, browseLimit);
         Invalidate();
     }
 
@@ -185,6 +169,7 @@ internal sealed class ThumbnailGridView : Panel
     public void ClearFullQualityCache()
     {
         _fullCache.Clear();
+        ClearGpuTextureCache();
         Invalidate();
     }
 
@@ -194,6 +179,7 @@ internal sealed class ThumbnailGridView : Panel
         _fullCache.Clear();
         _fastPreviewCache.Clear();
         _browsePreviewCache.Clear();
+        ClearGpuTextureCache();
         _pageNames = pageNames.Select(GetDisplayFileName).ToArray();
         _folders = folders?.ToArray() ?? [];
         _pageCount = _pageNames.Length;
@@ -210,7 +196,23 @@ internal sealed class ThumbnailGridView : Panel
     public bool HasBrowsePreview(int item, Size size) =>
         _browsePreviewCache.HasExact(item, size);
 
+    public Bitmap? CloneBestPagePreview(int page)
+    {
+        if (page < 0 || page >= _pageCount) return null;
+        using var full = _fullCache.AcquireBest(page, _renderTargetSize);
+        if (full is not null)
+        {
+            lock (full.Bitmap) return new Bitmap(full.Bitmap);
+        }
+        using var fast = _fastPreviewCache.AcquireBest(page, _renderTargetSize);
+        if (fast is null) return null;
+        lock (fast.Bitmap) return new Bitmap(fast.Bitmap);
+    }
+
     public ThumbnailFolderEntry[] GetBrowseEntries() => _folders.ToArray();
+
+    public ThumbnailFolderEntry? GetBrowseEntry(int item) =>
+        item >= 0 && item < _folders.Length ? _folders[item] : null;
 
     public ThumbnailPreviewWorkItem[] GetPreviewPriorityOrder()
     {
@@ -264,6 +266,37 @@ internal sealed class ThumbnailGridView : Panel
                 : new ThumbnailPreviewWorkItem(false, item - _folders.Length))
             .ToArray();
     }
+
+    public ThumbnailPreviewWorkItem[] GetVisiblePreviewPriorityOrder()
+    {
+        if (ItemCount == 0) return [];
+        var columns = Math.Max(1, _imagesPerRow);
+        var firstVisible = Math.Clamp(
+            Volatile.Read(ref _firstVisibleItem), 0, ItemCount - 1);
+        var lastVisible = Math.Clamp(
+            Volatile.Read(ref _lastVisibleItem), firstVisible, ItemCount - 1);
+        var first = Math.Max(0, firstVisible - columns);
+        var last = Math.Min(ItemCount - 1, lastVisible + columns);
+        var center = (firstVisible + lastVisible) / 2;
+        var result = new List<ThumbnailPreviewWorkItem>(last - first + 1);
+        var maximumDistance = Math.Max(center - first, last - center);
+        for (var distance = 0; distance <= maximumDistance; distance++)
+        {
+            var before = center - distance;
+            if (before >= first)
+                result.Add(ToPreviewWorkItem(before));
+            if (distance == 0) continue;
+            var after = center + distance;
+            if (after <= last)
+                result.Add(ToPreviewWorkItem(after));
+        }
+        return result.ToArray();
+    }
+
+    private ThumbnailPreviewWorkItem ToPreviewWorkItem(int item) =>
+        item < _folders.Length
+            ? new ThumbnailPreviewWorkItem(true, item)
+            : new ThumbnailPreviewWorkItem(false, item - _folders.Length);
 
     public void SetBrowsePreview(int item, Size size, Bitmap preview)
     {
@@ -331,7 +364,9 @@ internal sealed class ThumbnailGridView : Panel
         if (startingGesture)
         {
             _renderSizeDebounce.Stop();
-            ThumbnailInteractionStarted?.Invoke(this, EventArgs.Empty);
+            // Keep the current preview batch alive while scrolling. Cancelling it
+            // here left the GPU with no newly completed thumbnails until the
+            // settled-viewport debounce restarted all work.
         }
         _smoothScrollTimer.Start();
     }
@@ -387,6 +422,27 @@ internal sealed class ThumbnailGridView : Panel
         Focus();
     }
 
+    public void MoveSelectionPage(bool down)
+    {
+        if (ItemCount <= 0) return;
+        var current = _selectedItem >= 0
+            ? _selectedItem
+            : Math.Clamp(ScrollOffset / Math.Max(1, _cellHeight) * _imagesPerRow,
+                0, ItemCount - 1);
+        // Retain one row of visual context, like a browser page-scroll, and
+        // preserve the selected column where the final partial row permits it.
+        var visibleRows = Math.Max(1,
+            Math.Max(1, ClientSize.Height) / Math.Max(1, _cellHeight));
+        var rowsPerPage = Math.Max(1, visibleRows - 1);
+        var distance = checked(rowsPerPage * Math.Max(1, _imagesPerRow));
+        var target = down
+            ? Math.Min(ItemCount - 1, current + distance)
+            : Math.Max(0, current - distance);
+        SelectItem(target);
+        EnsureItemVisible(target);
+        Focus();
+    }
+
     public bool ActivateSelection()
     {
         var item = _selectedItem;
@@ -428,129 +484,30 @@ internal sealed class ThumbnailGridView : Panel
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
+        EnsureThumbnailRenderTarget();
         if (Visible) RefreshVirtualLayoutAfterShow();
+    }
+
+    protected override void OnHandleDestroyed(EventArgs e)
+    {
+        DiscardThumbnailDeviceResources();
+        base.OnHandleDestroyed(e);
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        ResizeThumbnailRenderTarget();
     }
 
     protected override void OnPaint(PaintEventArgs e)
     {
-        base.OnPaint(e);
-        e.Graphics.FillRectangle(_backgroundBrush, e.ClipRectangle);
-        if (ItemCount == 0) return;
-        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        e.Graphics.InterpolationMode = InterpolationMode.Low;
-        e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-        var scrollY = ScrollOffset;
-        var clipTop = Math.Max(0, e.ClipRectangle.Top);
-        var clipBottom = Math.Min(ClientSize.Height,
-            Math.Max(clipTop, e.ClipRectangle.Bottom));
-        var firstRow = Math.Max(0, (scrollY + clipTop) / _cellHeight);
-        var lastRow = Math.Min((ItemCount - 1) / _imagesPerRow,
-            (scrollY + clipBottom) / _cellHeight + 1);
-        for (var row = firstRow; row <= lastRow; row++)
-        {
-            for (var column = 0; column < _imagesPerRow; column++)
-            {
-                var item = row * _imagesPerRow + column;
-                if (item >= ItemCount) break;
-                var page = item - _folders.Length;
-                var bounds = GetItemBounds(item);
-                bounds.Offset(0, -scrollY);
-                if (!bounds.IntersectsWith(e.ClipRectangle)) continue;
-                var selected = item == _selectedItem;
-                e.Graphics.FillRectangle(selected ? _selectedBrush : _normalBrush, bounds);
-                e.Graphics.DrawRectangle(selected ? _selectedPen : _borderPen, bounds);
-                var labelHeight = 28;
-                var imageArea = Rectangle.Inflate(bounds, -8, -8);
-                imageArea.Height -= labelHeight;
-                if (item < _folders.Length)
-                {
-                    using var preview = _browsePreviewCache.AcquireBest(item, _renderTargetSize);
-                    var iconArea = imageArea;
-                    if (preview is not null)
-                    {
-                        if (preview.Exact && preview.Bitmap.Size == imageArea.Size)
-                            e.Graphics.DrawImageUnscaled(preview.Bitmap, imageArea.Location);
-                        else
-                        {
-                            e.Graphics.InterpolationMode = InterpolationMode.Low;
-                            e.Graphics.DrawImage(preview.Bitmap, imageArea);
-                        }
-                        iconArea = new Rectangle(
-                            imageArea.Left + imageArea.Width / 18,
-                            imageArea.Top + imageArea.Height * 5 / 9,
-                            imageArea.Width * 4 / 9,
-                            imageArea.Height * 4 / 9);
-                    }
-                    DrawFolderTile(e.Graphics, iconArea, _folders[item]);
-                    var folderLabel = new Rectangle(
-                        bounds.X + 6, bounds.Bottom - labelHeight, bounds.Width - 12, labelHeight - 2);
-                    TextRenderer.DrawText(e.Graphics, _folders[item].Label, _nameFont,
-                        folderLabel, Color.Gainsboro,
-                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
-                        TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis |
-                        TextFormatFlags.NoPrefix);
-                    continue;
-                }
-                using var full = _fullCache.AcquireBest(page, _renderTargetSize);
-                ThumbnailRenderCache.Lease? fast = null;
-                var selectedThumbnail = full;
-                if (full?.Exact != true)
-                {
-                    fast = _fastPreviewCache.AcquireBest(page, _renderTargetSize);
-                    if (fast?.Exact == true || full is null) selectedThumbnail = fast;
-                }
-                if (selectedThumbnail is not null)
-                {
-                    var thumbnail = selectedThumbnail.Bitmap;
-                    var scale = Math.Min((float)imageArea.Width / thumbnail.Width,
-                        (float)imageArea.Height / thumbnail.Height);
-                    var width = Math.Max(1, (int)(thumbnail.Width * scale));
-                    var height = Math.Max(1, (int)(thumbnail.Height * scale));
-                    var target = new Rectangle(
-                        imageArea.X + (imageArea.Width - width) / 2,
-                        imageArea.Y + (imageArea.Height - height) / 2,
-                        width, height);
-                    e.Graphics.InterpolationMode =
-                        ReferenceEquals(selectedThumbnail, full) && full.Exact
-                            ? InterpolationMode.HighQualityBicubic
-                            : InterpolationMode.Low;
-                    e.Graphics.DrawImage(thumbnail, target);
-                }
-                else
-                {
-                    var placeholder = Rectangle.Inflate(imageArea, -10, -10);
-                    e.Graphics.FillRectangle(_placeholderBrush, placeholder);
-                    e.Graphics.DrawRectangle(_placeholderPen, placeholder);
-                    var state = _generationStates.GetValueOrDefault(page, "Waiting for preview…");
-                    TextRenderer.DrawText(e.Graphics, state, _nameFont, placeholder,
-                        Color.FromArgb(170, 180, 196),
-                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
-                        TextFormatFlags.WordBreak | TextFormatFlags.EndEllipsis);
-                }
-                fast?.Dispose();
-                var label = new Rectangle(
-                    bounds.X + 6, bounds.Bottom - labelHeight, bounds.Width - 12, labelHeight - 2);
-                TextRenderer.DrawText(e.Graphics, _pageNames[page], _nameFont, label, Color.Gainsboro,
-                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
-                    TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        DrawDirect2DThumbnailFrame();
+    }
 
-                var number = (page + 1).ToString();
-                var numberSize = TextRenderer.MeasureText(e.Graphics, number, _numberFont,
-                    Size.Empty, TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
-                var badge = new Rectangle(
-                    bounds.Right - numberSize.Width - 11,
-                    bounds.Bottom - numberSize.Height - 7,
-                    numberSize.Width + 7,
-                    numberSize.Height + 3);
-                e.Graphics.FillRectangle(_numberBrush, badge);
-                e.Graphics.DrawRectangle(_numberBorder, badge);
-                TextRenderer.DrawText(e.Graphics, number, _numberFont, badge, Color.White,
-                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
-                    TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
-            }
-        }
-        if (GetOverlayTrackBounds().IntersectsWith(e.ClipRectangle))
-            DrawOverlayScrollbar(e.Graphics);
+    protected override void OnPaintBackground(PaintEventArgs pevent)
+    {
+        // Direct2D clears and presents the entire HWND surface.
     }
 
     protected override void OnMouseDown(MouseEventArgs e)
@@ -664,24 +621,7 @@ internal sealed class ThumbnailGridView : Panel
             _fullCache.Dispose();
             _fastPreviewCache.Dispose();
             _browsePreviewCache.Dispose();
-            _selectedBrush.Dispose();
-            _normalBrush.Dispose();
-            _backgroundBrush.Dispose();
-            _borderPen.Dispose();
-            _selectedPen.Dispose();
-            _nameFont.Dispose();
-            _numberFont.Dispose();
-            _numberBrush.Dispose();
-            _numberBorder.Dispose();
-            _placeholderBrush.Dispose();
-            _placeholderPen.Dispose();
-            _folderBrush.Dispose();
-            _parentFolderBrush.Dispose();
-            _archiveBrush.Dispose();
-            _pdfBrush.Dispose();
-            _browseIconBorder.Dispose();
-            _containerFontSmall.Dispose();
-            _containerFontLarge.Dispose();
+            DisposeThumbnailDirect2D();
         }
         base.Dispose(disposing);
     }
@@ -818,81 +758,6 @@ internal sealed class ThumbnailGridView : Panel
         Invalidate(Rectangle.Inflate(bounds, 3, 3));
     }
 
-    private void DrawFolderTile(Graphics graphics, Rectangle area, ThumbnailFolderEntry folder)
-    {
-        if (folder.IsContainer)
-        {
-            DrawContainerTile(graphics, area, folder.IsPdf);
-            return;
-        }
-        var size = Math.Max(18, Math.Min(area.Width, area.Height) * 2 / 3);
-        var body = new Rectangle(
-            area.X + (area.Width - size) / 2,
-            area.Y + (area.Height - size * 3 / 4) / 2,
-            size, size * 3 / 4);
-        var folderBrush = folder.IsParent ? _parentFolderBrush : _folderBrush;
-        var tab = new Rectangle(body.Left + size / 10, body.Top - size / 7,
-            size * 2 / 5, size / 4);
-        graphics.FillRectangle(folderBrush, tab);
-        graphics.FillRectangle(folderBrush, body);
-        graphics.DrawRectangle(_browseIconBorder, body);
-        if (!folder.IsParent) return;
-        using var arrowPen = new Pen(Color.White, Math.Max(2f, size / 18f))
-        {
-            StartCap = LineCap.Round, EndCap = LineCap.Round
-        };
-        var centerX = body.Left + body.Width / 2;
-        var centerY = body.Top + body.Height / 2;
-        graphics.DrawLine(arrowPen, centerX + size / 6, centerY, centerX - size / 7, centerY);
-        graphics.DrawLine(arrowPen, centerX - size / 7, centerY,
-            centerX, centerY - size / 8);
-        graphics.DrawLine(arrowPen, centerX - size / 7, centerY,
-            centerX, centerY + size / 8);
-    }
-
-    private static bool PathsEqual(string first, string second)
-    {
-        try
-        {
-            return string.Equals(Path.GetFullPath(first), Path.GetFullPath(second),
-                StringComparison.OrdinalIgnoreCase);
-        }
-        catch
-        {
-            return string.Equals(first, second, StringComparison.OrdinalIgnoreCase);
-        }
-    }
-
-    private void DrawContainerTile(Graphics graphics, Rectangle area, bool isPdf)
-    {
-        var height = Math.Max(24, Math.Min(area.Width, area.Height) * 3 / 4);
-        var width = Math.Max(18, height * 3 / 4);
-        var body = new Rectangle(
-            area.X + (area.Width - width) / 2,
-            area.Y + (area.Height - height) / 2,
-            width, height);
-        var fold = Math.Max(9, width / 4);
-        var fill = isPdf ? _pdfBrush : _archiveBrush;
-        var points = new[]
-        {
-            new Point(body.Left, body.Top),
-            new Point(body.Right - fold, body.Top),
-            new Point(body.Right, body.Top + fold),
-            new Point(body.Right, body.Bottom),
-            new Point(body.Left, body.Bottom)
-        };
-        graphics.FillPolygon(fill, points);
-        graphics.DrawPolygon(_browseIconBorder, points);
-        graphics.DrawLine(_browseIconBorder, body.Right - fold, body.Top,
-            body.Right - fold, body.Top + fold);
-        graphics.DrawLine(_browseIconBorder, body.Right - fold, body.Top + fold,
-            body.Right, body.Top + fold);
-        var text = isPdf ? "PDF" : "ARC";
-        var font = width >= 84 ? _containerFontLarge : _containerFontSmall;
-        TextRenderer.DrawText(graphics, text, font, body, Color.White,
-            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
-            TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
-    }
 
     private int ScrollOffset => _showOverlayScrollBar ? _scrollOffset : 0;
 
@@ -904,9 +769,8 @@ internal sealed class ThumbnailGridView : Panel
             : 0;
         if (_scrollOffset == value) return;
         SetScrollOffsetCore(value);
-        // Painting the new viewport takes precedence over contact sheets that
-        // belonged to the old viewport. The debounce starts fresh work at rest.
-        ThumbnailInteractionStarted?.Invoke(this, EventArgs.Empty);
+        // Let in-flight previews continue to complete while the scrollbar is
+        // moving. The debounce reorders the queue around the settled viewport.
         QueueThumbnailRefresh();
     }
 
@@ -919,6 +783,7 @@ internal sealed class ThumbnailGridView : Panel
         var previous = _scrollOffset;
         _scrollOffset = value;
         UpdateVisibleItemRange();
+        RequestVisiblePreviewRefreshIfDue();
         ScrollPaintedContent(previous - value);
     }
 
@@ -931,19 +796,9 @@ internal sealed class ThumbnailGridView : Panel
 
     private void ScrollPaintedContent(int deltaY)
     {
-        if (!IsHandleCreated || !Visible || ClientSize.IsEmpty ||
-            Math.Abs(deltaY) >= ClientSize.Height)
-        {
-            Invalidate();
-            return;
-        }
-
-        // Reuse pixels already painted in the window and invalidate only the
-        // newly exposed strip. This keeps wheel and thumb dragging independent
-        // of the number and complexity of visible thumbnail tiles.
-        _ = ScrollWindowEx(Handle, 0, deltaY, IntPtr.Zero, IntPtr.Zero,
-            IntPtr.Zero, out _, SwInvalidate);
-        Invalidate(GetOverlayTrackBounds());
+        // Direct2D redraws the visible scene from GPU textures. No GDI window
+        // blit is needed, and invalidation remains coalesced by the message pump.
+        Invalidate();
     }
 
     private void UpdateVisibleItemRange()
@@ -965,6 +820,29 @@ internal sealed class ThumbnailGridView : Panel
         Volatile.Write(ref _lastVisibleItem, last);
     }
 
+    private void RequestVisiblePreviewRefreshIfDue()
+    {
+        if (!Visible || ItemCount == 0) return;
+        var first = Volatile.Read(ref _firstVisibleItem);
+        var last = Volatile.Read(ref _lastVisibleItem);
+        if (first == _lastScrollingViewportFirstItem &&
+            last == _lastScrollingViewportLastItem) return;
+
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (_lastScrollingViewportRefreshTick != 0)
+        {
+            var elapsedMilliseconds =
+                (now - _lastScrollingViewportRefreshTick) * 1000d /
+                System.Diagnostics.Stopwatch.Frequency;
+            if (elapsedMilliseconds < ScrollingViewportRefreshIntervalMs) return;
+        }
+
+        _lastScrollingViewportRefreshTick = now;
+        _lastScrollingViewportFirstItem = first;
+        _lastScrollingViewportLastItem = last;
+        VisiblePreviewRefreshRequested?.Invoke(this, EventArgs.Empty);
+    }
+
     private Rectangle GetOverlayTrackBounds() => new(
         Math.Max(0, ClientSize.Width - 14),
         8,
@@ -983,19 +861,6 @@ internal sealed class ThumbnailGridView : Panel
         var y = track.Top + (int)Math.Round(
             travel * (double)ScrollOffset / _maximumScrollOffset);
         return new Rectangle(track.Left + 1, y, Math.Max(4, track.Width - 2), thumbHeight);
-    }
-
-    private void DrawOverlayScrollbar(Graphics graphics)
-    {
-        if (!_showOverlayScrollBar || _maximumScrollOffset <= 0) return;
-        var track = GetOverlayTrackBounds();
-        var thumb = GetOverlayThumbBounds();
-        using var trackBrush = new SolidBrush(Color.FromArgb(48, 8, 10, 14));
-        using var thumbBrush = new SolidBrush(_overlayScrollDragging
-            ? Color.FromArgb(220, 185, 202, 231)
-            : Color.FromArgb(155, 170, 188, 218));
-        graphics.FillRectangle(trackBrush, track);
-        graphics.FillRectangle(thumbBrush, thumb);
     }
 
     private void InvalidateCellThreadSafe(int page)
@@ -1068,11 +933,4 @@ internal sealed class ThumbnailGridView : Panel
         return string.IsNullOrWhiteSpace(fileName) ? name : fileName;
     }
 
-    private const uint SwInvalidate = 0x0002;
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern int ScrollWindowEx(
-        IntPtr window, int dx, int dy, IntPtr scrollRectangle,
-        IntPtr clipRectangle, IntPtr updateRegion,
-        out Rectangle updateRectangle, uint flags);
 }

@@ -408,7 +408,8 @@ internal sealed class AsyncViewerPanel : Panel
     }
 
     public void PresentImmediatePreview(
-        Bitmap first, Bitmap? second, int firstIndex, int secondIndex)
+        Bitmap first, Bitmap? second, int firstIndex, int secondIndex,
+        bool refitAfterPendingLayout = false)
     {
         CancelRender();
         _renderVersion++;
@@ -434,6 +435,22 @@ internal sealed class AsyncViewerPanel : Panel
             : CalculateSize(page, targetWidth, availableHeight, true, 1f)).ToArray();
         ApplyRendered(pages[0], pages[1], sizes, availableHeight, gap);
         _displayedPreview = true;
+        if (refitAfterPendingLayout && IsHandleCreated)
+        {
+            // A thumbnail can be published in the same UI turn that Full view
+            // becomes visible. Dock layout is occasionally still using the old
+            // bounds and no later Resize event is guaranteed, leaving the tile
+            // at native/small size. Re-fit after the pending layout messages.
+            // Re-fit whatever frame is current when the callback runs. Rapid
+            // wheel navigation may replace this thumbnail before the callback;
+            // skipping on a version mismatch used to leave the replacement at
+            // the first hidden viewer's ~512 px/native cached size.
+            BeginInvoke(new Action(() =>
+            {
+                if (IsDisposed || !FitToScreen || _zoomMode) return;
+                RelayoutDisplayedFrame();
+            }));
+        }
     }
 
     public bool TryPresentCachedPages(
@@ -497,9 +514,20 @@ internal sealed class AsyncViewerPanel : Panel
             var rendered = JapaneseMode
                 ? new[] { secondItem?.Bitmap, firstItem.Bitmap }
                 : new[] { firstItem.Bitmap, secondItem?.Bitmap };
-            var sizes = rendered.Select(bitmap => bitmap?.Size ?? Size.Empty).ToArray();
             const int gap = 10;
+            var availableWidth = Math.Max(100, ClientSize.Width - gap * 3);
             var availableHeight = Math.Max(100, ClientSize.Height - gap * 2);
+            var targetWidth = visiblePageCount == 2
+                ? availableWidth / 2 : availableWidth;
+            // Cache dimensions describe the stored texture, not its destination
+            // on screen. This matters after the viewer's first hidden->visible
+            // activation and when a small placeholder wins a rapid-navigation
+            // race. Direct2D can scale it immediately while a current-size
+            // quality render is prepared.
+            var sizes = rendered.Select(bitmap => bitmap is null
+                ? Size.Empty
+                : CalculateSize(bitmap, targetWidth, availableHeight,
+                    fitToScreen: true, zoom: 1f)).ToArray();
             ApplyRendered(rendered[0], rendered[1], sizes, availableHeight, gap, retainBitmaps: false);
             _displayedPreview = firstIsPreview || secondIsPreview;
             RenderingStateChanged?.Invoke(this, false);
@@ -649,8 +677,8 @@ internal sealed class AsyncViewerPanel : Panel
 
         if (generatePreview && Volatile.Read(ref _previewCacheLimitBytes) > 0)
         {
-            var preview = await RenderWorkScheduler.RunFastAsync(
-                _ => EncodedJpegRenderer.RenderReader(
+            var preview = await RenderWorkScheduler.RunFastCodecAsync(
+                () => EncodedJpegRenderer.RenderReader(
                     page, context.ClientSize, visiblePageCount, rotation,
                     context.LanczosQuality, fastPreview: true, cancellationToken),
                 cancellationToken).ConfigureAwait(false);
@@ -1487,19 +1515,26 @@ internal sealed class AsyncViewerPanel : Panel
     private void RelayoutDisplayedFrame()
     {
         if (!FitToScreen) return;
-        var boxes = new[] { _left, _right };
-        var visible = boxes.Where(box => box.Visible && box.Width > 0 && box.Height > 0).ToArray();
+        // Use the bitmap aspect ratio, not proxy bounds captured during an
+        // earlier/incomplete layout pass.
+        var visible = new[]
+        {
+            (Box: _left, Source: _leftRendered),
+            (Box: _right, Source: _rightRendered)
+        }.Where(item => item.Box.Visible && item.Source is not null).ToArray();
         if (visible.Length == 0) return;
 
         const int gap = 10;
         var availableWidth = Math.Max(100, ClientSize.Width - gap * 3);
         var availableHeight = Math.Max(100, ClientSize.Height - gap * 2);
         var targetWidth = visible.Length == 2 ? availableWidth / 2 : availableWidth;
-        var sizes = visible.Select(box =>
+        var sizes = visible.Select(item =>
         {
-            var scale = Math.Min((float)targetWidth / box.Width, (float)availableHeight / box.Height);
-            return new Size(Math.Max(1, (int)Math.Round(box.Width * scale)),
-                Math.Max(1, (int)Math.Round(box.Height * scale)));
+            var source = item.Source!;
+            var scale = Math.Min((float)targetWidth / source.Width,
+                (float)availableHeight / source.Height);
+            return new Size(Math.Max(1, (int)Math.Round(source.Width * scale)),
+                Math.Max(1, (int)Math.Round(source.Height * scale)));
         }).ToArray();
         var contentWidth = sizes.Sum(size => size.Width) + Math.Max(0, sizes.Length - 1) * gap;
         var x = Math.Max(gap, (ClientSize.Width - contentWidth) / 2);
@@ -1508,7 +1543,7 @@ internal sealed class AsyncViewerPanel : Panel
         {
             for (var i = 0; i < visible.Length; i++)
             {
-                visible[i].SetBounds(x,
+                visible[i].Box.SetBounds(x,
                     gap + Math.Max(0, (availableHeight - sizes[i].Height) / 2),
                     sizes[i].Width, sizes[i].Height, BoundsSpecified.All);
                 x += sizes[i].Width + gap;

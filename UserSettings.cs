@@ -4,6 +4,9 @@ namespace CDisplayEx.CSharp;
 
 internal sealed class UserSettings
 {
+    public static string DefaultPersistentCachePath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "G Reader", "PreviewCache");
     public static int DefaultImageMagickThreadsPerImage =>
         Math.Clamp(Environment.ProcessorCount / 4, 2, 8);
     public static int DefaultZoomImageMagickThreadsPerImage =>
@@ -27,6 +30,9 @@ internal sealed class UserSettings
     public int PreviewCacheMB { get; set; } = 512;
     public int ThumbnailCacheMB { get; set; } = 512;
     public int ThumbnailFastPreviewCacheMB { get; set; } = 256;
+    public string PersistentCachePath { get; set; } = DefaultPersistentCachePath;
+    public int FullViewDiskCacheMB { get; set; } = 4096;
+    public int ThumbnailDiskCacheMB { get; set; } = 4096;
     public int ThumbnailMaxPreviewSizePx { get; set; } = 360;
     public int FastPreviewWorkerCount { get; set; } = 4;
     public int FastPreviewThreadsPerWorker { get; set; } = 2;

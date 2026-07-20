@@ -8,6 +8,14 @@ internal sealed class ReaderSettingsDialog : Form
     private readonly NumericUpDown _previewCache = CreateMemoryInput();
     private readonly NumericUpDown _thumbnailCache = CreateMemoryInput();
     private readonly NumericUpDown _thumbnailFastPreviewCache = CreateMemoryInput();
+    private readonly TextBox _persistentCachePath = new() { Width = 420 };
+    private readonly NumericUpDown _fullViewDiskCache = CreateMemoryInput();
+    private readonly NumericUpDown _thumbnailDiskCache = CreateMemoryInput();
+    private readonly Label _diskCacheTotal = new()
+    {
+        Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft,
+        ForeColor = Color.FromArgb(70, 79, 94)
+    };
     private readonly NumericUpDown _thumbnailMaxPreviewSize = CreatePixelInput();
     private readonly NumericUpDown _fastPreviewWorkers = CreateWorkerInput();
     private readonly NumericUpDown _fastPreviewThreads = CreateWorkerInput();
@@ -38,6 +46,9 @@ internal sealed class ReaderSettingsDialog : Form
     public int PreviewCacheMB => (int)_previewCache.Value;
     public int ThumbnailCacheMB => (int)_thumbnailCache.Value;
     public int ThumbnailFastPreviewCacheMB => (int)_thumbnailFastPreviewCache.Value;
+    public string PersistentCachePath => _persistentCachePath.Text.Trim();
+    public int FullViewDiskCacheMB => (int)_fullViewDiskCache.Value;
+    public int ThumbnailDiskCacheMB => (int)_thumbnailDiskCache.Value;
     public int ThumbnailMaxPreviewSizePx => (int)_thumbnailMaxPreviewSize.Value;
     public int FastPreviewWorkerCount => (int)_fastPreviewWorkers.Value;
     public int FastPreviewThreadsPerWorker => (int)_fastPreviewThreads.Value;
@@ -82,6 +93,18 @@ internal sealed class ReaderSettingsDialog : Form
             (int)_thumbnailCache.Minimum, (int)_thumbnailCache.Maximum);
         _thumbnailFastPreviewCache.Value = Math.Clamp(settings.ThumbnailFastPreviewCacheMB,
             (int)_thumbnailFastPreviewCache.Minimum, (int)_thumbnailFastPreviewCache.Maximum);
+        _persistentCachePath.Text = string.IsNullOrWhiteSpace(settings.PersistentCachePath)
+            ? UserSettings.DefaultPersistentCachePath
+            : settings.PersistentCachePath;
+        _fullViewDiskCache.Value = Math.Clamp(settings.FullViewDiskCacheMB,
+            (int)_fullViewDiskCache.Minimum, (int)_fullViewDiskCache.Maximum);
+        _thumbnailDiskCache.Value = Math.Clamp(settings.ThumbnailDiskCacheMB,
+            (int)_thumbnailDiskCache.Minimum, (int)_thumbnailDiskCache.Maximum);
+        void UpdateDiskCacheTotal() => _diskCacheTotal.Text =
+            $"{_fullViewDiskCache.Value + _thumbnailDiskCache.Value:N0} MB maximum combined";
+        _fullViewDiskCache.ValueChanged += (_, _) => UpdateDiskCacheTotal();
+        _thumbnailDiskCache.ValueChanged += (_, _) => UpdateDiskCacheTotal();
+        UpdateDiskCacheTotal();
         _thumbnailMaxPreviewSize.Value = Math.Clamp(settings.ThumbnailMaxPreviewSizePx,
             (int)_thumbnailMaxPreviewSize.Minimum, (int)_thumbnailMaxPreviewSize.Maximum);
         _fastPreviewWorkers.Value = Math.Clamp(settings.FastPreviewWorkerCount,
@@ -118,6 +141,11 @@ internal sealed class ReaderSettingsDialog : Form
         var browseRandomPath = CreateSecondaryButton("Browse…");
         browseRandomPath.Click += (_, _) => ChooseRandomLibraryPath();
         var randomPathRow = CreateStretchButtonRow(_randomLibraryPath, browseRandomPath);
+
+        var browsePersistentCache = CreateSecondaryButton("Browseâ€¦");
+        browsePersistentCache.Click += (_, _) => ChoosePersistentCachePath();
+        var persistentCachePathRow = CreateStretchButtonRow(
+            _persistentCachePath, browsePersistentCache);
 
         var chooseDefaultViewer = CreateSecondaryButton("Choose defaults…");
         chooseDefaultViewer.Click += (_, _) => ChooseDefaultImageViewer();
@@ -166,6 +194,12 @@ internal sealed class ReaderSettingsDialog : Form
                 ("Lanczos thumbnail cache (MB)", _thumbnailCache),
                 ("Fast thumbnail cache (MB)", _thumbnailFastPreviewCache),
                 ("Maximum preview edge (px)", _thumbnailMaxPreviewSize)),
+            CreateSection("Persistent disk cache",
+                "Previously generated previews survive closing the app. Full-view and thumbnail files are trimmed independently in the background.",
+                ("Cache location", persistentCachePathRow),
+                ("Full-view preview quota (MB)", _fullViewDiskCache),
+                ("Thumbnail quota (MB)", _thumbnailDiskCache),
+                ("Total disk allowance", _diskCacheTotal)),
             CreateSection("Processing threads",
                 "These values control parallel background resizing. Higher values use more CPU and memory bandwidth.",
                 ("Fast preview workers", _fastPreviewWorkers),
@@ -331,6 +365,20 @@ internal sealed class ReaderSettingsDialog : Form
 
     private void AcceptSettings()
     {
+        if (string.IsNullOrWhiteSpace(_persistentCachePath.Text))
+        {
+            MessageBox.Show(this, "Choose a persistent cache location.",
+                "Cache location", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        try { _ = Path.GetFullPath(Environment.ExpandEnvironmentVariables(
+            _persistentCachePath.Text.Trim())); }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException)
+        {
+            MessageBox.Show(this, "The persistent cache location is not valid.",
+                "Cache location", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
         var reserved = _hotkeyEditors.FirstOrDefault(pair =>
             ToolbarHotkeyCatalog.IsReserved(pair.Value.Shortcut));
         if (!string.IsNullOrEmpty(reserved.Key))
@@ -382,6 +430,20 @@ internal sealed class ReaderSettingsDialog : Form
         };
         if (dialog.ShowDialog(this) == DialogResult.OK)
             _randomLibraryPath.Text = dialog.SelectedPath;
+    }
+
+    private void ChoosePersistentCachePath()
+    {
+        using var dialog = new FolderBrowserDialog
+        {
+            Description = "Choose where G Reader stores persistent previews",
+            UseDescriptionForTitle = true,
+            SelectedPath = Directory.Exists(_persistentCachePath.Text)
+                ? _persistentCachePath.Text
+                : UserSettings.DefaultPersistentCachePath
+        };
+        if (dialog.ShowDialog(this) == DialogResult.OK)
+            _persistentCachePath.Text = dialog.SelectedPath;
     }
 
     private void ChooseDefaultImageViewer()

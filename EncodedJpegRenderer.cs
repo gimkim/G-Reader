@@ -105,6 +105,23 @@ internal static class EncodedJpegRenderer
         cancellationToken.ThrowIfCancellationRequested();
         var width = Math.Max(32, bounds.Width);
         var height = Math.Max(32, bounds.Height);
+        if (TurboJpegNativeDecoder.TryDecode(
+                page, new Size(width, height), rotation,
+                fastPreview ? 1 : 2, fastPreview, cancellationToken,
+                out var turboDecoded, out var turboLandscape) &&
+            turboDecoded is not null)
+        {
+            using (turboDecoded)
+            {
+                var output = fastPreview
+                    ? AsyncViewerPanel.CreateFastThumbnail(
+                        turboDecoded, new Size(width, height), 1, cancellationToken)
+                    : AsyncViewerPanel.CreateLanczosThumbnail(
+                        turboDecoded, new Size(width, height), quality, cancellationToken);
+                return new Result(output, turboLandscape);
+            }
+        }
+
         // G Reader is always fit-to-screen. Ask libjpeg for a decoder-scaled
         // source near the useful output resolution instead of expanding a 45MP
         // photograph only to discard almost all pixels. The quality pass keeps

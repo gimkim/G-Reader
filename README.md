@@ -1,12 +1,12 @@
 # G Reader
 
-G Reader is a fast, Windows-native comic and image reader written in C#/.NET 8. It combines a Direct2D full-page viewer, responsive background rendering, configurable memory caches, and a virtualized thumbnail browser for folders, archives, and PDFs.
+G Reader is a fast, Windows-native comic and image reader written in C#/.NET 8. It combines Direct2D full-page and thumbnail renderers, responsive background processing, configurable memory caches, and a virtualized library browser for folders, archives, and PDFs.
 
 The project focuses on immediate interaction: opening, scrolling, page navigation, zooming, and resizing remain responsive while previews and final Lanczos renders are produced in the background.
 
 ## Highlights
 
-- Direct2D presentation for fast full-page display without page-transition effects
+- Direct2D presentation for both full-page and thumbnail views without page-transition effects
 - Single page, two-page, and two-page offset layouts
 - Left-to-right and right-to-left reading with matching navigation and slider direction
 - Automatic single-page display for landscape or unusually wide images
@@ -51,7 +51,7 @@ The project focuses on immediate interaction: opening, scrolling, page navigatio
 
 ### Thumbnail and library view
 
-- Uses a virtual grid: only visible cells are painted, so the control itself does not create thousands of child controls.
+- Uses a Direct2D virtual grid: only visible cells are drawn, so the control itself does not create thousands of child controls.
 - Single-click selects an item; double-click or `Enter` opens it.
 - Arrow keys always move the thumbnail selection. Home and End move to the first and last item across folders, archives, PDFs, and images.
 - `Ctrl+mouse wheel` changes the number of images per row.
@@ -64,7 +64,7 @@ The project focuses on immediate interaction: opening, scrolling, page navigatio
 
 Folder and container tiles receive stacked contact sheets made from up to four images. Image thumbnails and contact sheets share the fast-preview worker pool and one viewport-aware priority queue. Work starts at the selected visible item; if selection is outside the viewport, visible cells take priority.
 
-For very large libraries, contact sheets use a bounded working set around the current viewport instead of generating thousands of previews that would immediately be evicted. Scrolling cancels stale viewport work, reuses already-painted pixels, redraws only newly exposed cells, and resumes preview generation after interaction settles.
+For very large libraries, contact sheets use a bounded working set around the current viewport instead of generating thousands of previews that would immediately be evicted. Scrolling cancels stale viewport work, redraws the visible scene from cached GPU textures, and resumes preview generation after interaction settles.
 
 ## Sorting and library navigation
 
@@ -108,17 +108,23 @@ Command-line examples:
 
 G Reader separates interactive display work from decoding, preview generation, Lanczos resizing, and cache cleanup.
 
-- Full-page presentation uses a double-buffered Direct2D HWND render target.
+- Full-page presentation and the thumbnail grid use independent Direct2D HWND render targets.
+- Thumbnail images and contact sheets upload lazily into a dedicated GPU texture LRU. Rendering uploads at most four textures per frame both while idle and during active scrolling, allowing visible thumbnails to populate at full speed while the frame-sized cap prevents an unbounded upload burst.
+- Thumbnail labels, placeholders, vector icons, badges, and the overlay scrollbar use DirectWrite/Direct2D rather than GDI+ painting.
 - Static page navigation can reuse a GPU-side LRU of recently uploaded surfaces.
 - Fast previews are scheduled ahead of final-quality Lanczos work.
 - Large JPEG files request a decoder-scaled DCT source near the useful output resolution, avoiding unnecessary full 45 MP managed bitmaps.
+- JPEG fit/thumbnail rendering first uses the native TurboJPEG 3.1 decoder directly into BGRA memory, bypassing ImageMagick's decode wrapper. Unsupported precision/colorspace or native failures fall back to the established Magick.NET path.
+- JPEG decode is codec-bound and does not scale well inside one image. G Reader therefore converts otherwise-unused per-image thread capacity into additional concurrent JPEG jobs, capped by the machine's logical CPU count. Generic large-image paths retain their configured worker gate to avoid multiplying full-resolution RAM usage.
 - Non-JPEG resize paths pass BGRA buffers directly between System.Drawing and Magick.NET where possible.
 - Window resizing uses stale-while-revalidate: the previous surface remains visible until fast and final replacements arrive.
 - Decoding, cache discovery, archive scanning, resizing, and bulk disposal stay off the WinForms UI thread.
 - Cancellation callbacks are asynchronous so stale render work does not hold the UI thread.
 - Cache cleanup is delayed and coalesced with temporary headroom rather than enforcing a strict limit during interaction.
 - Thumbnail completion notifications are coalesced, and off-screen completions do not enqueue unnecessary UI repaints.
-- Thumbnail scrolling reuses the previous window pixels and repaints only exposed strips and dirty cells.
+- Thumbnail scrolling redraws the virtual scene from GPU textures; no GDI window blit or per-tile child-control layout is involved.
+- In-flight thumbnail and contact-sheet generation continues during wheel and scrollbar movement, so completed previews can appear while scrolling; the work queue is reprioritized after the viewport settles.
+- While scrolling continuously, a coalescing viewport queue samples the visible range about every 180 ms and requests only missing fast previews in and just around the viewport. It never cancels the main thumbnail batch and retains only the newest pending viewport, avoiding event floods and long queues.
 - High-frequency wheel input is combined to match display update cadence. Focused precision-touchpad input preserves sub-notch deltas, while asynchronous Raw Input keeps hover scrolling available when the app is unfocused.
 
 Animated files are inspected and decoded only when the matching page is visible. Static images continue through the normal fast cache path without animation overhead.
@@ -248,7 +254,8 @@ The repository contains source code and project assets. Local release output and
 | `AsyncMainForm.cs` | Main window, toolbar, input, book lifecycle, background scheduling |
 | `AsyncViewerPanel.cs` | Fit/zoom layout, progressive rendering, zoom crop refinement |
 | `Direct2DViewerSurface.cs` | Direct2D presentation and GPU-side surface cache |
-| `ThumbnailGridView.cs` | Virtual thumbnail browser, overlay scrollbar, partial repaint path |
+| `ThumbnailGridView.cs` | Virtual thumbnail browser, layout, selection, scrolling, and input |
+| `ThumbnailGridView.Direct2D.cs` | Direct2D/DirectWrite grid renderer and GPU texture LRU |
 | `Book.cs` | Folder, archive, PDF discovery and page ordering |
 | `PageCache.cs` | Decoded and rendered page cache state |
 | `EncodedJpegRenderer.cs` | Decoder-scaled JPEG preview and viewport rendering |
@@ -268,4 +275,4 @@ The following CDisplayEx-style features are outside this project's scope:
 
 ## Notes
 
-G Reader is a Windows-only application. Image resizing is CPU-based through Magick.NET/ImageMagick, while Direct2D accelerates full-page presentation and interactive movement. PDF support relies on Windows' built-in PDF APIs.
+G Reader is a Windows-only application. Image resizing is CPU-based through Magick.NET/ImageMagick, while Direct2D accelerates full-page and thumbnail presentation, scrolling, zooming, and interactive movement. PDF support relies on Windows' built-in PDF APIs.
