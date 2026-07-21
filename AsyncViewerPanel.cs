@@ -87,6 +87,8 @@ internal sealed class AsyncViewerPanel : Panel
     private int _secondIndex = -1;
     private Bitmap? _leftRendered;
     private Bitmap? _rightRendered;
+    private Size _leftDisplayedSourceSize;
+    private Size _rightDisplayedSourceSize;
     private CancellationTokenSource? _renderCancellation;
     private int _renderVersion;
     private long _renderCacheSequence;
@@ -1891,24 +1893,33 @@ internal sealed class AsyncViewerPanel : Panel
 
     private static Size CalculateSize(
         Image source, int targetWidth, int availableHeight, bool fitToScreen, float zoom)
+        => CalculateSize(source.Width, source.Height, targetWidth,
+            availableHeight, fitToScreen, zoom);
+
+    private static Size CalculateSize(
+        int sourceWidth, int sourceHeight, int targetWidth, int availableHeight,
+        bool fitToScreen, float zoom)
     {
         var scale = fitToScreen
-            ? Math.Min((float)targetWidth / source.Width, (float)availableHeight / source.Height)
+            ? Math.Min((float)targetWidth / sourceWidth,
+                (float)availableHeight / sourceHeight)
             : zoom;
         scale = Math.Max(0.02f, scale);
-        return new Size(Math.Max(1, (int)(source.Width * scale)), Math.Max(1, (int)(source.Height * scale)));
+        return new Size(Math.Max(1, (int)(sourceWidth * scale)),
+            Math.Max(1, (int)(sourceHeight * scale)));
     }
 
     private void RelayoutDisplayedFrame()
     {
         if (!FitToScreen) return;
-        // Use the bitmap aspect ratio, not proxy bounds captured during an
-        // earlier/incomplete layout pass.
+        // Use the displayed source aspect ratio, not proxy bounds captured
+        // during an earlier layout pass. GPU and borrowed cached frames do not
+        // retain a CPU bitmap, but must still fill the current viewport.
         var visible = new[]
         {
-            (Box: _left, Source: _leftRendered),
-            (Box: _right, Source: _rightRendered)
-        }.Where(item => item.Box.Visible && item.Source is not null).ToArray();
+            (Box: _left, SourceSize: _leftDisplayedSourceSize),
+            (Box: _right, SourceSize: _rightDisplayedSourceSize)
+        }.Where(item => item.Box.Visible && !item.SourceSize.IsEmpty).ToArray();
         if (visible.Length == 0) return;
 
         const int gap = 10;
@@ -1917,7 +1928,7 @@ internal sealed class AsyncViewerPanel : Panel
         var targetWidth = visible.Length == 2 ? availableWidth / 2 : availableWidth;
         var sizes = visible.Select(item =>
         {
-            var source = item.Source!;
+            var source = item.SourceSize;
             var scale = Math.Min((float)targetWidth / source.Width,
                 (float)availableHeight / source.Height);
             return new Size(Math.Max(1, (int)Math.Round(source.Width * scale)),
@@ -2256,9 +2267,14 @@ internal sealed class AsyncViewerPanel : Panel
                 ? new[] { second?.Image, first.Image }
                 : new[] { first.Image, second?.Image };
             const int gap = 10;
+            var availableWidth = Math.Max(100, ClientSize.Width - gap * 3);
             var availableHeight = Math.Max(100, ClientSize.Height - gap * 2);
+            var targetWidth = visiblePageCount == 2
+                ? availableWidth / 2 : availableWidth;
             var sizes = rendered.Select(image => image is null
-                ? Size.Empty : new Size(image.Width, image.Height)).ToArray();
+                ? Size.Empty
+                : CalculateSize(image.Width, image.Height, targetWidth,
+                    availableHeight, fitToScreen: true, zoom: 1f)).ToArray();
             ApplyRenderedGpu(rendered[0], rendered[1], sizes, availableHeight, gap);
             _displayedPreview = firstPreview || secondPreview;
             RenderingStateChanged?.Invoke(this, false);
@@ -2285,6 +2301,10 @@ internal sealed class AsyncViewerPanel : Panel
     {
         _loadingPlaceholder.Visible = false;
         DisposeRendered(clearSurface: false);
+        _leftDisplayedSourceSize = left is null
+            ? Size.Empty : new Size(left.Width, left.Height);
+        _rightDisplayedSourceSize = right is null
+            ? Size.Empty : new Size(right.Width, right.Height);
         var boxes = new[] { _left, _right };
         var visibleSizes = sizes.Where(size => !size.IsEmpty).ToArray();
         var contentWidth = visibleSizes.Sum(size => size.Width) +
@@ -2321,6 +2341,8 @@ internal sealed class AsyncViewerPanel : Panel
         DisposeRendered(clearSurface: false);
         _leftRendered = retainBitmaps ? left : null;
         _rightRendered = retainBitmaps ? right : null;
+        _leftDisplayedSourceSize = left?.Size ?? Size.Empty;
+        _rightDisplayedSourceSize = right?.Size ?? Size.Empty;
         var boxes = new[] { _left, _right };
         var visibleSizes = sizes.Where(size => !size.IsEmpty).ToArray();
         var contentWidth = visibleSizes.Sum(size => size.Width) + Math.Max(0, visibleSizes.Length - 1) * gap;
@@ -2441,6 +2463,8 @@ internal sealed class AsyncViewerPanel : Panel
         RetireSource(_rightRendered);
         _leftRendered = null;
         _rightRendered = null;
+        _leftDisplayedSourceSize = Size.Empty;
+        _rightDisplayedSourceSize = Size.Empty;
     }
 
     private bool ContainsRender(RenderKey key)
