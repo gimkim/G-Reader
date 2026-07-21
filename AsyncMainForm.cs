@@ -2067,7 +2067,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             Bitmap? fast = null;
             Bitmap? full = null;
             using var source = await LoadThumbnailSourceAsync(
-                book, page, workerToken).ConfigureAwait(false);
+                book, page, targetSize, oversample: 2f, workerToken)
+                .ConfigureAwait(false);
             try
             {
                 fast = await RenderWorkScheduler.RunFastAsync(
@@ -2463,16 +2464,24 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     }
 
     private async Task<Bitmap> LoadThumbnailSourceAsync(
-        Book book, int page, CancellationToken cancellationToken)
+        Book book, int page, Size targetSize, float oversample,
+        CancellationToken cancellationToken)
     {
         return await Task.Run(() =>
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var bitmap = DecodePage(book, page);
+            var entry = book.Pages[page];
+            var rotation = _rotations.GetValueOrDefault(page);
+            var decodeTarget = rotation is 90 or 270
+                ? new Size(targetSize.Height, targetSize.Width)
+                : targetSize;
+            var bitmap = entry.DecodeThumbnail is { } decodeThumbnail
+                ? decodeThumbnail(decodeTarget, oversample)
+                : DecodePage(book, page);
             try
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (_rotations.TryGetValue(page, out var rotation)) ApplyRotation(bitmap, rotation);
+                if (rotation != 0) ApplyRotation(bitmap, rotation);
                 return bitmap;
             }
             catch
@@ -2617,7 +2626,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                         ? decoded : null, cancellationToken).ConfigureAwait(false);
             if (wic is not null && rotation != 0) ApplyRotation(wic, rotation);
             using var image = wic ?? await LoadThumbnailSourceAsync(
-                book, page, cancellationToken).ConfigureAwait(false);
+                book, page, targetSize, fastPreview ? 1f : 2f,
+                cancellationToken).ConfigureAwait(false);
             var sourceBytes = (long)image.Width * image.Height * 4;
             if (fastPreview && ImagePipelineTuning.UseGenericGpuFastPreview &&
                 sourceBytes <= ImagePipelineTuning.GenericGpuFastMaximumSourceBytes)
@@ -2640,7 +2650,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 }
             }
             if (!fastPreview && ImagePipelineTuning.UseGenericGpuLanczos &&
-                sourceBytes >= ImagePipelineTuning.GenericGpuMinimumSourceBytes)
+                (entry.DecodeThumbnail is not null ||
+                 sourceBytes >= ImagePipelineTuning.GenericGpuMinimumSourceBytes))
             {
                 var gpu = await RenderWorkScheduler.RunFullAsync(() =>
                 {

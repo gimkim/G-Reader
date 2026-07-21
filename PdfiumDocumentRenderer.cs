@@ -18,7 +18,7 @@ internal sealed class PdfiumDocumentRenderer : IPdfDocumentRenderer
 
     private readonly string _path;
     private readonly PdfiumProcessPool _pool;
-    private readonly ConcurrentDictionary<int, Lazy<byte[]?>> _imageOnlyJpegs = [];
+    private readonly ConcurrentDictionary<int, Lazy<byte[]?>> _imageOnlyJpegsInFlight = [];
     private readonly ConcurrentDictionary<int, SizeF> _pageSizes = [];
     private int _disposed;
 
@@ -116,10 +116,13 @@ internal sealed class PdfiumDocumentRenderer : IPdfDocumentRenderer
         int pageIndex, Size outputSize, out Bitmap bitmap)
     {
         bitmap = null!;
-        var encoded = _imageOnlyJpegs.GetOrAdd(pageIndex, index =>
+        var pending = _imageOnlyJpegsInFlight.GetOrAdd(pageIndex, index =>
             new Lazy<byte[]?>(() => Execute(ExtractImageOnlyJpegCommand,
                     writer => writer.Write(index), ReadOptionalByteArray),
-                LazyThreadSafetyMode.ExecutionAndPublication)).Value;
+                LazyThreadSafetyMode.ExecutionAndPublication));
+        byte[]? encoded;
+        try { encoded = pending.Value; }
+        finally { _imageOnlyJpegsInFlight.TryRemove(pageIndex, out _); }
         if (encoded is null) return false;
 
         var page = new PageEntry($"PDF page {pageIndex + 1}.jpg",
@@ -175,7 +178,7 @@ internal sealed class PdfiumDocumentRenderer : IPdfDocumentRenderer
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        _imageOnlyJpegs.Clear();
+        _imageOnlyJpegsInFlight.Clear();
         _pageSizes.Clear();
         _pool.ReleaseReference();
         GC.SuppressFinalize(this);

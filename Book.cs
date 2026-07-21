@@ -8,7 +8,8 @@ using SharpCompress.Archives;
 namespace CDisplayEx.CSharp;
 
 internal sealed record PageEntry(
-    string Name, Func<Stream> Open, Func<Bitmap>? Decode = null);
+    string Name, Func<Stream> Open, Func<Bitmap>? Decode = null,
+    Func<Size, float, Bitmap>? DecodeThumbnail = null);
 internal sealed record SortablePage(
     string Name, long Size, DateTime Modified, DateTime? Taken, Func<Stream> Open);
 internal sealed record SortableBrowsePath(
@@ -218,7 +219,9 @@ internal sealed class Book
             .Select(index => new PageEntry(
                 $"Page {index + 1}",
                 () => renderer.RenderPageStream(index),
-                () => renderer.RenderPage(index)))
+                () => renderer.RenderPage(index),
+                (targetSize, oversample) => renderer.RenderPageToFit(
+                    index, targetSize, oversample)))
             .ToArray();
         if (pages.Length == 0) throw new InvalidDataException("The PDF contains no pages.");
         return new Book(pdfPath, pages,

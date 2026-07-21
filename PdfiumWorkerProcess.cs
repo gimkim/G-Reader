@@ -64,6 +64,12 @@ internal static unsafe class PdfiumWorkerServer
                 writer.Flush();
             }
         }
+        catch (IOException)
+        {
+            // The parent owns both anonymous pipes. If it exits or cancels while
+            // a response is being written, the worker should terminate quietly
+            // instead of surfacing a second, misleading crash.
+        }
         finally
         {
             foreach (var document in documents.Values)
