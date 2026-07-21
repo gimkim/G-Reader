@@ -318,7 +318,8 @@ internal static class PersistentPreviewCache
         var identity = string.Join('\n', "greader-preview-v3-color", kind, sourcePath,
             book.Pages[pageIndex].Name, length, modifiedTicks,
             NormalizeRotation(rotation), widthBucket, heightBucket,
-            kind == PersistentPreviewKind.ThumbnailFinal ? quality : 0);
+            kind == PersistentPreviewKind.ThumbnailFinal ? quality : 0,
+            GetPdfEngineIdentity(sourcePath));
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)))
             .ToLowerInvariant();
         var extension = IsBrowseKind(kind)
@@ -358,7 +359,7 @@ internal static class PersistentPreviewCache
         var identity = string.Join('\n', "greader-browse-preview-v7-two-stage",
             fastPreview ? "fast" : "full", sourcePath,
             length, modifiedTicks, widthBucket, heightBucket,
-            fastPreview ? 0 : quality);
+            fastPreview ? 0 : quality, GetPdfEngineIdentity(sourcePath));
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)))
             .ToLowerInvariant();
         return Path.Combine(GetCategoryRoot(
@@ -382,6 +383,11 @@ internal static class PersistentPreviewCache
         rotation %= 360;
         return rotation < 0 ? rotation + 360 : rotation;
     }
+
+    private static int GetPdfEngineIdentity(string sourcePath) =>
+        Path.GetExtension(sourcePath).Equals(".pdf", StringComparison.OrdinalIgnoreCase)
+            ? 1
+            : -1;
 
     private static void SaveImage(
         Bitmap bitmap, string path, PersistentPreviewKind kind, long quality)

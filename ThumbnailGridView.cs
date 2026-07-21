@@ -210,6 +210,16 @@ internal sealed partial class ThumbnailGridView : Panel
         Invalidate();
     }
 
+    public void ClearBrowsePreviewCache()
+    {
+        _browseFullPreviewCache.Clear();
+        _browseFastPreviewCache.Clear();
+        _gpuBrowseFullPreviewCache.Clear();
+        _gpuBrowseFastPreviewCache.Clear();
+        ClearGpuTextureCache();
+        Invalidate();
+    }
+
     public void ResetPages(IEnumerable<string> pageNames,
         IEnumerable<ThumbnailFolderEntry>? folders = null)
     {

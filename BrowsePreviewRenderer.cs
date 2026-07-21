@@ -2,9 +2,6 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using ImageMagick;
 using SharpCompress.Archives;
-using Windows.Data.Pdf;
-using Windows.Storage;
-using Windows.Storage.Streams;
 
 namespace CDisplayEx.CSharp;
 
@@ -15,12 +12,14 @@ internal static class BrowsePreviewRenderer
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        // PDF pages are rasterized by Windows.Data.Pdf and can never enter the
-        // nvJPEG path. Avoid opening/parsing the document merely to reject it.
+        // PDF pages use the selected PDF engine rather than the archive/image
+        // contact-sheet path. PDFium performs its own strict image-only nvJPEG
+        // detection when that engine is selected.
+        // Avoid opening/parsing the document merely to reject GPU composition.
         if (IsPdf(path)) return null;
         if (Book.IsSupportedArchive(path))
         {
-            using var archive = ArchiveFactory.OpenArchive(path);
+            using var archive = ArchiveFactory.Open(path);
             var pages = archive.Entries.Where(entry => !entry.IsDirectory &&
                     Book.IsSupportedImage(entry.Key ?? string.Empty))
                 .OrderBy(entry => entry.Key!, NumericFirstComparer.Instance).Take(4)
@@ -85,7 +84,7 @@ internal static class BrowsePreviewRenderer
             // Keep one archive directory/handle alive for all four cover pages.
             // Reopening the same archive once per card caused heavy random I/O
             // and CPU contention in folders containing many archives.
-            using var archive = ArchiveFactory.OpenArchive(path);
+            using var archive = ArchiveFactory.Open(path);
             var entries = archive.Entries
                 .Where(entry => !entry.IsDirectory &&
                     Book.IsSupportedImage(entry.Key ?? string.Empty))
@@ -207,16 +206,13 @@ internal static class BrowsePreviewRenderer
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var file = StorageFile.GetFileFromPathAsync(path)
-            .AsTask().GetAwaiter().GetResult();
-        var document = PdfDocument.LoadFromFileAsync(file)
-            .AsTask().GetAwaiter().GetResult();
+        using var document = PdfRendering.Open(path);
         var previews = new List<Bitmap>(4);
         try
         {
             var cardTarget = GetCardTarget(targetSize, fastPreview);
-            var count = Math.Min(4u, document.PageCount);
-            for (uint index = 0; index < count; index++)
+            var count = Math.Min(4, document.PageCount);
+            for (var index = 0; index < count; index++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 previews.Add(RenderPdfPreviewPage(document, index, cardTarget,
@@ -233,31 +229,15 @@ internal static class BrowsePreviewRenderer
     }
 
     private static Bitmap RenderPdfPreviewPage(
-        PdfDocument document, uint index, Size targetSize,
+        IPdfDocumentRenderer document, int index, Size targetSize,
         bool fastPreview, int quality, CancellationToken cancellationToken)
     {
-        using var page = document.GetPage(index);
-        var media = page.Dimensions.MediaBox;
-        var scale = Math.Min(targetSize.Width / Math.Max(1d, media.Width),
-            targetSize.Height / Math.Max(1d, media.Height));
         // The fast pass rasterizes at display resolution. The final pass asks
-        // the vector PDF renderer for 2x linear detail, then applies the selected
-        // Lanczos filter once. No full-page 1.5x intermediate is created.
-        var oversample = fastPreview ? 1d : 2d;
-        var width = Math.Max(1u, (uint)Math.Ceiling(media.Width * scale * oversample));
-        var height = Math.Max(1u, (uint)Math.Ceiling(media.Height * scale * oversample));
-        using var random = new InMemoryRandomAccessStream();
-        page.RenderToStreamAsync(random, new PdfPageRenderOptions
-        {
-            DestinationWidth = width,
-            DestinationHeight = height
-        }).AsTask().GetAwaiter().GetResult();
+        // the selected PDF engine for 2x detail, then applies Lanczos
+        // filter once. Pixel data never takes an encoded stream round-trip.
+        using var raster = document.RenderPageToFit(
+            index, targetSize, fastPreview ? 1f : 2f);
         cancellationToken.ThrowIfCancellationRequested();
-        random.Seek(0);
-        using var stream = random.AsStreamForRead();
-        using var decoded = Image.FromStream(stream,
-            useEmbeddedColorManagement: false, validateImageData: false);
-        using var raster = new Bitmap(decoded);
         if (!fastPreview)
             return AsyncViewerPanel.CreateLanczosThumbnail(
                 raster, targetSize, quality, cancellationToken);

@@ -26,7 +26,7 @@ The project focuses on immediate interaction: opening, scrolling, page navigatio
 | --- | --- |
 | Images | JPEG, PNG, BMP, TIFF, GIF, WebP |
 | Comic archives | ZIP/CBZ, RAR/CBR, 7Z/CB7 |
-| Documents | PDF through the Windows PDF renderer |
+| Documents | PDF through PDFium direct-BGRA rendering |
 | Collections | Image folders and library folders containing subfolders, archives, or PDFs |
 
 ## Reader modes
@@ -123,7 +123,7 @@ G Reader separates interactive display work from decoding, preview generation, L
 - Static page navigation can reuse a GPU-side LRU of recently uploaded surfaces.
 - Fast previews are scheduled ahead of final-quality Lanczos work.
 - Folder, archive, and PDF contact sheets use the same two-stage policy as image thumbnails: a fast contact sheet appears first, then a separately cached Lanczos contact sheet replaces it. Fast and final entries have independent RAM and persistent-disk identities.
-- PDF contact sheets open and parse a document once per quality pass and rasterize only near the useful output size. Normal PDF reading shares one parsed `PdfDocument` across all page entries instead of reopening the complete file for every pre-cache decode.
+- PDF rendering uses a configurable pool of 1-16 isolated native PDFium worker processes (four by default), allowing multiple pages to render concurrently without sharing PDFium global state. Workers keep document handles warm and return direct BGRA pixels through binary pipes. Eligible single-image JPEG pages can instead pass their original encoded data to nvJPEG; pages with annotations, transforms, additional objects, or unsafe color profiles remain on PDFium.
 - Large JPEG files request a decoder-scaled DCT source near the useful output resolution, avoiding unnecessary full 45 MP managed bitmaps.
 - Optional NVIDIA nvJPEG decoding keeps a shared CUDA context warm and reuses decoder states, streams, pinned host buffers, and VRAM allocations. Full view, rotated pages, zoom viewport patches, page thumbnails, and folder/archive contact sheets can remain GPU-resident through NPP and CUDA–D3D11 interop. Background batch concurrency is calculated from current free/total VRAM and each source/output image's estimated working set, with 15% (at least 1 GB) kept as headroom and one stream reserved for visible-page and zoom requests; unsupported paths immediately fall back to TurboJPEG rather than delaying the UI.
 - Zoom keeps up to two full-resolution decoded JPEG sources in a bounded VRAM LRU, then generates only newly exposed viewport regions. GPU-created page thumbnails are encoded by nvJPEG before the reduced compressed bytes are sent to the persistent disk cache.
@@ -292,4 +292,12 @@ The following CDisplayEx-style features are outside this project's scope:
 
 ## Notes
 
-G Reader is a Windows-only application. The normal image pipeline uses Magick.NET/ImageMagick on the CPU; the optional nvJPEG/NPP pipeline can decode, resize, cache, and present Full-view JPEG surfaces without leaving GPU memory. Direct2D accelerates full-page and thumbnail presentation, scrolling, zooming, and interactive movement. PDF support relies on Windows' built-in PDF APIs.
+G Reader is a Windows-only application. The normal image pipeline uses Magick.NET/ImageMagick on the CPU; the optional nvJPEG/NPP pipeline can decode, resize, cache, and present Full-view JPEG surfaces without leaving GPU memory. Direct2D accelerates full-page and thumbnail presentation, scrolling, zooming, and interactive movement. PDF parsing and rasterization use PDFiumCore/PDFium.
+
+## License notices
+
+PDFiumCore and PDFium retain their Apache 2.0 and BSD-style notices. Source and
+binary distributions must retain [LICENSE.md](LICENSE.md),
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), and the corresponding license
+copies in the `licenses` directory. The build and publish configuration copies
+these files beside the executable automatically.

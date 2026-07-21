@@ -211,6 +211,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             _settings.PersistentCachePath, _settings.FullViewDiskCacheMB,
             _settings.ThumbnailDiskCacheMB);
         NvJpegNativeDecoder.Configure(_settings.UseNvJpeg);
+        PdfRendering.PdfiumProcessCount = _settings.PdfiumProcessCount;
         ApplyImageMagickThreadLimit();
         ApplyFastPreviewSchedulerSettings();
         _activePrecacheWorkerCount = PrecacheWorkerCount;
@@ -724,11 +725,13 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     }
 
     private async Task TryOpenAsync(string path,
-        string? preferredPageName = null, string? preferredBrowsePath = null)
+        string? preferredPageName = null, string? preferredBrowsePath = null,
+        bool forceFreshPageCache = false,
+        bool showThumbnailForFolderWithoutImages = false)
     {
         CancelRandomOpenWork();
         RememberCurrentBookPosition();
-        CancelBookWork();
+        CancelBookWork(retainPageCache: !forceFreshPageCache);
         _book = null;
         _viewer.RetireBookCache();
         BuildThumbnailPlaceholders();
@@ -752,7 +755,9 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             cancellation.Token.ThrowIfCancellationRequested();
             if (_bookCancellation != cancellation) return;
             _book = book;
-            _cache = TakeRetainedPageCache(book.SourcePath) ??
+            _cache = (!forceFreshPageCache
+                ? TakeRetainedPageCache(book.SourcePath)
+                : null) ??
                 new PageCache(index => DecodePage(book, index));
             _viewer.ActivateBookCache(book.SourcePath);
             _bookPrecacheStarted = false;
@@ -780,7 +785,17 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             var browseEntrySelected = !string.IsNullOrWhiteSpace(preferredBrowsePath) &&
                 _thumbnailGrid.SelectBrowsePath(preferredBrowsePath);
             EndProgress(progress);
-            if (_thumbnailMode)
+            var switchToThumbnail = showThumbnailForFolderWithoutImages &&
+                Directory.Exists(book.SourcePath) && book.Pages.Count == 0 && !_thumbnailMode;
+            if (switchToThumbnail)
+            {
+                // A folder can still be useful as a library view when it has no
+                // images directly inside it (it may contain folders, archives or
+                // PDFs). Full view has no page to render, so expose those browse
+                // entries immediately instead of leaving the old viewer visible.
+                SetThumbnailMode(true);
+            }
+            else if (_thumbnailMode)
             {
                 if (!browseEntrySelected) HighlightThumbnail();
                 _thumbnailGrid.Focus();
@@ -1675,7 +1690,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     }
 
     private string GetPageCacheKey(Book book, int index) =>
-        $"{book.SourcePath}|{index}|{_rotations.GetValueOrDefault(index)}";
+        $"{book.SourcePath}|{index}|{_rotations.GetValueOrDefault(index)}|pdf:1";
 
     private string GetEmbeddedProfileKey(Book book, int index) =>
         $"{book.SourcePath}|{book.Pages[index].Name}";
@@ -1754,6 +1769,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private Bitmap DecodePage(Book book, int index)
     {
         var page = book.Pages[index];
+        if (page.Decode is not null) return page.Decode();
         if (Path.GetExtension(page.Name).Equals(".webp", StringComparison.OrdinalIgnoreCase))
         {
             try
@@ -3027,7 +3043,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private string GetPageCachePoolKey(string sourcePath) => string.Join("|",
         Path.GetFullPath(sourcePath),
         (int)_settings.FolderPageSort, _settings.FolderPageSortDescending,
-        (int)_settings.ArchivePageSort, _settings.ArchivePageSortDescending);
+        (int)_settings.ArchivePageSort, _settings.ArchivePageSortDescending,
+        "pdf", 1);
 
     private void RetainPageCache(string sourcePath, PageCache cache)
     {
@@ -3686,7 +3703,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         BringToFront();
         Activate();
         Focus();
-        _ = TryOpenAsync(files[0]);
+        _ = TryOpenAsync(files[0],
+            showThumbnailForFolderWithoutImages: Directory.Exists(files[0]));
         BeginInvoke(new Action(() =>
         {
             if (IsDisposed || Disposing) return;
@@ -3703,11 +3721,15 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
         var qualityChanged = _settings.LanczosQuality != dialog.LanczosQuality;
         var nvJpegChanged = _settings.UseNvJpeg != dialog.UseNvJpeg;
+        var pdfiumProcessCountChanged =
+            _settings.PdfiumProcessCount != dialog.PdfiumProcessCount;
         var colorManagementChanged =
             _settings.UseMonitorColorProfile != dialog.UseMonitorColorProfile;
         var previousPerformance = _performance;
         _settings.LanczosQuality = dialog.LanczosQuality;
         _settings.UseNvJpeg = dialog.UseNvJpeg;
+        _settings.PdfiumProcessCount = dialog.PdfiumProcessCount;
+        PdfRendering.PdfiumProcessCount = _settings.PdfiumProcessCount;
         _settings.UseMonitorColorProfile = dialog.UseMonitorColorProfile;
         NvJpegNativeDecoder.Configure(_settings.UseNvJpeg);
         _settings.AutoOptimizePerformance = dialog.AutoOptimizePerformance;
@@ -3750,6 +3772,20 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _thumbnailGrid.SetInternalPreviewMaxSize(_settings.ThumbnailMaxPreviewSizePx);
         if (qualityChanged) _thumbnailGrid.ClearFullQualityCache();
         _settings.Save();
+        if (pdfiumProcessCountChanged &&
+            _book is { } currentBook &&
+            Path.GetExtension(currentBook.SourcePath).Equals(
+                ".pdf", StringComparison.OrdinalIgnoreCase))
+        {
+            var sourcePath = currentBook.SourcePath;
+            var pageName = _pageIndex >= 0 && _pageIndex < currentBook.Pages.Count
+                ? currentBook.Pages[_pageIndex].Name
+                : null;
+            UpdateNavigationToolbar();
+            _ = TryOpenAsync(sourcePath, pageName,
+                forceFreshPageCache: true);
+            return;
+        }
         if (colorManagementChanged)
         {
             _monitorProfileDevice = null;

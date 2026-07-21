@@ -41,6 +41,7 @@ internal sealed class MainForm : Form
     public MainForm(string? initialPath)
     {
         _initialPath = initialPath;
+        PdfRendering.PdfiumProcessCount = _settings.PdfiumProcessCount;
         Text = "CDisplayEx";
         Width = 1100;
         Height = 760;

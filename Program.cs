@@ -5,6 +5,10 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        // PDFium workers are headless native-engine hosts. Enter before any
+        // WinForms or shell-registration initialization so startup stays small
+        // and the redirected binary stdout stream remains uncontaminated.
+        if (PdfiumWorkerServer.TryRun(args)) return;
         ApplicationConfiguration.Initialize();
         try { WindowsFileAssociations.EnsureRegistered(); }
         catch { /* File associations are optional and must never prevent startup. */ }

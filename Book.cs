@@ -4,13 +4,11 @@ using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
 using SharpCompress.Archives;
-using Windows.Data.Pdf;
-using Windows.Storage;
-using Windows.Storage.Streams;
 
 namespace CDisplayEx.CSharp;
 
-internal sealed record PageEntry(string Name, Func<Stream> Open);
+internal sealed record PageEntry(
+    string Name, Func<Stream> Open, Func<Bitmap>? Decode = null);
 internal sealed record SortablePage(
     string Name, long Size, DateTime Modified, DateTime? Taken, Func<Stream> Open);
 internal sealed record SortableBrowsePath(
@@ -122,7 +120,7 @@ internal sealed class Book
         if (IsSupportedArchive(path))
         {
             string[] names;
-            using (var archive = ArchiveFactory.OpenArchive(path))
+            using (var archive = ArchiveFactory.Open(path))
                 names = archive.Entries
                     .Where(entry => !entry.IsDirectory &&
                         IsSupportedImage(entry.Key ?? string.Empty))
@@ -215,35 +213,16 @@ internal sealed class Book
 
     private static Book OpenPdf(string pdfPath)
     {
-        var file = StorageFile.GetFileFromPathAsync(pdfPath).AsTask().GetAwaiter().GetResult();
-        var document = PdfDocument.LoadFromFileAsync(file).AsTask().GetAwaiter().GetResult();
-        var pages = Enumerable.Range(0, checked((int)document.PageCount))
-            // Keep the parsed document shared by every page entry. Previously
-            // each decode reopened and reparsed the complete PDF, multiplying
-            // startup cost across pre-cache workers.
+        var renderer = PdfRendering.Open(pdfPath);
+        var pages = Enumerable.Range(0, renderer.PageCount)
             .Select(index => new PageEntry(
-                $"Page {index + 1}", () => RenderPdfPage(document, index)))
+                $"Page {index + 1}",
+                () => renderer.RenderPageStream(index),
+                () => renderer.RenderPage(index)))
             .ToArray();
         if (pages.Length == 0) throw new InvalidDataException("The PDF contains no pages.");
         return new Book(pdfPath, pages,
             parentFolder: Path.GetDirectoryName(pdfPath));
-    }
-
-    private static Stream RenderPdfPage(PdfDocument document, int index)
-    {
-        using var page = document.GetPage((uint)index);
-        using var random = new InMemoryRandomAccessStream();
-        var options = new PdfPageRenderOptions
-        {
-            DestinationWidth = Math.Max(1, (uint)Math.Round(page.Dimensions.MediaBox.Width * 1.5)),
-            DestinationHeight = Math.Max(1, (uint)Math.Round(page.Dimensions.MediaBox.Height * 1.5))
-        };
-        page.RenderToStreamAsync(random, options).AsTask().GetAwaiter().GetResult();
-        random.Seek(0);
-        var memory = new MemoryStream();
-        random.AsStreamForRead().CopyTo(memory);
-        memory.Position = 0;
-        return memory;
     }
 
     public static bool IsSupportedArchive(string path) => Path.GetExtension(path).ToLowerInvariant() is
@@ -253,7 +232,7 @@ internal sealed class Book
         string archivePath, PageSortMode sortMode, bool descending)
     {
         SortablePage[] sortedPages;
-        using (var archive = ArchiveFactory.OpenArchive(archivePath))
+        using (var archive = ArchiveFactory.Open(archivePath))
         {
             var pages = new List<SortablePage>();
             foreach (var entry in archive.Entries.Where(entry =>
@@ -286,7 +265,7 @@ internal sealed class Book
 
     private static Stream OpenArchiveEntry(string archivePath, string name)
     {
-        using var archive = ArchiveFactory.OpenArchive(archivePath);
+        using var archive = ArchiveFactory.Open(archivePath);
         var entry = archive.Entries.FirstOrDefault(e => !e.IsDirectory && e.Key == name)
             ?? throw new InvalidDataException($"Missing archive entry: {name}");
         var memory = new MemoryStream();

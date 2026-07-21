@@ -8,6 +8,7 @@ internal sealed class ReaderSettingsDialog : Form
         Text = "Use NVIDIA nvJPEG when available (automatic libjpeg-turbo fallback)",
         AutoSize = true, Dock = DockStyle.Fill
     };
+    private readonly NumericUpDown _pdfiumProcesses = CreatePdfiumProcessInput();
     private readonly CheckBox _useMonitorColorProfile = new()
     {
         Text = "Use the ICC profile assigned to the current monitor",
@@ -57,6 +58,7 @@ internal sealed class ReaderSettingsDialog : Form
 
     public int LanczosQuality => _quality.SelectedIndex;
     public bool UseNvJpeg => _useNvJpeg.Checked;
+    public int PdfiumProcessCount => (int)_pdfiumProcesses.Value;
     public bool UseMonitorColorProfile => _useMonitorColorProfile.Checked;
     public int CacheAheadMB => (int)_ahead.Value;
     public int CacheBehindMB => (int)_behind.Value;
@@ -105,6 +107,8 @@ internal sealed class ReaderSettingsDialog : Form
         ]);
         _quality.SelectedIndex = Math.Clamp(settings.LanczosQuality, 0, _quality.Items.Count - 1);
         _useNvJpeg.Checked = settings.UseNvJpeg;
+        _pdfiumProcesses.Value = Math.Clamp(settings.PdfiumProcessCount,
+            (int)_pdfiumProcesses.Minimum, (int)_pdfiumProcesses.Maximum);
         _useMonitorColorProfile.Checked = settings.UseMonitorColorProfile;
         _ahead.Value = Math.Clamp(settings.CacheAheadMB, (int)_ahead.Minimum, (int)_ahead.Maximum);
         _behind.Value = Math.Clamp(settings.CacheBehindMB, (int)_behind.Minimum, (int)_behind.Maximum);
@@ -258,11 +262,9 @@ internal sealed class ReaderSettingsDialog : Form
         };
         copyAutomaticRow.Controls.Add(copyAutomatic);
 
-        var readerPage = CreateSettingsPage("Reader & Library",
-            CreateSection("Image rendering",
-                "Choose final resize quality and JPEG decoder. nvJPEG is warmed in the background, reuses pinned buffers, and falls back automatically when CUDA or a JPEG feature is unavailable.",
-                ("Lanczos quality", _quality),
-                ("NVIDIA GPU decode", _useNvJpeg),
+        var generalPage = CreateSettingsPage("General",
+            CreateSection("Reader appearance",
+                "Control the canvas appearance and color correction used on the active monitor.",
                 ("Monitor color management", _useMonitorColorProfile),
                 ("Background color", colorRow)),
             CreateSection("Library navigation",
@@ -275,31 +277,42 @@ internal sealed class ReaderSettingsDialog : Form
                 "Register G Reader for supported image formats and choose which formats open with it by default.",
                 ("Default image viewer", defaultViewerRow)));
 
-        var performancePage = CreateSettingsPage("Cache & Performance",
+        var renderingPage = CreateSettingsPage("Rendering",
+            CreateSection("Image quality",
+                "Choose the final resize filter and optional NVIDIA JPEG decoder. Unsupported images automatically use the CPU path.",
+                ("Lanczos quality", _quality),
+                ("NVIDIA GPU decode", _useNvJpeg)),
+            CreateSection("PDF rendering",
+                "PDFium uses isolated native processes for parallel page rendering and can pass eligible full-page JPEG data to nvJPEG.",
+                ("PDFium worker processes", _pdfiumProcesses)),
+            CreateSection("Thumbnail rendering",
+                "Limit the internal preview resolution used to populate the thumbnail grid.",
+                ("Maximum preview edge (px)", _thumbnailMaxPreviewSize)));
+
+        var cachePage = CreateSettingsPage("Cache",
+            CreateSection("Memory cache",
+                "Reading pages and thumbnails use separate soft budgets. Cleanup runs after navigation work to preserve responsiveness.",
+                ("Pages ahead (MB)", _ahead),
+                ("Pages behind (MB)", _behind),
+                ("Full-view fast previews (MB)", _previewCache),
+                ("Final thumbnails (MB)", _thumbnailCache),
+                ("Fast thumbnails (MB)", _thumbnailFastPreviewCache)),
+            CreateSection("Persistent disk cache",
+                "Generated previews survive closing the app. Full-view and thumbnail files are trimmed independently in the background.",
+                ("Cache location", persistentCachePathRow),
+                ("Full-view quota (MB)", _fullViewDiskCache),
+                ("Thumbnail quota (MB)", _thumbnailDiskCache),
+                ("Total disk allowance", _diskCacheTotal),
+                ("Cache maintenance", clearDiskCacheRow)));
+
+        var performancePage = CreateSettingsPage("Performance",
             CreateSection("Automatic optimization",
                 "Tune memory budgets and CPU parallelism from available RAM and logical processor count. Manual values are preserved when Auto is enabled.",
                 ("Optimization mode", _autoOptimize),
                 ("Active profile", _autoOptimizeSummary),
                 ("Manual starting point", copyAutomaticRow)),
-            CreateSection("Full-page cache",
-                "Memory budgets for resized reading pages. Ahead and behind are soft limits; cleanup is deferred to keep navigation responsive.",
-                ("Ahead cache (MB)", _ahead),
-                ("Behind cache (MB)", _behind),
-                ("Fast preview cache (MB)", _previewCache)),
-            CreateSection("Thumbnail cache",
-                "Thumbnail previews have independent fast and final-quality memory budgets.",
-                ("Lanczos thumbnail cache (MB)", _thumbnailCache),
-                ("Fast thumbnail cache (MB)", _thumbnailFastPreviewCache),
-                ("Maximum preview edge (px)", _thumbnailMaxPreviewSize)),
-            CreateSection("Persistent disk cache",
-                "Previously generated previews survive closing the app. Full-view and thumbnail files are trimmed independently in the background.",
-                ("Cache location", persistentCachePathRow),
-                ("Full-view preview quota (MB)", _fullViewDiskCache),
-                ("Thumbnail quota (MB)", _thumbnailDiskCache),
-                ("Total disk allowance", _diskCacheTotal),
-                ("Cache maintenance", clearDiskCacheRow)),
             CreateSection("Processing threads",
-                "These values control parallel background resizing. Higher values use more CPU and memory bandwidth.",
+                "Control CPU parallelism for preview generation and Lanczos resizing. PDFium process count is kept with its renderer on the Rendering page.",
                 ("Fast preview workers", _fastPreviewWorkers),
                 ("CPU threads per fast worker", _fastPreviewThreads),
                 ("Pre-cache workers", _precacheWorkers),
@@ -361,7 +374,9 @@ internal sealed class ReaderSettingsDialog : Form
             Dock = DockStyle.Fill, Padding = new Point(18, 7),
             Font = new Font("Segoe UI Semibold", 10f)
         };
-        tabs.TabPages.Add(readerPage);
+        tabs.TabPages.Add(generalPage);
+        tabs.TabPages.Add(renderingPage);
+        tabs.TabPages.Add(cachePage);
         tabs.TabPages.Add(performancePage);
         tabs.TabPages.Add(hotkeyPage);
 
@@ -682,6 +697,12 @@ internal sealed class ReaderSettingsDialog : Form
     private static NumericUpDown CreateWorkerInput() => new()
     {
         Minimum = 1, Maximum = 64, Increment = 1,
+        ThousandsSeparator = false, Dock = DockStyle.Fill
+    };
+
+    private static NumericUpDown CreatePdfiumProcessInput() => new()
+    {
+        Minimum = 1, Maximum = 16, Increment = 1,
         ThousandsSeparator = false, Dock = DockStyle.Fill
     };
 

@@ -25,6 +25,7 @@ internal sealed class UserSettings
     public bool FitToScreen { get; set; } = true;
     public int LanczosQuality { get; set; } = 1;
     public bool UseNvJpeg { get; set; }
+    public int PdfiumProcessCount { get; set; } = 4;
     public bool UseMonitorColorProfile { get; set; } = true;
     public bool AutoOptimizePerformance { get; set; }
     public int CacheAheadMB { get; set; } = 3072;
