@@ -701,6 +701,7 @@ internal static unsafe class NvJpegNativeDecoder
                 var resourcePointer = resource;
                 if (_api.CudaGraphicsMapResources(1, &resourcePointer, _stream) != 0)
                     return false;
+                var unmapResult = 0;
                 try
                 {
                     if (_api.CudaGraphicsSubResourceGetMappedArray(
@@ -710,7 +711,16 @@ internal static unsafe class NvJpegNativeDecoder
                             3, _stream) != 0 ||
                         _api.CudaStreamSynchronize(_stream) != 0) return false;
                 }
-                finally { _api.CudaGraphicsUnmapResources(1, &resourcePointer, _stream); }
+                finally
+                {
+                    unmapResult = _api.CudaGraphicsUnmapResources(
+                        1, &resourcePointer, _stream);
+                }
+                // cudaGraphicsUnmapResources is asynchronous when a stream is
+                // supplied. Direct2D must not read (or unregister) the texture
+                // until CUDA has completely handed ownership back to D3D11.
+                if (unmapResult != 0 || _api.CudaStreamSynchronize(_stream) != 0)
+                    return false;
                 cancellationToken.ThrowIfCancellationRequested();
                 var encoded = captureEncoded
                     ? TryEncodeBgr(colorSource, colorPitch, target, jpegQuality) : null;
@@ -885,6 +895,7 @@ internal static unsafe class NvJpegNativeDecoder
                         texture.NativePointer, 0) != 0 || resource == IntPtr.Zero) return false;
                 var pointer = resource;
                 if (_api.CudaGraphicsMapResources(1, &pointer, _stream) != 0) return false;
+                var unmapResult = 0;
                 try
                 {
                     if (_api.CudaGraphicsSubResourceGetMappedArray(out var array,
@@ -894,7 +905,16 @@ internal static unsafe class NvJpegNativeDecoder
                             3, _stream) != 0 || _api.CudaStreamSynchronize(_stream) != 0)
                         return false;
                 }
-                finally { _api.CudaGraphicsUnmapResources(1, &pointer, _stream); }
+                finally
+                {
+                    unmapResult = _api.CudaGraphicsUnmapResources(
+                        1, &pointer, _stream);
+                }
+                // Unmap is enqueued on the CUDA stream. Do not expose the D3D
+                // texture until CUDA has actually returned ownership to D3D;
+                // otherwise Direct2D can intermittently sample an empty surface.
+                if (unmapResult != 0 || _api.CudaStreamSynchronize(_stream) != 0)
+                    return false;
                 cancellationToken.ThrowIfCancellationRequested();
                 image = new GpuRenderedImage(texture, resource, target.Width, target.Height,
                     value => _api.CudaGraphicsUnregisterResource(value));
@@ -920,6 +940,7 @@ internal static unsafe class NvJpegNativeDecoder
                         texture.NativePointer, 0) != 0 || resource == IntPtr.Zero) return false;
                 var pointer = resource;
                 if (_api.CudaGraphicsMapResources(1, &pointer, _stream) != 0) return false;
+                var unmapResult = 0;
                 try
                 {
                     if (_api.CudaGraphicsSubResourceGetMappedArray(out var array,
@@ -929,7 +950,15 @@ internal static unsafe class NvJpegNativeDecoder
                             3, _stream) != 0 || _api.CudaStreamSynchronize(_stream) != 0)
                         return false;
                 }
-                finally { _api.CudaGraphicsUnmapResources(1, &pointer, _stream); }
+                finally
+                {
+                    unmapResult = _api.CudaGraphicsUnmapResources(
+                        1, &pointer, _stream);
+                }
+                // The texture is safe for Direct3D only after the asynchronous
+                // unmap operation has completed on this worker's CUDA stream.
+                if (unmapResult != 0 || _api.CudaStreamSynchronize(_stream) != 0)
+                    return false;
                 cancellationToken.ThrowIfCancellationRequested();
                 image = new GpuRenderedImage(texture, resource, target.Width, target.Height,
                     value => _api.CudaGraphicsUnregisterResource(value));

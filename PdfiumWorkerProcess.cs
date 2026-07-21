@@ -330,8 +330,14 @@ internal sealed class PdfiumWorkerClient : IDisposable
         if (Path.GetFileNameWithoutExtension(executable).Equals(
                 "dotnet", StringComparison.OrdinalIgnoreCase))
         {
-            start.ArgumentList.Add(Assembly.GetEntryAssembly()?.Location
-                ?? throw new InvalidOperationException("Cannot locate G Reader.dll."));
+            var entryAssemblyName = Assembly.GetEntryAssembly()?.GetName().Name
+                ?? throw new InvalidOperationException("Cannot identify G Reader.dll.");
+            var entryAssemblyPath = Path.Combine(
+                AppContext.BaseDirectory, $"{entryAssemblyName}.dll");
+            if (!File.Exists(entryAssemblyPath))
+                throw new InvalidOperationException(
+                    $"Cannot locate G Reader.dll at '{entryAssemblyPath}'.");
+            start.ArgumentList.Add(entryAssemblyPath);
         }
         start.ArgumentList.Add(_workerArgument);
         var requestPipe = new AnonymousPipeServerStream(

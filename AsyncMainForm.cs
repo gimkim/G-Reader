@@ -8,25 +8,45 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private sealed record RetainedPageCache(PageCache Cache, long LastUsed);
     private sealed class GeneratedThumbnail(Bitmap? bitmap, GpuRenderedImage? gpu) : IDisposable
     {
+        private Action? _completion;
         public Bitmap? Bitmap { get; private set; } = bitmap;
         public GpuRenderedImage? Gpu { get; private set; } = gpu;
+        public void CompleteWith(Action completion) => _completion = completion;
         public void Publish(ThumbnailGridView grid, int page, Size size, bool fast)
         {
-            if (Gpu is { } gpuImage)
-            { Gpu = null; grid.SetThumbnailGpu(page, size, gpuImage, fast); return; }
-            if (Bitmap is { } bitmapImage)
-            { Bitmap = null; grid.SetThumbnail(page, size, bitmapImage, fast); }
+            try
+            {
+                if (Gpu is { } gpuImage)
+                { Gpu = null; grid.SetThumbnailGpu(page, size, gpuImage, fast); return; }
+                if (Bitmap is { } bitmapImage)
+                { Bitmap = null; grid.SetThumbnail(page, size, bitmapImage, fast); }
+            }
+            finally { Complete(); }
         }
         public void PublishBrowse(
             ThumbnailGridView grid, int item, Size size, bool fast)
         {
-            if (Gpu is { } gpuImage)
-            { Gpu = null; grid.SetBrowsePreviewGpu(item, size, gpuImage, fast); return; }
-            if (Bitmap is { } bitmapImage)
-            { Bitmap = null; grid.SetBrowsePreview(item, size, bitmapImage, fast); }
+            try
+            {
+                if (Gpu is { } gpuImage)
+                { Gpu = null; grid.SetBrowsePreviewGpu(item, size, gpuImage, fast); return; }
+                if (Bitmap is { } bitmapImage)
+                { Bitmap = null; grid.SetBrowsePreview(item, size, bitmapImage, fast); }
+            }
+            finally { Complete(); }
         }
-        public void Dispose() { Bitmap?.Dispose(); Gpu?.Dispose(); Bitmap = null; Gpu = null; }
+        public void Dispose()
+        {
+            Bitmap?.Dispose();
+            Gpu?.Dispose();
+            Bitmap = null;
+            Gpu = null;
+            Complete();
+        }
+        private void Complete() => Interlocked.Exchange(ref _completion, null)?.Invoke();
     }
+    private readonly record struct BrowsePreviewKey(
+        string Path, int Width, int Height, bool FastPreview);
     private const int BottomBarHeight = 40;
     private int PrecacheWorkerCount => Math.Clamp(_performance.PrecacheWorkerCount, 1, 64);
     private const long Megabyte = 1024L * 1024;
@@ -128,6 +148,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private CancellationTokenSource? _displayCancellation;
     private CancellationTokenSource? _warmCancellation;
     private CancellationTokenSource? _thumbnailCancellation;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<BrowsePreviewKey, byte>
+        _browsePreviewsInFlight = new();
     private CancellationTokenSource? _randomOpenCancellation;
     private int _pageIndex;
     private int _progressVersion;
@@ -2155,7 +2177,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         }
 
         async Task<bool> RunUnifiedFastPassAsync(
-            IEnumerable<ThumbnailPreviewWorkItem> phaseWork)
+            IEnumerable<ThumbnailPreviewWorkItem> phaseWork, bool priority)
         {
             try
             {
@@ -2171,7 +2193,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                         workerToken.ThrowIfCancellationRequested();
                         var encodedPage = !work.IsBrowse &&
                             EncodedJpegRenderer.Supports(book.Pages[work.Index]);
-                        if (!encodedPage)
+                        if (!work.IsBrowse && !encodedPage)
                         {
                             await genericFastSlots.WaitAsync(workerToken).ConfigureAwait(false);
                             enteredGenericSlot = true;
@@ -2183,7 +2205,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                             {
                                 var entry = browseEntries[work.Index];
                                 var preview = await CreateBrowseThumbnailAsync(
-                                    entry.Path, targetSize, fastPreview: true, workerToken)
+                                    entry.Path, targetSize, fastPreview: true,
+                                    priority, workerToken)
                                     .ConfigureAwait(false);
                                 if (preview is not null)
                                 {
@@ -2254,7 +2277,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         }
 
         async Task<bool> RunBrowseFullPassAsync(
-            IEnumerable<ThumbnailPreviewWorkItem> phaseWork)
+            IEnumerable<ThumbnailPreviewWorkItem> phaseWork, bool priority)
         {
             var browseWork = phaseWork.Where(work => work.IsBrowse).ToArray();
             try
@@ -2275,7 +2298,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                         {
                             var entry = browseEntries[work.Index];
                             var preview = await CreateBrowseThumbnailAsync(
-                                entry.Path, targetSize, fastPreview: false, workerToken)
+                                entry.Path, targetSize, fastPreview: false,
+                                priority, workerToken)
                                 .ConfigureAwait(false);
                             if (preview is not null)
                             {
@@ -2309,11 +2333,11 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         // Visible/nearby cells get both stages first. The remaining book receives
         // fast placeholders before its slower Lanczos pass. Browse contact sheets
         // and image placeholders share one ordered worker queue.
-        if (!await RunUnifiedFastPassAsync(priorityWork)) return;
-        if (!await RunBrowseFullPassAsync(priorityWork)) return;
+        if (!await RunUnifiedFastPassAsync(priorityWork, priority: true)) return;
+        if (!await RunBrowseFullPassAsync(priorityWork, priority: true)) return;
         if (!await RunPassAsync(priorityPages, fastPreview: false)) return;
-        if (!await RunUnifiedFastPassAsync(remainingWork)) return;
-        if (!await RunBrowseFullPassAsync(remainingWork)) return;
+        if (!await RunUnifiedFastPassAsync(remainingWork, priority: false)) return;
+        if (!await RunBrowseFullPassAsync(remainingWork, priority: false)) return;
         if (!await RunPassAsync(remainingPages, fastPreview: false)) return;
         if (!cancellation.IsCancellationRequested) EndProgress(id, "Thumbnails ready");
     }
@@ -2381,7 +2405,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                                     _thumbnailGrid.HasBrowseFastPreview(work.Index, targetSize))
                                     return;
                                 var preview = await CreateBrowseThumbnailAsync(
-                                    browseEntry.Path, targetSize, fastPreview: true, workerToken)
+                                    browseEntry.Path, targetSize, fastPreview: true,
+                                    priority: true, workerToken)
                                     .ConfigureAwait(false);
                                 if (preview is null) return;
                                 if (workerToken.IsCancellationRequested || !_thumbnailMode ||
@@ -2460,42 +2485,61 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private async Task<GeneratedThumbnail?> CreateBrowseThumbnailAsync(
         string path, Size targetSize, bool fastPreview,
+        bool priority,
         CancellationToken cancellationToken)
     {
-        var cached = await Task.Run(() =>
+        var key = new BrowsePreviewKey(
+            Path.GetFullPath(path), targetSize.Width, targetSize.Height, fastPreview);
+        if (!_browsePreviewsInFlight.TryAdd(key, 0)) return null;
+        var completionTransferred = false;
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            return PersistentPreviewCache.TryLoadBrowse(
-                path, targetSize, fastPreview, _settings.LanczosQuality,
-                out var bitmap) ? bitmap : null;
-        }, cancellationToken).ConfigureAwait(false);
-        if (cached is not null) return new GeneratedThumbnail(cached, null);
+            var result = await BrowsePreviewWorkScheduler.RunAsync(priority, async () =>
+            {
+                var cached = await Task.Run(() =>
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    return PersistentPreviewCache.TryLoadBrowse(
+                        path, targetSize, fastPreview, _settings.LanczosQuality,
+                        out var bitmap) ? bitmap : null;
+                }, cancellationToken).ConfigureAwait(false);
+                if (cached is not null) return new GeneratedThumbnail(cached, null);
 
-        if (fastPreview)
-        {
-            var gpu = await RenderWorkScheduler.RunFastCodecAsync(
-                () => BrowsePreviewRenderer.CreateGpu(
-                    path, targetSize, fastPreview: true,
-                    _settings.LanczosQuality, cancellationToken),
-                cancellationToken).ConfigureAwait(false);
-            if (gpu is not null) return new GeneratedThumbnail(null, gpu);
+                if (fastPreview)
+                {
+                    var gpu = await RenderWorkScheduler.RunFastCodecAsync(
+                        () => BrowsePreviewRenderer.CreateGpu(
+                            path, targetSize, fastPreview: true,
+                            _settings.LanczosQuality, cancellationToken),
+                        cancellationToken).ConfigureAwait(false);
+                    if (gpu is not null) return new GeneratedThumbnail(null, gpu);
+                }
+
+                var preview = fastPreview
+                    ? await RenderWorkScheduler.RunFastAsync(
+                        threads => BrowsePreviewRenderer.Create(
+                            path, targetSize, threads, fastPreview: true,
+                            _settings.LanczosQuality, cancellationToken),
+                        cancellationToken).ConfigureAwait(false)
+                    : await RenderWorkScheduler.RunFullAsync(
+                        () => BrowsePreviewRenderer.Create(
+                            path, targetSize, _performance.ImageMagickThreadsPerImage,
+                            fastPreview: false, _settings.LanczosQuality, cancellationToken),
+                        cancellationToken).ConfigureAwait(false);
+                if (preview is not null)
+                    PersistentPreviewCache.StoreBrowseCopyInBackground(
+                        path, targetSize, fastPreview, _settings.LanczosQuality, preview);
+                return preview is null ? null : new GeneratedThumbnail(preview, null);
+            }, cancellationToken).ConfigureAwait(false);
+            if (result is null) return null;
+            result.CompleteWith(() => _browsePreviewsInFlight.TryRemove(key, out _));
+            completionTransferred = true;
+            return result;
         }
-
-        var preview = fastPreview
-            ? await RenderWorkScheduler.RunFastAsync(
-                threads => BrowsePreviewRenderer.Create(
-                    path, targetSize, threads, fastPreview: true,
-                    _settings.LanczosQuality, cancellationToken),
-                cancellationToken).ConfigureAwait(false)
-            : await RenderWorkScheduler.RunFullAsync(
-                () => BrowsePreviewRenderer.Create(
-                    path, targetSize, _performance.ImageMagickThreadsPerImage,
-                    fastPreview: false, _settings.LanczosQuality, cancellationToken),
-                cancellationToken).ConfigureAwait(false);
-        if (preview is not null)
-            PersistentPreviewCache.StoreBrowseCopyInBackground(
-                path, targetSize, fastPreview, _settings.LanczosQuality, preview);
-        return preview is null ? null : new GeneratedThumbnail(preview, null);
+        finally
+        {
+            if (!completionTransferred) _browsePreviewsInFlight.TryRemove(key, out _);
+        }
     }
 
     private async Task UpdateThumbnailColorProfileAsync(
