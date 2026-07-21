@@ -44,9 +44,10 @@ internal sealed class ReaderSettingsDialog : Form
         MinimumSize = new Size(0, 76), Padding = new Padding(0, 4, 0, 4)
     };
     private readonly ComboBox _autoMove = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
-    private readonly ComboBox _previousBookPage = new()
+    private readonly CheckBox _rememberReadingPosition = new()
     {
-        DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill
+        Text = "Remember the last page separately for each folder, archive, and PDF",
+        AutoSize = true, Dock = DockStyle.Fill
     };
     private readonly Panel _colorPreview = new() { Width = 92, Height = 28, BorderStyle = BorderStyle.FixedSingle };
     private readonly TextBox _randomLibraryPath = new() { Width = 420 };
@@ -74,7 +75,8 @@ internal sealed class ReaderSettingsDialog : Form
     public bool AutoOptimizePerformance => _autoOptimize.Checked;
     public Color ReaderBackground { get; private set; }
     public int AutoMoveMode => _autoMove.SelectedIndex;
-    public bool PreviousBookOpensLastPage => _previousBookPage.SelectedIndex == 0;
+    public bool RememberReadingPosition => _rememberReadingPosition.Checked;
+    public bool ClearRememberedReadingPositionsRequested { get; private set; }
     public string RandomLibraryPath => _randomLibraryPath.Text.Trim();
     public Dictionary<string, int> ToolbarHotkeys => _hotkeyEditors.ToDictionary(
         pair => pair.Key, pair => (int)pair.Value.Shortcut, StringComparer.Ordinal);
@@ -147,11 +149,7 @@ internal sealed class ReaderSettingsDialog : Form
             "Auto move — both folders and archives/PDFs"
         ]);
         _autoMove.SelectedIndex = Math.Clamp(settings.AutoMoveMode, 0, 3);
-        _previousBookPage.Items.AddRange([
-            "Open the last page",
-            "Open the first page"
-        ]);
-        _previousBookPage.SelectedIndex = settings.PreviousBookOpensLastPage ? 0 : 1;
+        _rememberReadingPosition.Checked = settings.RememberReadingPosition;
         _randomLibraryPath.Text = settings.RandomLibraryPath ?? string.Empty;
         ReaderBackground = Color.FromArgb(settings.BackgroundArgb);
         _colorPreview.BackColor = ReaderBackground;
@@ -215,6 +213,33 @@ internal sealed class ReaderSettingsDialog : Form
         };
         clearDiskCacheRow.Controls.AddRange([clearDiskCache, clearDiskCacheStatus]);
 
+        var clearReadingPositions = CreateSecondaryButton("Clear saved positions");
+        clearReadingPositions.MinimumSize = new Size(174, 32);
+        var readingPositionsStatus = new Label
+        {
+            AutoSize = true, TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = Color.FromArgb(70, 79, 94),
+            Margin = new Padding(10, 8, 0, 0)
+        };
+        clearReadingPositions.Click += (_, _) =>
+        {
+            if (MessageBox.Show(this,
+                    "Forget every saved reading position for folders, archives, and PDFs?",
+                    "Clear saved positions", MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            ClearRememberedReadingPositionsRequested = true;
+            readingPositionsStatus.Text = "Will clear when you save settings";
+            clearReadingPositions.Enabled = false;
+        };
+        var clearReadingPositionsRow = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill, AutoSize = true, WrapContents = false,
+            Margin = Padding.Empty
+        };
+        clearReadingPositionsRow.Controls.AddRange([
+            clearReadingPositions, readingPositionsStatus
+        ]);
+
         var chooseDefaultViewer = CreateSecondaryButton("Choose defaults…");
         chooseDefaultViewer.Click += (_, _) => ChooseDefaultImageViewer();
         var defaultViewerRow = new FlowLayoutPanel
@@ -243,7 +268,8 @@ internal sealed class ReaderSettingsDialog : Form
             CreateSection("Library navigation",
                 "At a book boundary, follow the same ordered folder/archive list shown in Thumbnail view.",
                 ("Automatic move", _autoMove),
-                ("When moving to previous book", _previousBookPage),
+                ("Resume reading", _rememberReadingPosition),
+                ("Saved positions", clearReadingPositionsRow),
                 ("Random library path", randomPathRow)),
             CreateSection("Windows integration",
                 "Register G Reader for supported image formats and choose which formats open with it by default.",

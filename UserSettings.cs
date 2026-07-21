@@ -48,7 +48,10 @@ internal sealed class UserSettings
     public bool ArchivePageSortDescending { get; set; }
     // 0 = off, 1 = folders, 2 = archives/PDFs, 3 = both.
     public int AutoMoveMode { get; set; }
-    public bool PreviousBookOpensLastPage { get; set; } = true;
+    public bool RememberReadingPosition { get; set; } = true;
+    // Source path -> page entry name. Names survive sorting changes better than indexes.
+    public Dictionary<string, string> RememberedReadingPositions { get; set; } =
+        new(StringComparer.OrdinalIgnoreCase);
     public string RandomLibraryPath { get; set; } = string.Empty;
     public bool HasWindowBounds { get; set; }
     public bool WindowMaximized { get; set; }

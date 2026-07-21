@@ -155,6 +155,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private bool _suppressPositionEvent;
     private bool _doublePage;
     private bool _doublePageOffset;
+    private bool _singlePageCameFromOffset;
     private bool _pageLayoutChangedAfterStartup;
     private bool _autoSingleLandscape;
     private bool _currentAutoSingle;
@@ -341,6 +342,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         FormClosing += (_, _) =>
         {
             CancelRandomOpenWork();
+            RememberCurrentBookPosition();
             CancelBookWork(retainPageCache: false);
             DisposeRetainedPageCaches();
             _viewer.ClearBookCache();
@@ -392,8 +394,14 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _doublePageItem = CheckItem("&Double Page", (_, _) =>
         {
             _pageLayoutChangedAfterStartup = true;
+            var wasOffset = _doublePageOffset;
             _doublePage = _doublePageItem!.Checked;
-            if (!_doublePage) _doublePageOffset = false;
+            if (!_doublePage)
+            {
+                _doublePageOffset = false;
+                _singlePageCameFromOffset = wasOffset;
+            }
+            else _singlePageCameFromOffset = false;
             _ = ShowPageAsync();
         }, Keys.Control | Keys.D);
         _autoSingleLandscapeItem = CheckItem("Auto Single Page for &Landscape", (_, _) =>
@@ -715,10 +723,11 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         if (cancellation is not null) CancelAndDisposeInBackground(cancellation);
     }
 
-    private async Task TryOpenAsync(string path, bool openAtEnd = false,
+    private async Task TryOpenAsync(string path,
         string? preferredPageName = null, string? preferredBrowsePath = null)
     {
         CancelRandomOpenWork();
+        RememberCurrentBookPosition();
         CancelBookWork();
         _book = null;
         _viewer.RetireBookCache();
@@ -753,9 +762,9 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                     preferredPageName, StringComparison.OrdinalIgnoreCase));
             _pageIndex = preferredIndex >= 0
                 ? preferredIndex
-                : openAtEnd
-                    ? Math.Max(0, book.Pages.Count - 1)
-                    : File.Exists(path) && Book.IsSupportedImage(path) ? book.IndexOfFile(path) : 0;
+                : File.Exists(path) && Book.IsSupportedImage(path)
+                    ? book.IndexOfFile(path)
+                    : GetRememberedBookPage(book);
             _ = RefreshCurrentPageInfoAsync(_pageIndex);
             _rotations.Clear();
             _landscapePages.Clear();
@@ -792,6 +801,37 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         if (string.IsNullOrWhiteSpace(first) || string.IsNullOrWhiteSpace(second)) return false;
         try { return string.Equals(Path.GetFullPath(first), Path.GetFullPath(second), StringComparison.OrdinalIgnoreCase); }
         catch { return false; }
+    }
+
+    private static string GetReadingPositionKey(string sourcePath)
+    {
+        try { return Path.TrimEndingDirectorySeparator(Path.GetFullPath(sourcePath)); }
+        catch { return sourcePath; }
+    }
+
+    private int GetRememberedBookPage(Book book)
+    {
+        if (!_settings.RememberReadingPosition || book.Pages.Count == 0) return 0;
+        var positions = _settings.RememberedReadingPositions;
+        if (positions is null || !positions.TryGetValue(
+                GetReadingPositionKey(book.SourcePath), out var pageName) ||
+            string.IsNullOrWhiteSpace(pageName)) return 0;
+        var index = book.Pages.ToList().FindIndex(page => string.Equals(
+            page.Name, pageName, StringComparison.OrdinalIgnoreCase));
+        return index >= 0 ? index : 0;
+    }
+
+    private void RememberCurrentBookPosition()
+    {
+        if (!_settings.RememberReadingPosition || _book is not { } book ||
+            book.Pages.Count == 0 || _pageIndex < 0 || _pageIndex >= book.Pages.Count) return;
+        var positions = _settings.RememberedReadingPositions ??=
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var key = GetReadingPositionKey(book.SourcePath);
+        positions[key] = book.Pages[_pageIndex].Name;
+        // Keep settings lightweight even for very large libraries.
+        while (positions.Count > 4096)
+            positions.Remove(positions.Keys.First());
     }
 
     private async Task OpenThumbnailBrowseEntryAsync(string path)
@@ -2573,23 +2613,36 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private void CyclePageLayout()
     {
         _pageLayoutChangedAfterStartup = true;
+        var pageIndexAdjustment = 0;
         if (!_doublePage)
         {
             _doublePage = true;
             _doublePageOffset = false;
+            if (_singlePageCameFromOffset) pageIndexAdjustment = 1;
+            _singlePageCameFromOffset = false;
         }
         else if (!_doublePageOffset)
         {
+            // Normal spreads are 1-2, 3-4, 5-6… while offset spreads are
+            // 2-3, 4-5, 6-7…. Keep one current page visible when switching.
+            pageIndexAdjustment = -1;
             _doublePageOffset = true;
         }
         else
         {
             _doublePage = false;
             _doublePageOffset = false;
+            _singlePageCameFromOffset = true;
         }
 
         if (_doublePageItem is not null) _doublePageItem.Checked = _doublePage;
         UpdateNavigationToolbar();
+        if (_book is { Pages.Count: > 0 } && pageIndexAdjustment != 0)
+        {
+            _pageIndex = Math.Clamp(
+                _pageIndex + pageIndexAdjustment, 0, _book.Pages.Count - 1);
+            UpdatePosition();
+        }
         _ = ShowPageAsync();
     }
 
@@ -3209,8 +3262,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             var nextPath = await Task.Run(() => FindAdjacentBook(
                 sourcePath, direction, mode, folderSort, descending));
             if (nextPath is null || !ReferenceEquals(_book, currentBook)) return;
-            await TryOpenAsync(nextPath,
-                openAtEnd: direction < 0 && _settings.PreviousBookOpensLastPage);
+            await TryOpenAsync(nextPath);
         }
         catch (IOException) { }
         catch (UnauthorizedAccessException) { }
@@ -3686,7 +3738,9 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         ApplyFastPreviewSchedulerSettings();
         _settings.BackgroundArgb = dialog.ReaderBackground.ToArgb();
         _settings.AutoMoveMode = dialog.AutoMoveMode;
-        _settings.PreviousBookOpensLastPage = dialog.PreviousBookOpensLastPage;
+        _settings.RememberReadingPosition = dialog.RememberReadingPosition;
+        if (dialog.ClearRememberedReadingPositionsRequested)
+            (_settings.RememberedReadingPositions ??= new()).Clear();
         _settings.RandomLibraryPath = dialog.RandomLibraryPath;
         _settings.ToolbarHotkeys = dialog.ToolbarHotkeys;
         _viewer.ApplyReaderSettings(

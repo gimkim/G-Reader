@@ -88,7 +88,7 @@ Folder view keeps the stable group order **Folder → Archive/PDF → Image**, t
 
 At a book boundary, automatic library navigation can be disabled or limited to folders, archives/PDFs, or both. Navigation follows the same grouped and sorted order shown by the parent thumbnail view.
 
-Settings can choose whether moving to the previous book opens its last page or its first page. Moving to the next book continues to open at the first page.
+G Reader can remember the last page separately for every folder, archive, and PDF. This can be disabled or cleared from Settings; without a saved position, every book opens at its first page.
 
 ## Opening and Windows integration
 
