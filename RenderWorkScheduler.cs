@@ -22,7 +22,8 @@ internal static class RenderWorkScheduler
         Volatile.Read(ref _batchCodecConcurrency);
 
     public static void Configure(
-        int fastPreviewWorkers, int fastPreviewThreadsPerWorker,
+        int globalFastPreviewConcurrency, int fastPreviewWorkers,
+        int fastPreviewThreadsPerWorker,
         int batchWorkers, int batchThreadsPerImage)
     {
         Volatile.Write(ref _fastLane, new FastLane(
@@ -30,7 +31,7 @@ internal static class RenderWorkScheduler
             Math.Clamp(fastPreviewThreadsPerWorker, 1, 64)));
         var logicalCpu = Math.Clamp(Environment.ProcessorCount, 1, 64);
         Volatile.Write(ref _fastCodecConcurrency, Math.Clamp(
-            checked(fastPreviewWorkers * fastPreviewThreadsPerWorker),
+            globalFastPreviewConcurrency,
             1, logicalCpu));
         Volatile.Write(ref _batchCodecConcurrency, Math.Clamp(
             checked(batchWorkers * batchThreadsPerImage),

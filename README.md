@@ -15,8 +15,8 @@ The project focuses on immediate interaction: opening, scrolling, page navigatio
 - Monitor ICC color management enabled by default, including embedded image profiles and automatic profile switching when the window moves between displays
 - Virtualized thumbnail browser that remains practical with thousands of items
 - Folder, archive, and PDF contact sheets generated progressively around the viewport
-- Configurable and automatically optimized worker counts, per-image threads, and cache budgets
-- Automatic optimization assigns Zoom Lanczos all logical processors except one reserved for UI and operating-system responsiveness
+- Configurable worker counts, per-image threads, and cache budgets with automatic initial value suggestions
+- Automatic initial value suggestion assigns Zoom Lanczos all logical processors except one reserved for UI and operating-system responsiveness
 - Animated GIF and animated WebP playback without changing the static-image cache path
 - Drag-and-drop, command-line opening, Explorer integration, and configurable toolbar hotkeys
 
@@ -145,7 +145,7 @@ Animated files are inspected and decoded only when the matching page is visible.
 
 ## Cache and performance settings
 
-First launch enables automatic optimization and derives a profile from available memory and logical CPU count. The detected profile can be copied into permanent manual settings and adjusted further.
+First launch enables automatic initial value suggestion and derives starting values from available memory and logical CPU count. This hardware estimate is separate from Dataset Benchmark. The suggested values can be copied into permanent manual settings and adjusted further.
 
 Configurable values include:
 
@@ -225,7 +225,9 @@ Settings are stored in:
 %APPDATA%\G Reader\settings.json
 ```
 
-Reading history, bookmarks, resume position, and last-page state are intentionally not stored.
+General reading history and bookmarks are intentionally not stored. Per-book
+reading positions can be remembered when the corresponding Settings option is
+enabled, and can be cleared from Settings.
 
 ## Status and feedback
 
@@ -236,6 +238,9 @@ Reading history, bookmarks, resume position, and last-page state are intentional
 - Temporary overlays confirm zoom changes and clipboard copies.
 
 ## Build from source
+
+For a complete new-machine checklist, including optional settings and cache
+transfer, see [MIGRATION.md](MIGRATION.md).
 
 Requirements:
 
@@ -278,6 +283,9 @@ The repository contains source code and project assets. Local release output and
 | `EncodedJpegRenderer.cs` | Decoder-scaled JPEG preview and viewport rendering |
 | `AnimatedImageRenderer.cs` | Animated GIF/WebP frame handling |
 | `RenderWorkScheduler.cs` | Fast, final, and urgent rendering lanes |
+| `ImagePipelineTuning.cs` | Per-codec worker gates and GPU/CPU pipeline limits |
+| `PerformanceBenchmark.cs` | Dataset benchmark and performance-profile measurement |
+| `TemporaryBenchmarkDataset.cs` | Temporary multi-format benchmark dataset generation |
 | `ReaderSettingsDialog.cs` | Settings, automatic profile, cache/thread controls, hotkeys |
 
 ## Intentionally omitted
@@ -285,7 +293,7 @@ The repository contains source code and project assets. Local release output and
 The following CDisplayEx-style features are outside this project's scope:
 
 - Windows Explorer thumbnail/shell extension
-- Reading history, bookmarks, recent/resume, and last-page persistence
+- General reading history, bookmarks, and a recent-books list
 - Gamma, white balance, vibrance, and automatic color correction
 - Leap Motion support
 - Original CDisplayEx toolbar resources and translations

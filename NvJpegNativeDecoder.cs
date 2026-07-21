@@ -20,6 +20,7 @@ internal static unsafe class NvJpegNativeDecoder
     private const int NvJpegOutputBgri = 6;
     private const int NvJpegInputBgri = 6;
     private const int CudaMemcpyDeviceToHost = 2;
+    private const int CudaMemcpyHostToDevice = 1;
     private const int NppiInterpolationLinear = 2;
     private const int NppiInterpolationCubic = 4;
     private const int NppiInterpolationLanczos = 16;
@@ -32,6 +33,10 @@ internal static unsafe class NvJpegNativeDecoder
     // This is only a safety ceiling. Actual background concurrency is admitted
     // by available VRAM and each image's estimated working set below.
     private static readonly SemaphoreSlim BackgroundGpuSlots = new(MaximumGpuWorkers - 1);
+    private static SemaphoreSlim _configuredGpuSlots = new(MaximumGpuWorkers);
+    private static SemaphoreSlim _configuredBackgroundSlots = new(8);
+    private static int _vramHeadroomPercent = 15;
+    private static int _backgroundBatchDelayMs = 2;
     private static readonly object VramAdmissionGate = new();
     private static readonly SemaphoreSlim VramReleased = new(0, int.MaxValue);
     private static long _remainingBatchVram;
@@ -65,7 +70,7 @@ internal static unsafe class NvJpegNativeDecoder
             {
                 if (api.CudaMemGetInfo(out var free, out var total) != 0) return null;
                 var headroom = Math.Max(1024L * 1024 * 1024,
-                    checked((long)total) * 15 / 100);
+                    checked((long)total) * Volatile.Read(ref _vramHeadroomPercent) / 100);
                 var currentlySafe = Math.Max(0L, checked((long)free) - headroom);
                 if (_activeVramLeases == 0)
                     _remainingBatchVram = currentlySafe;
@@ -84,6 +89,18 @@ internal static unsafe class NvJpegNativeDecoder
         }
     }
     private static volatile bool _enabled;
+    private static volatile bool _genericGpuEnabled;
+    public static bool IsReady => Volatile.Read(ref _state) == Ready;
+    public static bool TryGetGpuMemoryInfo(out long freeBytes, out long totalBytes)
+    {
+        freeBytes = totalBytes = 0;
+        var api = Volatile.Read(ref _api);
+        if (api is null || Volatile.Read(ref _state) != Ready ||
+            api.CudaMemGetInfo(out var free, out var total) != 0) return false;
+        freeBytes = checked((long)free);
+        totalBytes = checked((long)total);
+        return true;
+    }
     private static int _state;
     private static IntPtr _nvJpegHandle;
     private static Api? _api;
@@ -143,10 +160,23 @@ internal static unsafe class NvJpegNativeDecoder
     private static void ReleaseZoomSource(ZoomGpuSource source)
     { lock (ZoomSourceGate) source.Readers--; }
 
-    public static void Configure(bool enabled)
+    public static void Configure(bool enabled, UserSettings? settings = null)
     {
         _enabled = enabled;
-        if (!enabled || Volatile.Read(ref _state) is Ready or Warming or Unavailable) return;
+        _genericGpuEnabled = settings?.UseGenericGpuLanczos == true;
+        if (settings is not null)
+        {
+            var workers = Math.Clamp(settings.NvJpegWorkerCount, 1, MaximumGpuWorkers);
+            var batch = Math.Clamp(settings.NvJpegBatchSize, 1, workers);
+            Volatile.Write(ref _configuredGpuSlots, new SemaphoreSlim(workers));
+            Volatile.Write(ref _configuredBackgroundSlots, new SemaphoreSlim(batch));
+            Volatile.Write(ref _vramHeadroomPercent,
+                Math.Clamp(settings.NvJpegVramHeadroomPercent, 5, 75));
+            Volatile.Write(ref _backgroundBatchDelayMs,
+                Math.Clamp(settings.NvJpegBatchDelayMs, 0, 100));
+        }
+        if ((!enabled && !_genericGpuEnabled) ||
+            Volatile.Read(ref _state) is Ready or Warming or Unavailable) return;
         if (Interlocked.CompareExchange(ref _state, Warming, 0) != 0) return;
         // CUDA context creation can take hundreds of milliseconds. Never let it
         // run on the WinForms thread; previews use TurboJPEG while warming.
@@ -162,6 +192,9 @@ internal static unsafe class NvJpegNativeDecoder
         landscape = false;
         if (!_enabled || Volatile.Read(ref _state) != Ready || !GpuSlots.Wait(0))
             return false;
+
+        var configuredGate = Volatile.Read(ref _configuredGpuSlots);
+        if (!configuredGate.Wait(0)) { GpuSlots.Release(); return false; }
 
         Worker? worker = null;
         try
@@ -180,6 +213,7 @@ internal static unsafe class NvJpegNativeDecoder
         finally
         {
             if (worker is not null) Workers.Add(worker);
+            configuredGate.Release();
             GpuSlots.Release();
         }
     }
@@ -193,6 +227,8 @@ internal static unsafe class NvJpegNativeDecoder
         landscape = false;
         if (!_enabled || !_directTextureInterop ||
             Volatile.Read(ref _state) != Ready || !GpuSlots.Wait(0)) return false;
+        var configuredGate = Volatile.Read(ref _configuredGpuSlots);
+        if (!configuredGate.Wait(0)) { GpuSlots.Release(); return false; }
         Worker? worker = null;
         try
         {
@@ -211,6 +247,7 @@ internal static unsafe class NvJpegNativeDecoder
         finally
         {
             if (worker is not null) Workers.Add(worker);
+            configuredGate.Release();
             GpuSlots.Release();
         }
     }
@@ -225,11 +262,23 @@ internal static unsafe class NvJpegNativeDecoder
             return false;
         Worker? worker = null;
         var backgroundAcquired = false;
+        SemaphoreSlim? configuredBackground = null;
+        SemaphoreSlim? configuredGpu = null;
+        var configuredBackgroundAcquired = false;
+        var configuredGpuAcquired = false;
         var gpuAcquired = false;
         try
         {
+            configuredBackground = Volatile.Read(ref _configuredBackgroundSlots);
+            configuredBackground.Wait(cancellationToken);
+            configuredBackgroundAcquired = true;
+            var delay = Volatile.Read(ref _backgroundBatchDelayMs);
+            if (delay > 0) Task.Delay(delay, cancellationToken).GetAwaiter().GetResult();
             BackgroundGpuSlots.Wait(cancellationToken);
             backgroundAcquired = true;
+            configuredGpu = Volatile.Read(ref _configuredGpuSlots);
+            configuredGpu.Wait(cancellationToken);
+            configuredGpuAcquired = true;
             GpuSlots.Wait(cancellationToken);
             gpuAcquired = true;
             if (!Workers.TryTake(out worker)) return false;
@@ -243,7 +292,9 @@ internal static unsafe class NvJpegNativeDecoder
         {
             if (worker is not null) Workers.Add(worker);
             if (gpuAcquired) GpuSlots.Release();
+            if (configuredGpuAcquired) configuredGpu!.Release();
             if (backgroundAcquired) BackgroundGpuSlots.Release();
+            if (configuredBackgroundAcquired) configuredBackground!.Release();
         }
     }
 
@@ -253,8 +304,11 @@ internal static unsafe class NvJpegNativeDecoder
         out GpuRenderedImage? image)
     {
         image = null;
-        if (!_enabled || !_directTextureInterop || Volatile.Read(ref _state) != Ready ||
+        if (!_enabled || !_directTextureInterop ||
+            Volatile.Read(ref _state) != Ready ||
             !GpuSlots.Wait(0)) return false;
+        var configuredGate = Volatile.Read(ref _configuredGpuSlots);
+        if (!configuredGate.Wait(0)) { GpuSlots.Release(); return false; }
         Worker? worker = null;
         try
         {
@@ -267,6 +321,34 @@ internal static unsafe class NvJpegNativeDecoder
         finally
         {
             if (worker is not null) Workers.Add(worker);
+            configuredGate.Release();
+            GpuSlots.Release();
+        }
+    }
+
+    public static bool TryResizeBitmapToGpu(
+        Bitmap source, Size bounds, bool fastPreview,
+        CancellationToken cancellationToken, out GpuRenderedImage? image)
+    {
+        image = null;
+        if (!_genericGpuEnabled || !_directTextureInterop ||
+            Volatile.Read(ref _state) != Ready ||
+            !GpuSlots.Wait(0)) return false;
+        var configuredGate = Volatile.Read(ref _configuredGpuSlots);
+        if (!configuredGate.Wait(0)) { GpuSlots.Release(); return false; }
+        Worker? worker = null;
+        try
+        {
+            if (!Workers.TryTake(out worker)) return false;
+            return worker.TryResizeBitmapToGpu(
+                source, bounds, fastPreview, cancellationToken, out image);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { image?.Dispose(); image = null; return false; }
+        finally
+        {
+            if (worker is not null) Workers.Add(worker);
+            configuredGate.Release();
             GpuSlots.Release();
         }
     }
@@ -467,6 +549,60 @@ internal static unsafe class NvJpegNativeDecoder
                 decoded.Dispose();
                 throw;
             }
+        }
+
+        public bool TryResizeBitmapToGpu(
+            Bitmap source, Size bounds, bool fastPreview,
+            CancellationToken cancellationToken, out GpuRenderedImage? image)
+        {
+            image = null;
+            if (_nppContext is null || _api.NppiResizeC4 is null) return false;
+            Bitmap? converted = null;
+            var input = source;
+            if (source.PixelFormat != PixelFormat.Format32bppPArgb)
+            {
+                converted = new Bitmap(source.Width, source.Height,
+                    PixelFormat.Format32bppPArgb);
+                using var graphics = Graphics.FromImage(converted);
+                graphics.DrawImageUnscaled(source, 0, 0);
+                input = converted;
+            }
+            try
+            {
+                var scale = Math.Min(1d, Math.Min(
+                    Math.Max(1, bounds.Width) / (double)Math.Max(1, input.Width),
+                    Math.Max(1, bounds.Height) / (double)Math.Max(1, input.Height)));
+                var target = new Size(
+                    Math.Max(1, (int)Math.Round(input.Width * scale)),
+                    Math.Max(1, (int)Math.Round(input.Height * scale)));
+                var sourcePitch = checked(input.Width * 4);
+                if (!EnsureDeviceBuffer(ref _decodedDevice, ref _decodedCapacity,
+                        checked((long)sourcePitch * input.Height))) return false;
+                var data = input.LockBits(new Rectangle(0, 0, input.Width, input.Height),
+                    ImageLockMode.ReadOnly, PixelFormat.Format32bppPArgb);
+                try
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (_api.CudaMemcpy2DAsync(_decodedDevice, (nuint)sourcePitch,
+                            data.Scan0, (nuint)Math.Abs(data.Stride), (nuint)sourcePitch,
+                            (nuint)input.Height, CudaMemcpyHostToDevice, _stream) != 0)
+                        return false;
+                }
+                finally { input.UnlockBits(data); }
+                var targetPitch = checked(target.Width * 4);
+                if (!EnsureDeviceBuffer(ref _bgraDevice, ref _bgraCapacity,
+                        checked((long)targetPitch * target.Height))) return false;
+                if (_api.NppiResizeC4(_decodedDevice, sourcePitch,
+                        new NppiSize(input.Width, input.Height),
+                        new NppiRect(0, 0, input.Width, input.Height),
+                        _bgraDevice, targetPitch, new NppiSize(target.Width, target.Height),
+                        new NppiRect(0, 0, target.Width, target.Height),
+                        fastPreview ? NppiInterpolationLinear : NppiInterpolationLanczos,
+                        _nppContext.Value) != 0) return false;
+                return CopyBgraToSharedTexture(
+                    _bgraDevice, targetPitch, target, cancellationToken, out image);
+            }
+            finally { converted?.Dispose(); }
         }
 
         public bool TryDecodeToGpu(
@@ -771,6 +907,43 @@ internal static unsafe class NvJpegNativeDecoder
             }
         }
 
+        private bool CopyBgraToSharedTexture(IntPtr source, int sourcePitch, Size target,
+            CancellationToken cancellationToken, out GpuRenderedImage? image)
+        {
+            image = null;
+            var texture = GpuInteropDevice.CreateTexture(target.Width, target.Height);
+            if (texture is null) return false;
+            IntPtr resource = IntPtr.Zero;
+            try
+            {
+                if (_api.CudaGraphicsD3D11RegisterResource(out resource,
+                        texture.NativePointer, 0) != 0 || resource == IntPtr.Zero) return false;
+                var pointer = resource;
+                if (_api.CudaGraphicsMapResources(1, &pointer, _stream) != 0) return false;
+                try
+                {
+                    if (_api.CudaGraphicsSubResourceGetMappedArray(out var array,
+                            resource, 0, 0) != 0 || array == IntPtr.Zero ||
+                        _api.CudaMemcpy2DToArrayAsync(array, 0, 0, source,
+                            (nuint)sourcePitch, (nuint)sourcePitch, (nuint)target.Height,
+                            3, _stream) != 0 || _api.CudaStreamSynchronize(_stream) != 0)
+                        return false;
+                }
+                finally { _api.CudaGraphicsUnmapResources(1, &pointer, _stream); }
+                cancellationToken.ThrowIfCancellationRequested();
+                image = new GpuRenderedImage(texture, resource, target.Width, target.Height,
+                    value => _api.CudaGraphicsUnregisterResource(value));
+                resource = IntPtr.Zero;
+                texture = null;
+                return true;
+            }
+            finally
+            {
+                if (resource != IntPtr.Zero) _api.CudaGraphicsUnregisterResource(resource);
+                texture?.Dispose();
+            }
+        }
+
         private static Rectangle MapDisplayedCropToRaw(Rectangle crop, Size rawSize,
             int rotation) => rotation switch
             {
@@ -998,6 +1171,7 @@ internal static unsafe class NvJpegNativeDecoder
         public required CudaGraphicsUnregisterResourceDelegate CudaGraphicsUnregisterResource { get; init; }
         public required CudaMemcpy2DToArrayAsyncDelegate CudaMemcpy2DToArrayAsync { get; init; }
         public NppiResizeDelegate? NppiResize { get; init; }
+        public NppiResizeDelegate? NppiResizeC4 { get; init; }
         public NppiSwapChannelsDelegate? NppiSwapChannels { get; init; }
         public NppiTransposeDelegate? NppiTranspose { get; init; }
         public NppiMirrorDelegate? NppiMirror { get; init; }
@@ -1083,6 +1257,7 @@ internal static unsafe class NvJpegNativeDecoder
                         CudaGraphicsUnregisterResource = Get<CudaGraphicsUnregisterResourceDelegate>(cudart, "cudaGraphicsUnregisterResource"),
                         CudaMemcpy2DToArrayAsync = Get<CudaMemcpy2DToArrayAsyncDelegate>(cudart, "cudaMemcpy2DToArrayAsync"),
                         NppiResize = TryGet<NppiResizeDelegate>(nppif, "nppiResize_8u_C3R_Ctx"),
+                        NppiResizeC4 = TryGet<NppiResizeDelegate>(nppif, "nppiResize_8u_C4R_Ctx"),
                         NppiSwapChannels = TryGet<NppiSwapChannelsDelegate>(nppif, "nppiSwapChannels_8u_C3C4R_Ctx"),
                         NppiTranspose = TryGet<NppiTransposeDelegate>(nppif, "nppiTranspose_8u_C3R_Ctx"),
                         NppiMirror = TryGet<NppiMirrorDelegate>(nppif, "nppiMirror_8u_C3R_Ctx")

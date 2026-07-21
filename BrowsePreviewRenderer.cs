@@ -47,8 +47,7 @@ internal static class BrowsePreviewRenderer
         IReadOnlyList<PageEntry> pages, Size targetSize, bool fastPreview, int quality,
         CancellationToken cancellationToken)
     {
-        if (pages.Count == 0 || pages.Any(page => !EncodedJpegRenderer.Supports(page)))
-            return null;
+        if (pages.Count == 0) return null;
         // GPU contact sheets are stored as an sRGB composite. A source with an
         // embedded profile must first go through the CPU ICC transform below;
         // ordinary untagged/sRGB JPEGs retain the zero-copy GPU path.
@@ -60,11 +59,27 @@ internal static class BrowsePreviewRenderer
         {
             foreach (var page in pages)
             {
-                var result = EncodedJpegRenderer.RenderThumbnailGpu(page, cardTarget,
-                    0, fastPreview, jpegQuality: fastPreview ? 82 : 92,
-                    cancellationToken);
-                if (result is not { } rendered) return null;
-                images.Add(rendered.Image);
+                if (EncodedJpegRenderer.Supports(page))
+                {
+                    var result = EncodedJpegRenderer.RenderThumbnailGpu(page, cardTarget,
+                        0, fastPreview, jpegQuality: fastPreview ? 82 : 92,
+                        cancellationToken);
+                    if (result is not { } rendered) return null;
+                    images.Add(rendered.Image);
+                    continue;
+                }
+                if (!fastPreview || !ImagePipelineTuning.UseGenericGpuFastPreview ||
+                    !WicFastPreviewDecoder.TryDecode(
+                        page, cardTarget, cancellationToken, out var preview) ||
+                    preview is null) return null;
+                using (preview)
+                using (var lease = ImagePipelineTuning.EnterGenericGpu(cancellationToken))
+                {
+                    var rendered = GpuContactSheetRenderer.TryScale(
+                        preview, cardTarget, cancellationToken);
+                    if (rendered is null) return null;
+                    images.Add(rendered);
+                }
             }
             return GpuContactSheetRenderer.TryCompose(images, targetSize);
         }
@@ -172,6 +187,10 @@ internal static class BrowsePreviewRenderer
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        if (fastPreview && WicFastPreviewDecoder.TryDecode(
+                page, targetSize, cancellationToken, out var wic) && wic is not null)
+            return wic;
+        using var formatLease = ImagePipelineTuning.EnterFormat(page.Name, cancellationToken);
         using var stream = page.Open();
         using var image = new MagickImage(stream);
         if (image.GetColorProfile() is not null)

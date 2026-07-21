@@ -2,6 +2,7 @@ namespace CDisplayEx.CSharp;
 
 internal sealed class ReaderSettingsDialog : Form
 {
+    public event EventHandler<bool>? BenchmarkRunningChanged;
     private readonly ComboBox _quality = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
     private readonly CheckBox _useNvJpeg = new()
     {
@@ -9,6 +10,32 @@ internal sealed class ReaderSettingsDialog : Form
         AutoSize = true, Dock = DockStyle.Fill
     };
     private readonly NumericUpDown _pdfiumProcesses = CreatePdfiumProcessInput();
+    private readonly NumericUpDown _jpegCpuFastWorkers = CreateWorkerInput();
+    private readonly NumericUpDown _jpegCpuBackgroundWorkers = CreateWorkerInput();
+    private readonly NumericUpDown _nvJpegWorkers = CreateCountInput(1, 16);
+    private readonly NumericUpDown _nvJpegBatchSize = CreateCountInput(1, 16);
+    private readonly NumericUpDown _nvJpegBatchDelay = CreateMillisecondsInput();
+    private readonly NumericUpDown _nvJpegVramHeadroom = CreatePercentInput();
+    private readonly CheckBox _useWicFastPreview = CreateOption(
+        "Use Windows Imaging Component for first-frame previews");
+    private readonly NumericUpDown _wicWorkers = CreateWorkerInput();
+    private readonly NumericUpDown _pngWorkers = CreateWorkerInput();
+    private readonly NumericUpDown _webpWorkers = CreateWorkerInput();
+    private readonly NumericUpDown _gifWorkers = CreateWorkerInput();
+    private readonly NumericUpDown _tiffWorkers = CreateWorkerInput();
+    private readonly NumericUpDown _bmpWorkers = CreateWorkerInput();
+    private readonly NumericUpDown _genericWorkers = CreateWorkerInput();
+    private readonly CheckBox _useGenericGpuFast = CreateOption(
+        "Use Direct2D GPU scaling for generic fast previews");
+    private readonly CheckBox _useGenericGpuLanczos = CreateOption(
+        "Use GPU final scaling for non-JPEG images when available");
+    private readonly NumericUpDown _genericGpuWorkers = CreateWorkerInput();
+    private readonly NumericUpDown _genericGpuMinimumSource = CreateMemoryInput();
+    private readonly NumericUpDown _genericGpuFastMaximumSource = CreateMemoryInput();
+    private readonly NumericUpDown _thumbnailIdleUploadBudget = CreateTimeBudgetInput();
+    private readonly NumericUpDown _thumbnailScrollUploadBudget = CreateTimeBudgetInput();
+    private readonly NumericUpDown _thumbnailUploadBudget = CreateMemoryInput();
+    private readonly NumericUpDown _thumbnailUploadsPerFrame = CreateCountInput(1, 1024);
     private readonly CheckBox _useMonitorColorProfile = new()
     {
         Text = "Use the ICC profile assigned to the current monitor",
@@ -28,16 +55,30 @@ internal sealed class ReaderSettingsDialog : Form
         ForeColor = Color.FromArgb(70, 79, 94)
     };
     private readonly NumericUpDown _thumbnailMaxPreviewSize = CreatePixelInput();
+    private readonly NumericUpDown _globalFastPreviewConcurrency = CreateWorkerInput();
     private readonly NumericUpDown _fastPreviewWorkers = CreateWorkerInput();
     private readonly NumericUpDown _fastPreviewThreads = CreateWorkerInput();
     private readonly NumericUpDown _precacheWorkers = CreateWorkerInput();
     private readonly NumericUpDown _imageMagickThreads = CreateWorkerInput();
     private readonly NumericUpDown _zoomImageMagickThreads = CreateZoomThreadInput();
+    private readonly Label _effectiveFastParallelism = new()
+    {
+        Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft,
+        ForeColor = Color.FromArgb(70, 79, 94), AutoEllipsis = false,
+        MinimumSize = new Size(0, 100), Padding = new Padding(0, 3, 0, 3)
+    };
     private readonly CheckBox _autoOptimize = new()
     {
-        Text = "Automatically optimize cache and worker threads for this computer",
+        Text = "Use automatic initial value suggestions for this computer",
         AutoSize = true, Dock = DockStyle.Fill
     };
+    private readonly CheckBox _useBenchmarkProfile = CreateOption(
+        "Use the most recent dataset benchmark profile");
+    private readonly ComboBox _benchmarkDatasetSource = new()
+    {
+        DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill
+    };
+    private readonly TextBox _benchmarkDatasetPath = new() { Width = 420 };
     private readonly Label _autoOptimizeSummary = new()
     {
         Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft,
@@ -53,12 +94,38 @@ internal sealed class ReaderSettingsDialog : Form
     private readonly Panel _colorPreview = new() { Width = 92, Height = 28, BorderStyle = BorderStyle.FixedSingle };
     private readonly TextBox _randomLibraryPath = new() { Width = 420 };
     private readonly Dictionary<string, HotkeyTextBox> _hotkeyEditors = new(StringComparer.Ordinal);
-    private PerformanceProfile _manualPerformance = null!;
-    private readonly PerformanceProfile _automaticPerformance;
+    private AutomaticInitialValueProfile _manualInitialValues = null!;
+    private readonly AutomaticInitialValueProfile _automaticInitialValues;
+    private readonly UserSettings _sourceSettings;
+    private CancellationTokenSource? _benchmarkCancellation;
+    private bool _benchmarkRunning;
 
     public int LanczosQuality => _quality.SelectedIndex;
     public bool UseNvJpeg => _useNvJpeg.Checked;
     public int PdfiumProcessCount => (int)_pdfiumProcesses.Value;
+    public int JpegCpuFastWorkers => (int)_jpegCpuFastWorkers.Value;
+    public int JpegCpuBackgroundWorkers => (int)_jpegCpuBackgroundWorkers.Value;
+    public int NvJpegWorkerCount => (int)_nvJpegWorkers.Value;
+    public int NvJpegBatchSize => (int)_nvJpegBatchSize.Value;
+    public int NvJpegBatchDelayMs => (int)_nvJpegBatchDelay.Value;
+    public int NvJpegVramHeadroomPercent => (int)_nvJpegVramHeadroom.Value;
+    public bool UseWicFastPreview => _useWicFastPreview.Checked;
+    public int WicFastPreviewWorkers => (int)_wicWorkers.Value;
+    public int PngDecodeWorkers => (int)_pngWorkers.Value;
+    public int WebPDecodeWorkers => (int)_webpWorkers.Value;
+    public int GifDecodeWorkers => (int)_gifWorkers.Value;
+    public int TiffDecodeWorkers => (int)_tiffWorkers.Value;
+    public int BmpDecodeWorkers => (int)_bmpWorkers.Value;
+    public int GenericFallbackWorkers => (int)_genericWorkers.Value;
+    public bool UseGenericGpuFastPreview => _useGenericGpuFast.Checked;
+    public bool UseGenericGpuLanczos => _useGenericGpuLanczos.Checked;
+    public int GenericGpuWorkers => (int)_genericGpuWorkers.Value;
+    public int GenericGpuMinimumSourceMB => (int)_genericGpuMinimumSource.Value;
+    public int GenericGpuFastMaximumSourceMB => (int)_genericGpuFastMaximumSource.Value;
+    public double ThumbnailIdleUploadBudgetMs => (double)_thumbnailIdleUploadBudget.Value;
+    public double ThumbnailScrollUploadBudgetMs => (double)_thumbnailScrollUploadBudget.Value;
+    public int ThumbnailUploadBudgetMB => (int)_thumbnailUploadBudget.Value;
+    public int ThumbnailUploadsPerFrame => (int)_thumbnailUploadsPerFrame.Value;
     public bool UseMonitorColorProfile => _useMonitorColorProfile.Checked;
     public int CacheAheadMB => (int)_ahead.Value;
     public int CacheBehindMB => (int)_behind.Value;
@@ -69,12 +136,18 @@ internal sealed class ReaderSettingsDialog : Form
     public int FullViewDiskCacheMB => (int)_fullViewDiskCache.Value;
     public int ThumbnailDiskCacheMB => (int)_thumbnailDiskCache.Value;
     public int ThumbnailMaxPreviewSizePx => (int)_thumbnailMaxPreviewSize.Value;
+    public int GlobalFastPreviewConcurrency => (int)_globalFastPreviewConcurrency.Value;
     public int FastPreviewWorkerCount => (int)_fastPreviewWorkers.Value;
     public int FastPreviewThreadsPerWorker => (int)_fastPreviewThreads.Value;
     public int PrecacheWorkerCount => (int)_precacheWorkers.Value;
     public int ImageMagickThreadsPerImage => (int)_imageMagickThreads.Value;
     public int ZoomImageMagickThreadsPerImage => (int)_zoomImageMagickThreads.Value;
     public bool AutoOptimizePerformance => _autoOptimize.Checked;
+    public bool UseBenchmarkProfile => _useBenchmarkProfile.Checked;
+    public int BenchmarkDatasetMode => _benchmarkDatasetSource.SelectedIndex;
+    public string BenchmarkDatasetPath => _benchmarkDatasetPath.Text.Trim();
+    public DateTime? BenchmarkCompletedUtc { get; private set; }
+    public string BenchmarkSummary { get; private set; } = string.Empty;
     public Color ReaderBackground { get; private set; }
     public int AutoMoveMode => _autoMove.SelectedIndex;
     public bool RememberReadingPosition => _rememberReadingPosition.Checked;
@@ -85,8 +158,9 @@ internal sealed class ReaderSettingsDialog : Form
 
     public ReaderSettingsDialog(UserSettings settings)
     {
-        _manualPerformance = PerformanceProfile.FromSettings(settings);
-        _automaticPerformance = PerformanceProfile.Detect();
+        _sourceSettings = settings;
+        _manualInitialValues = AutomaticInitialValueProfile.FromSettings(settings);
+        _automaticInitialValues = AutomaticInitialValueProfile.Detect();
         Text = "G Reader Settings";
         FormBorderStyle = FormBorderStyle.Sizable;
         StartPosition = FormStartPosition.CenterParent;
@@ -109,6 +183,29 @@ internal sealed class ReaderSettingsDialog : Form
         _useNvJpeg.Checked = settings.UseNvJpeg;
         _pdfiumProcesses.Value = Math.Clamp(settings.PdfiumProcessCount,
             (int)_pdfiumProcesses.Minimum, (int)_pdfiumProcesses.Maximum);
+        SetValue(_jpegCpuFastWorkers, settings.JpegCpuFastWorkers);
+        SetValue(_jpegCpuBackgroundWorkers, settings.JpegCpuBackgroundWorkers);
+        SetValue(_nvJpegWorkers, settings.NvJpegWorkerCount);
+        SetValue(_nvJpegBatchSize, settings.NvJpegBatchSize);
+        SetValue(_nvJpegBatchDelay, settings.NvJpegBatchDelayMs);
+        SetValue(_nvJpegVramHeadroom, settings.NvJpegVramHeadroomPercent);
+        _useWicFastPreview.Checked = settings.UseWicFastPreview;
+        SetValue(_wicWorkers, settings.WicFastPreviewWorkers);
+        SetValue(_pngWorkers, settings.PngDecodeWorkers);
+        SetValue(_webpWorkers, settings.WebPDecodeWorkers);
+        SetValue(_gifWorkers, settings.GifDecodeWorkers);
+        SetValue(_tiffWorkers, settings.TiffDecodeWorkers);
+        SetValue(_bmpWorkers, settings.BmpDecodeWorkers);
+        SetValue(_genericWorkers, settings.GenericFallbackWorkers);
+        _useGenericGpuFast.Checked = settings.UseGenericGpuFastPreview;
+        _useGenericGpuLanczos.Checked = settings.UseGenericGpuLanczos;
+        SetValue(_genericGpuWorkers, settings.GenericGpuWorkers);
+        SetValue(_genericGpuMinimumSource, settings.GenericGpuMinimumSourceMB);
+        SetValue(_genericGpuFastMaximumSource, settings.GenericGpuFastMaximumSourceMB);
+        SetDecimalValue(_thumbnailIdleUploadBudget, settings.ThumbnailIdleUploadBudgetMs);
+        SetDecimalValue(_thumbnailScrollUploadBudget, settings.ThumbnailScrollUploadBudgetMs);
+        SetValue(_thumbnailUploadBudget, settings.ThumbnailUploadBudgetMB);
+        SetValue(_thumbnailUploadsPerFrame, settings.ThumbnailUploadsPerFrame);
         _useMonitorColorProfile.Checked = settings.UseMonitorColorProfile;
         _ahead.Value = Math.Clamp(settings.CacheAheadMB, (int)_ahead.Minimum, (int)_ahead.Maximum);
         _behind.Value = Math.Clamp(settings.CacheBehindMB, (int)_behind.Minimum, (int)_behind.Maximum);
@@ -132,6 +229,7 @@ internal sealed class ReaderSettingsDialog : Form
         UpdateDiskCacheTotal();
         _thumbnailMaxPreviewSize.Value = Math.Clamp(settings.ThumbnailMaxPreviewSizePx,
             (int)_thumbnailMaxPreviewSize.Minimum, (int)_thumbnailMaxPreviewSize.Maximum);
+        SetValue(_globalFastPreviewConcurrency, settings.GlobalFastPreviewConcurrency);
         _fastPreviewWorkers.Value = Math.Clamp(settings.FastPreviewWorkerCount,
             (int)_fastPreviewWorkers.Minimum, (int)_fastPreviewWorkers.Maximum);
         _fastPreviewThreads.Value = Math.Clamp(settings.FastPreviewThreadsPerWorker,
@@ -142,9 +240,34 @@ internal sealed class ReaderSettingsDialog : Form
             (int)_imageMagickThreads.Minimum, (int)_imageMagickThreads.Maximum);
         _zoomImageMagickThreads.Value = Math.Clamp(settings.ZoomImageMagickThreadsPerImage,
             (int)_zoomImageMagickThreads.Minimum, (int)_zoomImageMagickThreads.Maximum);
+        foreach (var input in new[]
+                 {
+                     _globalFastPreviewConcurrency, _fastPreviewWorkers,
+                     _fastPreviewThreads, _jpegCpuFastWorkers, _nvJpegWorkers
+                 })
+            input.ValueChanged += (_, _) => UpdateEffectiveFastParallelism();
+        _useNvJpeg.CheckedChanged += (_, _) => UpdateEffectiveFastParallelism();
+        UpdateEffectiveFastParallelism();
         _autoOptimize.Checked = settings.AutoOptimizePerformance;
+        _useBenchmarkProfile.Checked = settings.UseBenchmarkProfile;
+        _benchmarkDatasetSource.Items.AddRange([
+            "Temporary comprehensive dataset (recommended)",
+            "Custom dataset folder"
+        ]);
+        _benchmarkDatasetSource.SelectedIndex = Math.Clamp(
+            settings.BenchmarkDatasetMode, 0, 1);
+        _benchmarkDatasetPath.Text = settings.BenchmarkDatasetPath ?? string.Empty;
+        BenchmarkCompletedUtc = settings.LastBenchmarkUtc;
+        BenchmarkSummary = settings.LastBenchmarkSummary ?? string.Empty;
         _autoOptimize.CheckedChanged += (_, _) =>
+        {
+            if (_autoOptimize.Checked) _useBenchmarkProfile.Checked = false;
             ApplyPerformanceMode(captureManual: _autoOptimize.Checked);
+        };
+        _useBenchmarkProfile.CheckedChanged += (_, _) =>
+        {
+            if (_useBenchmarkProfile.Checked) _autoOptimize.Checked = false;
+        };
         ApplyPerformanceMode(captureManual: false);
         _autoMove.Items.AddRange([
             "No auto move",
@@ -168,7 +291,7 @@ internal sealed class ReaderSettingsDialog : Form
         browseRandomPath.Click += (_, _) => ChooseRandomLibraryPath();
         var randomPathRow = CreateStretchButtonRow(_randomLibraryPath, browseRandomPath);
 
-        var browsePersistentCache = CreateSecondaryButton("Browseâ€¦");
+        var browsePersistentCache = CreateSecondaryButton("Browse...");
         browsePersistentCache.Click += (_, _) => ChoosePersistentCachePath();
         var persistentCachePathRow = CreateStretchButtonRow(
             _persistentCachePath, browsePersistentCache);
@@ -252,7 +375,7 @@ internal sealed class ReaderSettingsDialog : Form
         };
         defaultViewerRow.Controls.Add(chooseDefaultViewer);
 
-        var copyAutomatic = CreateSecondaryButton("Copy Auto values to Manual");
+        var copyAutomatic = CreateSecondaryButton("Copy suggested values to Manual");
         copyAutomatic.MinimumSize = new Size(218, 32);
         copyAutomatic.Click += (_, _) => CopyAutomaticToManual();
         var copyAutomaticRow = new FlowLayoutPanel
@@ -261,6 +384,133 @@ internal sealed class ReaderSettingsDialog : Form
             Margin = Padding.Empty
         };
         copyAutomaticRow.Controls.Add(copyAutomatic);
+
+        var browseBenchmarkDataset = CreateSecondaryButton("Browse...");
+        browseBenchmarkDataset.Click += (_, _) => ChooseBenchmarkDataset();
+        var benchmarkPathRow = CreateStretchButtonRow(
+            _benchmarkDatasetPath, browseBenchmarkDataset);
+        void UpdateBenchmarkDatasetControls()
+        {
+            var custom = _benchmarkDatasetSource.SelectedIndex == 1;
+            _benchmarkDatasetPath.Enabled = custom;
+            browseBenchmarkDataset.Enabled = custom;
+        }
+        _benchmarkDatasetSource.SelectedIndexChanged += (_, _) =>
+            UpdateBenchmarkDatasetControls();
+        UpdateBenchmarkDatasetControls();
+        var runBenchmark = CreateSecondaryButton("Run automatic benchmark");
+        runBenchmark.MinimumSize = new Size(218, 32);
+        var cancelBenchmark = CreateSecondaryButton("Cancel");
+        cancelBenchmark.Enabled = false;
+        var benchmarkProgress = new ProgressBar
+        {
+            Width = 260, Height = 18, Minimum = 0, Maximum = 100,
+            Margin = new Padding(10, 8, 0, 0)
+        };
+        var benchmarkStatus = new Label
+        {
+            Dock = DockStyle.Fill, AutoSize = false,
+            TextAlign = ContentAlignment.TopLeft,
+            ForeColor = Color.FromArgb(70, 79, 94),
+            Margin = new Padding(4, 4, 4, 0),
+            Text = string.IsNullOrWhiteSpace(BenchmarkSummary)
+                ? "No benchmark has been run yet."
+                : BenchmarkSummary
+        };
+        cancelBenchmark.Click += (_, _) => _benchmarkCancellation?.Cancel();
+        runBenchmark.Click += async (_, _) =>
+        {
+            var useCustomDataset = _benchmarkDatasetSource.SelectedIndex == 1;
+            if (useCustomDataset && !Directory.Exists(_benchmarkDatasetPath.Text.Trim()))
+            {
+                ChooseBenchmarkDataset();
+                if (!Directory.Exists(_benchmarkDatasetPath.Text.Trim())) return;
+            }
+            runBenchmark.Enabled = false;
+            cancelBenchmark.Enabled = true;
+            _benchmarkRunning = true;
+            BenchmarkRunningChanged?.Invoke(this, true);
+            benchmarkProgress.Value = 0;
+            benchmarkStatus.Text = "Scanning dataset...";
+            _benchmarkCancellation?.Dispose();
+            _benchmarkCancellation = new CancellationTokenSource();
+            TemporaryBenchmarkDataset? generatedDataset = null;
+            var progress = new Progress<PerformanceBenchmarkProgress>(value =>
+            {
+                benchmarkProgress.Maximum = Math.Max(1, value.Total);
+                benchmarkProgress.Value = Math.Clamp(value.Completed, 0,
+                    benchmarkProgress.Maximum);
+                benchmarkStatus.Text = $"{value.Stage}: {value.Detail}";
+            });
+            try
+            {
+                // Give cancelled pre-cache/thumbnail workers a brief, non-blocking
+                // drain window so they do not contaminate the first measurement.
+                await Task.Delay(300, _benchmarkCancellation.Token);
+                var datasetPath = _benchmarkDatasetPath.Text.Trim();
+                if (!useCustomDataset)
+                {
+                    benchmarkStatus.Text = "Generating comprehensive temporary dataset...";
+                    var generationProgress = new Progress<TemporaryDatasetProgress>(value =>
+                    {
+                        benchmarkProgress.Maximum = Math.Max(1, value.Total);
+                        benchmarkProgress.Value = Math.Clamp(value.Completed, 0,
+                            benchmarkProgress.Maximum);
+                        benchmarkStatus.Text = "Generating: " + value.Detail;
+                    });
+                    generatedDataset = await TemporaryBenchmarkDataset.CreateAsync(
+                        generationProgress, _benchmarkCancellation.Token);
+                    datasetPath = generatedDataset.Path;
+                    benchmarkProgress.Value = 0;
+                    benchmarkStatus.Text = "Temporary dataset ready; starting benchmark...";
+                }
+                var benchmarkSettings = CreateBenchmarkSettingsSnapshot();
+                var result = await PerformanceBenchmark.RunAsync(
+                    datasetPath, benchmarkSettings,
+                    progress, _benchmarkCancellation.Token);
+                ApplyBenchmarkResult(result);
+                BenchmarkCompletedUtc = DateTime.UtcNow;
+                BenchmarkSummary = result.Summary;
+                benchmarkStatus.Text = "Applied: " + result.Summary;
+                benchmarkProgress.Value = benchmarkProgress.Maximum;
+            }
+            catch (OperationCanceledException)
+            {
+                benchmarkStatus.Text = "Benchmark cancelled; previous values were kept.";
+            }
+            catch (Exception ex)
+            {
+                benchmarkStatus.Text = "Benchmark failed: " + ex.Message;
+            }
+            finally
+            {
+                if (generatedDataset is not null)
+                    await generatedDataset.DisposeAsync();
+                ImagePipelineTuning.Configure(_sourceSettings);
+                NvJpegNativeDecoder.Configure(_sourceSettings.UseNvJpeg, _sourceSettings);
+                _benchmarkRunning = false;
+                BenchmarkRunningChanged?.Invoke(this, false);
+                runBenchmark.Enabled = true;
+                cancelBenchmark.Enabled = false;
+            }
+        };
+        var benchmarkButtons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill, AutoSize = false, WrapContents = false,
+            Margin = Padding.Empty
+        };
+        benchmarkButtons.Controls.AddRange([runBenchmark, cancelBenchmark, benchmarkProgress]);
+        var benchmarkCommandRow = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2,
+            Margin = Padding.Empty, Padding = Padding.Empty,
+            MinimumSize = new Size(0, 104)
+        };
+        benchmarkCommandRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        benchmarkCommandRow.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+        benchmarkCommandRow.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        benchmarkCommandRow.Controls.Add(benchmarkButtons, 0, 0);
+        benchmarkCommandRow.Controls.Add(benchmarkStatus, 0, 1);
 
         var generalPage = CreateSettingsPage("General",
             CreateSection("Reader appearance",
@@ -306,18 +556,61 @@ internal sealed class ReaderSettingsDialog : Form
                 ("Cache maintenance", clearDiskCacheRow)));
 
         var performancePage = CreateSettingsPage("Performance",
-            CreateSection("Automatic optimization",
-                "Tune memory budgets and CPU parallelism from available RAM and logical processor count. Manual values are preserved when Auto is enabled.",
-                ("Optimization mode", _autoOptimize),
-                ("Active profile", _autoOptimizeSummary),
-                ("Manual starting point", copyAutomaticRow)),
+            CreateSection("Automatic initial value suggestion",
+                "Suggest starting values for memory, codec/PDF workers, GPU batching, thumbnail uploads and CPU parallelism from this computer's resources. This is a hardware estimate, not a dataset benchmark.",
+                ("Initial-value suggestion", _autoOptimize),
+                ("Suggested profile", _autoOptimizeSummary),
+                ("Copy to manual settings", copyAutomaticRow)),
+            CreateSection("Dataset benchmark",
+                "Use a generated temporary set covering supported formats and multiple resolutions, or choose your own folder. Generation time is excluded from benchmark scores.",
+                ("Benchmark profile", _useBenchmarkProfile),
+                ("Dataset source", _benchmarkDatasetSource),
+                ("Custom folder", benchmarkPathRow),
+                ("Benchmark", benchmarkCommandRow)),
             CreateSection("Processing threads",
-                "Control CPU parallelism for preview generation and Lanczos resizing. PDFium process count is kept with its renderer on the Rendering page.",
-                ("Fast preview workers", _fastPreviewWorkers),
-                ("CPU threads per fast worker", _fastPreviewThreads),
-                ("Pre-cache workers", _precacheWorkers),
-                ("Batch Lanczos threads per image", _imageMagickThreads),
+                "The global limit controls fast-pass scheduling. Non-JPEG resize jobs may each split their output rows across several CPU threads; JPEG decoding has separate image-level limits.",
+                ("Global fast-preview concurrency", _globalFastPreviewConcurrency),
+                ("Non-JPEG resize images in parallel", _fastPreviewWorkers),
+                ("CPU threads per non-JPEG resize", _fastPreviewThreads),
+                ("Effective fast paths", _effectiveFastParallelism),
+                ("Full-quality pre-cache images", _precacheWorkers),
+                ("CPU threads per Lanczos image", _imageMagickThreads),
                 ("Zoom Lanczos threads", _zoomImageMagickThreads)));
+
+        var codecsPage = CreateSettingsPage("Codecs & GPU",
+            CreateSection("JPEG on CPU",
+                "JPEG decoding is single-threaded per image. These limits are numbers of images decoded simultaneously, not threads inside one image.",
+                ("Fast CPU JPEG images in parallel", _jpegCpuFastWorkers),
+                ("Background CPU JPEG images in parallel", _jpegCpuBackgroundWorkers)),
+            CreateSection("NVIDIA nvJPEG",
+                "Urgent pages are submitted immediately. Only background thumbnail work may wait briefly to form a batch; VRAM admission remains adaptive.",
+                ("GPU JPEG images in parallel", _nvJpegWorkers),
+                ("Background batch size", _nvJpegBatchSize),
+                ("Maximum batch wait (ms)", _nvJpegBatchDelay),
+                ("VRAM headroom (%)", _nvJpegVramHeadroom)),
+            CreateSection("Format decode parallelism",
+                "Independent limits prevent a slow codec from occupying every preview worker.",
+                ("WIC first-frame previews", _useWicFastPreview),
+                ("WIC preview workers", _wicWorkers),
+                ("PNG workers", _pngWorkers),
+                ("WebP workers", _webpWorkers),
+                ("GIF workers", _gifWorkers),
+                ("TIFF workers", _tiffWorkers),
+                ("BMP workers", _bmpWorkers),
+                ("Other/fallback workers", _genericWorkers)),
+            CreateSection("Generic GPU scaling",
+                "Direct2D supplies a low-latency preview. The final GPU path is used only when its size threshold makes transfer worthwhile.",
+                ("GPU fast preview", _useGenericGpuFast),
+                ("GPU final resize", _useGenericGpuLanczos),
+                ("GPU resize workers", _genericGpuWorkers),
+                ("Final GPU minimum source (MB)", _genericGpuMinimumSource),
+                ("Fast GPU maximum source (MB)", _genericGpuFastMaximumSource)),
+            CreateSection("Thumbnail GPU upload",
+                "Adaptive frame budgets keep scrolling responsive while allowing textures to appear continuously.",
+                ("Idle time budget (ms)", _thumbnailIdleUploadBudget),
+                ("Scrolling time budget (ms)", _thumbnailScrollUploadBudget),
+                ("Maximum upload per frame (MB)", _thumbnailUploadBudget),
+                ("Maximum textures per frame", _thumbnailUploadsPerFrame)));
 
         var hotkeyTable = new TableLayoutPanel
         {
@@ -378,6 +671,7 @@ internal sealed class ReaderSettingsDialog : Form
         tabs.TabPages.Add(renderingPage);
         tabs.TabPages.Add(cachePage);
         tabs.TabPages.Add(performancePage);
+        tabs.TabPages.Add(codecsPage);
         tabs.TabPages.Add(hotkeyPage);
 
         var ok = new Button
@@ -407,33 +701,127 @@ internal sealed class ReaderSettingsDialog : Form
     {
         if (_autoOptimize.Checked)
         {
-            if (captureManual) _manualPerformance = CapturePerformanceValues();
-            ApplyPerformanceValues(_automaticPerformance);
+            if (captureManual) _manualInitialValues = CaptureInitialValues();
+            ApplyInitialValues(_automaticInitialValues);
+            var core = _automaticInitialValues.Core;
             _autoOptimizeSummary.Text =
-                $"{_automaticPerformance.CacheAheadMB + _automaticPerformance.CacheBehindMB:N0} MB pages " +
-                $"({_automaticPerformance.CacheAheadMB:N0} ahead + {_automaticPerformance.CacheBehindMB:N0} behind)\n" +
-                $"{_automaticPerformance.PrecacheWorkerCount} pre-cache workers • " +
-                $"{_automaticPerformance.ImageMagickThreadsPerImage} batch threads • " +
-                $"{_automaticPerformance.ZoomImageMagickThreadsPerImage} zoom threads";
+                $"{core.CacheAheadMB + core.CacheBehindMB:N0} MB pages " +
+                $"({core.CacheAheadMB:N0} ahead + {core.CacheBehindMB:N0} behind)\n" +
+                $"{core.GlobalFastPreviewConcurrency} global fast / " +
+                $"{core.FastPreviewWorkerCount}×{core.FastPreviewThreadsPerWorker} non-JPEG / " +
+                $"{_automaticInitialValues.JpegCpuFastWorkers} JPEG\n" +
+                $"{core.PrecacheWorkerCount} pre-cache / " +
+                $"{_automaticInitialValues.PdfiumProcessCount} PDFium workers • " +
+                $"nvJPEG {_automaticInitialValues.NvJpegWorkerCount}, batch {_automaticInitialValues.NvJpegBatchSize}\n" +
+                $"GPU upload {_automaticInitialValues.ThumbnailIdleUploadBudgetMs:0.#}/" +
+                $"{_automaticInitialValues.ThumbnailScrollUploadBudgetMs:0.#} ms • " +
+                $"{_automaticInitialValues.ThumbnailUploadBudgetMB} MB/frame";
         }
         else
         {
-            ApplyPerformanceValues(_manualPerformance);
-            _autoOptimizeSummary.Text = "Manual cache and worker values are active.";
+            ApplyInitialValues(_manualInitialValues);
+            _autoOptimizeSummary.Text = _useBenchmarkProfile.Checked
+                ? "Dataset benchmark values are active. " + BenchmarkSummary
+                : "Manual cache and worker values are active.";
         }
-        SetPerformanceInputsEnabled(!_autoOptimize.Checked);
+        SetSuggestedInputsEnabled(!_autoOptimize.Checked);
+    }
+
+    private void UpdateEffectiveFastParallelism()
+    {
+        var logical = Math.Clamp(Environment.ProcessorCount, 1, 64);
+        var global = Math.Min(logical, (int)_globalFastPreviewConcurrency.Value);
+        var nonJpegImages = Math.Min(global, (int)_fastPreviewWorkers.Value);
+        var threadsPerResize = (int)_fastPreviewThreads.Value;
+        var nonJpegThreads = Math.Min(logical, nonJpegImages * threadsPerResize);
+        var cpuJpegImages = Math.Min(global, (int)_jpegCpuFastWorkers.Value);
+        var gpuJpeg = _useNvJpeg.Checked
+            ? $"{Math.Min(global, (int)_nvJpegWorkers.Value)} images"
+            : $"Off (configured {(int)_nvJpegWorkers.Value})";
+        _effectiveFastParallelism.Text =
+            $"Fast scheduling: {global} images maximum\n" +
+            $"CPU JPEG: {cpuJpegImages} images × 1 decode thread\n" +
+            $"Non-JPEG resize: {nonJpegImages} images × up to {threadsPerResize} threads " +
+            $"(up to {nonJpegThreads} CPU threads)\n" +
+            $"GPU JPEG: {gpuJpeg}";
     }
 
     private void CopyAutomaticToManual()
     {
-        _manualPerformance = _automaticPerformance;
+        _manualInitialValues = _automaticInitialValues;
+        _useBenchmarkProfile.Checked = false;
         if (_autoOptimize.Checked)
             _autoOptimize.Checked = false;
         else
-            ApplyPerformanceValues(_manualPerformance);
+            ApplyInitialValues(_manualInitialValues);
         _autoOptimizeSummary.Text =
-            "Auto values copied to Manual. Adjust them below, then choose Save.";
+            "Suggested initial values copied to Manual. Adjust them below, then choose Save.";
     }
+
+    private UserSettings CreateBenchmarkSettingsSnapshot()
+    {
+        var settings = System.Text.Json.JsonSerializer.Deserialize<UserSettings>(
+            System.Text.Json.JsonSerializer.Serialize(_sourceSettings)) ?? new UserSettings();
+        settings.UseNvJpeg = _useNvJpeg.Checked;
+        settings.NvJpegWorkerCount = (int)_nvJpegWorkers.Value;
+        settings.NvJpegBatchSize = (int)_nvJpegBatchSize.Value;
+        settings.NvJpegBatchDelayMs = (int)_nvJpegBatchDelay.Value;
+        settings.NvJpegVramHeadroomPercent = (int)_nvJpegVramHeadroom.Value;
+        return settings;
+    }
+
+    private void ApplyBenchmarkResult(PerformanceBenchmarkResult result)
+    {
+        _autoOptimize.Checked = false;
+        _useBenchmarkProfile.Checked = true;
+        // Cache budgets are capacity decisions rather than decode throughput
+        // decisions, so seed them from current available RAM before applying
+        // the measured CPU/GPU values.
+        var capacity = PerformanceProfile.Detect();
+        SetValue(_ahead, capacity.CacheAheadMB);
+        SetValue(_behind, capacity.CacheBehindMB);
+        SetValue(_previewCache, capacity.PreviewCacheMB);
+        SetValue(_thumbnailCache, capacity.ThumbnailCacheMB);
+        SetValue(_thumbnailFastPreviewCache, capacity.ThumbnailFastPreviewCacheMB);
+        SetValue(_globalFastPreviewConcurrency,
+            Math.Clamp(result.FastWorkers * result.FastThreads, 1,
+                Math.Clamp(Environment.ProcessorCount, 1, 64)));
+        SetValue(_zoomImageMagickThreads, capacity.ZoomImageMagickThreadsPerImage);
+        SetValue(_jpegCpuFastWorkers, result.JpegCpuWorkers);
+        SetValue(_jpegCpuBackgroundWorkers, result.JpegCpuWorkers);
+        SetValue(_pngWorkers, result.PngWorkers);
+        SetValue(_webpWorkers, result.WebPWorkers);
+        SetValue(_gifWorkers, result.GifWorkers);
+        SetValue(_tiffWorkers, result.TiffWorkers);
+        SetValue(_bmpWorkers, result.BmpWorkers);
+        SetValue(_genericWorkers, result.GenericWorkers);
+        SetValue(_wicWorkers, result.WicWorkers);
+        SetValue(_imageMagickThreads, result.ImageMagickThreads);
+        SetValue(_precacheWorkers, result.PrecacheWorkers);
+        SetValue(_fastPreviewWorkers, result.FastWorkers);
+        SetValue(_fastPreviewThreads, result.FastThreads);
+        SetValue(_nvJpegWorkers, result.NvJpegWorkers);
+        SetValue(_nvJpegBatchSize, result.NvJpegBatchSize);
+        SetValue(_nvJpegBatchDelay, result.NvJpegBatchDelayMs);
+        SetValue(_pdfiumProcesses, result.PdfiumProcesses);
+        _manualInitialValues = CaptureInitialValues();
+        SetSuggestedInputsEnabled(true);
+        _autoOptimizeSummary.Text = "Dataset benchmark values are active.";
+    }
+
+    private AutomaticInitialValueProfile CaptureInitialValues() => new(
+        CapturePerformanceValues(), (int)_pdfiumProcesses.Value,
+        (int)_jpegCpuFastWorkers.Value, (int)_jpegCpuBackgroundWorkers.Value,
+        (int)_nvJpegWorkers.Value, (int)_nvJpegBatchSize.Value,
+        (int)_nvJpegBatchDelay.Value, (int)_nvJpegVramHeadroom.Value,
+        (int)_wicWorkers.Value, (int)_pngWorkers.Value, (int)_webpWorkers.Value,
+        (int)_gifWorkers.Value, (int)_tiffWorkers.Value, (int)_bmpWorkers.Value,
+        (int)_genericWorkers.Value, (int)_genericGpuWorkers.Value,
+        (int)_genericGpuMinimumSource.Value, (int)_genericGpuFastMaximumSource.Value,
+        (double)_thumbnailIdleUploadBudget.Value,
+        (double)_thumbnailScrollUploadBudget.Value,
+        (int)_thumbnailUploadBudget.Value, (int)_thumbnailUploadsPerFrame.Value,
+        (int)_thumbnailMaxPreviewSize.Value);
 
     private PerformanceProfile CapturePerformanceValues() => new(
         (int)_ahead.Value,
@@ -441,6 +829,7 @@ internal sealed class ReaderSettingsDialog : Form
         (int)_previewCache.Value,
         (int)_thumbnailCache.Value,
         (int)_thumbnailFastPreviewCache.Value,
+        (int)_globalFastPreviewConcurrency.Value,
         (int)_fastPreviewWorkers.Value,
         (int)_fastPreviewThreads.Value,
         (int)_precacheWorkers.Value,
@@ -454,6 +843,7 @@ internal sealed class ReaderSettingsDialog : Form
         SetValue(_previewCache, profile.PreviewCacheMB);
         SetValue(_thumbnailCache, profile.ThumbnailCacheMB);
         SetValue(_thumbnailFastPreviewCache, profile.ThumbnailFastPreviewCacheMB);
+        SetValue(_globalFastPreviewConcurrency, profile.GlobalFastPreviewConcurrency);
         SetValue(_fastPreviewWorkers, profile.FastPreviewWorkerCount);
         SetValue(_fastPreviewThreads, profile.FastPreviewThreadsPerWorker);
         SetValue(_precacheWorkers, profile.PrecacheWorkerCount);
@@ -461,20 +851,60 @@ internal sealed class ReaderSettingsDialog : Form
         SetValue(_zoomImageMagickThreads, profile.ZoomImageMagickThreadsPerImage);
     }
 
-    private void SetPerformanceInputsEnabled(bool enabled)
+    private void ApplyInitialValues(AutomaticInitialValueProfile profile)
+    {
+        ApplyPerformanceValues(profile.Core);
+        SetValue(_pdfiumProcesses, profile.PdfiumProcessCount);
+        SetValue(_jpegCpuFastWorkers, profile.JpegCpuFastWorkers);
+        SetValue(_jpegCpuBackgroundWorkers, profile.JpegCpuBackgroundWorkers);
+        SetValue(_nvJpegWorkers, profile.NvJpegWorkerCount);
+        SetValue(_nvJpegBatchSize, profile.NvJpegBatchSize);
+        SetValue(_nvJpegBatchDelay, profile.NvJpegBatchDelayMs);
+        SetValue(_nvJpegVramHeadroom, profile.NvJpegVramHeadroomPercent);
+        SetValue(_wicWorkers, profile.WicFastPreviewWorkers);
+        SetValue(_pngWorkers, profile.PngDecodeWorkers);
+        SetValue(_webpWorkers, profile.WebPDecodeWorkers);
+        SetValue(_gifWorkers, profile.GifDecodeWorkers);
+        SetValue(_tiffWorkers, profile.TiffDecodeWorkers);
+        SetValue(_bmpWorkers, profile.BmpDecodeWorkers);
+        SetValue(_genericWorkers, profile.GenericFallbackWorkers);
+        SetValue(_genericGpuWorkers, profile.GenericGpuWorkers);
+        SetValue(_genericGpuMinimumSource, profile.GenericGpuMinimumSourceMB);
+        SetValue(_genericGpuFastMaximumSource, profile.GenericGpuFastMaximumSourceMB);
+        SetDecimalValue(_thumbnailIdleUploadBudget, profile.ThumbnailIdleUploadBudgetMs);
+        SetDecimalValue(_thumbnailScrollUploadBudget, profile.ThumbnailScrollUploadBudgetMs);
+        SetValue(_thumbnailUploadBudget, profile.ThumbnailUploadBudgetMB);
+        SetValue(_thumbnailUploadsPerFrame, profile.ThumbnailUploadsPerFrame);
+        SetValue(_thumbnailMaxPreviewSize, profile.ThumbnailMaxPreviewSizePx);
+    }
+
+    private void SetSuggestedInputsEnabled(bool enabled)
     {
         foreach (var input in new Control[]
                  {
                      _ahead, _behind, _previewCache, _thumbnailCache,
-                     _thumbnailFastPreviewCache, _fastPreviewWorkers,
+                     _thumbnailFastPreviewCache, _globalFastPreviewConcurrency,
+                     _fastPreviewWorkers,
                      _fastPreviewThreads, _precacheWorkers, _imageMagickThreads,
-                     _zoomImageMagickThreads
+                     _zoomImageMagickThreads, _pdfiumProcesses,
+                     _jpegCpuFastWorkers, _jpegCpuBackgroundWorkers,
+                     _nvJpegWorkers, _nvJpegBatchSize, _nvJpegBatchDelay,
+                     _nvJpegVramHeadroom, _wicWorkers, _pngWorkers,
+                     _webpWorkers, _gifWorkers, _tiffWorkers, _bmpWorkers,
+                     _genericWorkers, _genericGpuWorkers,
+                     _genericGpuMinimumSource, _genericGpuFastMaximumSource,
+                     _thumbnailIdleUploadBudget, _thumbnailScrollUploadBudget,
+                     _thumbnailUploadBudget, _thumbnailUploadsPerFrame,
+                     _thumbnailMaxPreviewSize
                  })
             input.Enabled = enabled;
     }
 
     private static void SetValue(NumericUpDown input, int value) =>
         input.Value = Math.Clamp(value, (int)input.Minimum, (int)input.Maximum);
+
+    private static void SetDecimalValue(NumericUpDown input, double value) =>
+        input.Value = Math.Clamp((decimal)value, input.Minimum, input.Maximum);
 
     private void AcceptSettings()
     {
@@ -545,6 +975,16 @@ internal sealed class ReaderSettingsDialog : Form
             _randomLibraryPath.Text = dialog.SelectedPath;
     }
 
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        if (_benchmarkRunning)
+        {
+            _benchmarkCancellation?.Cancel();
+            e.Cancel = true;
+        }
+        base.OnFormClosing(e);
+    }
+
     private void ChoosePersistentCachePath()
     {
         using var dialog = new FolderBrowserDialog
@@ -557,6 +997,19 @@ internal sealed class ReaderSettingsDialog : Form
         };
         if (dialog.ShowDialog(this) == DialogResult.OK)
             _persistentCachePath.Text = dialog.SelectedPath;
+    }
+
+    private void ChooseBenchmarkDataset()
+    {
+        using var dialog = new FolderBrowserDialog
+        {
+            Description = "Choose a folder containing representative test images",
+            UseDescriptionForTitle = true,
+            SelectedPath = Directory.Exists(_benchmarkDatasetPath.Text)
+                ? _benchmarkDatasetPath.Text : string.Empty
+        };
+        if (dialog.ShowDialog(this) == DialogResult.OK)
+            _benchmarkDatasetPath.Text = dialog.SelectedPath;
     }
 
     private static string FormatByteCount(long bytes)
@@ -614,9 +1067,11 @@ internal sealed class ReaderSettingsDialog : Form
         var fieldHeights = fields
             .Select(field => Math.Max(46, field.Input.MinimumSize.Height))
             .ToArray();
+        const int descriptionHeight = 60;
         var card = new Panel
         {
-            Dock = DockStyle.Top, Height = 122 + fieldHeights.Sum(),
+            Dock = DockStyle.Top,
+            Height = 122 + (descriptionHeight - 42) + fieldHeights.Sum(),
             BackColor = Color.White, BorderStyle = BorderStyle.FixedSingle,
             Margin = new Padding(0, 0, 0, 14)
         };
@@ -626,7 +1081,7 @@ internal sealed class ReaderSettingsDialog : Form
             Padding = new Padding(20, 10, 20, 12), BackColor = Color.White
         };
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, descriptionHeight));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         layout.Controls.Add(new Label
         {
@@ -639,7 +1094,9 @@ internal sealed class ReaderSettingsDialog : Form
         {
             Text = description, Dock = DockStyle.Fill,
             ForeColor = Color.FromArgb(91, 99, 112),
-            TextAlign = ContentAlignment.TopLeft, AutoEllipsis = false
+            TextAlign = ContentAlignment.TopLeft, AutoEllipsis = false,
+            UseCompatibleTextRendering = true,
+            Padding = new Padding(0, 1, 0, 3)
         }, 0, 1);
 
         var fieldTable = new TableLayoutPanel
@@ -715,6 +1172,33 @@ internal sealed class ReaderSettingsDialog : Form
     private static NumericUpDown CreatePixelInput() => new()
     {
         Minimum = 32, Maximum = 8192, Increment = 32,
+        ThousandsSeparator = true, Dock = DockStyle.Fill
+    };
+
+    private static CheckBox CreateOption(string text) => new()
+    {
+        Text = text, AutoSize = true, Dock = DockStyle.Fill
+    };
+
+    private static NumericUpDown CreateMillisecondsInput() => new()
+    {
+        Minimum = 0, Maximum = 100, Increment = 1, Dock = DockStyle.Fill
+    };
+
+    private static NumericUpDown CreatePercentInput() => new()
+    {
+        Minimum = 5, Maximum = 75, Increment = 1, Dock = DockStyle.Fill
+    };
+
+    private static NumericUpDown CreateTimeBudgetInput() => new()
+    {
+        Minimum = 0.5m, Maximum = 50m, Increment = 0.5m,
+        DecimalPlaces = 1, Dock = DockStyle.Fill
+    };
+
+    private static NumericUpDown CreateCountInput(int minimum, int maximum) => new()
+    {
+        Minimum = minimum, Maximum = maximum, Increment = 1,
         ThousandsSeparator = true, Dock = DockStyle.Fill
     };
 

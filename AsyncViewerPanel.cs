@@ -942,10 +942,44 @@ internal sealed class AsyncViewerPanel : Panel
 
         if (Volatile.Read(ref _previewCacheLimitBytes) > 0 && !ContainsPreview(key))
         {
-            var preview = await RenderWorkScheduler.RunFastAsync(
-                threads => ResizeFastPreview(source, size, threads, cancellationToken),
-                cancellationToken);
-            if (preview is not null && !AddPreviewOwned(key, preview)) preview.Dispose();
+            GpuRenderedImage? gpuPreview = null;
+            var sourceBytes = (long)source.Width * source.Height * 4;
+            if (ImagePipelineTuning.UseGenericGpuFastPreview &&
+                sourceBytes <= ImagePipelineTuning.GenericGpuFastMaximumSourceBytes)
+                gpuPreview = await RenderWorkScheduler.RunFastCodecAsync(() =>
+                {
+                    using var lease = ImagePipelineTuning.EnterGenericGpu(cancellationToken);
+                    return GpuContactSheetRenderer.TryScale(source, size, cancellationToken);
+                }, cancellationToken);
+            if (gpuPreview is not null)
+            {
+                if (!AddGpuPreviewOwned(key, gpuPreview)) gpuPreview.Dispose();
+            }
+            else
+            {
+                var preview = await RenderWorkScheduler.RunFastAsync(
+                    threads => ResizeFastPreview(source, size, threads, cancellationToken),
+                    cancellationToken);
+                if (preview is not null && !AddPreviewOwned(key, preview)) preview.Dispose();
+            }
+        }
+
+        if (ImagePipelineTuning.UseGenericGpuLanczos &&
+            (long)source.Width * source.Height * 4 >=
+            ImagePipelineTuning.GenericGpuMinimumSourceBytes)
+        {
+            var gpuRendered = await RenderWorkScheduler.RunFullAsync(() =>
+            {
+                using var lease = ImagePipelineTuning.EnterGenericGpu(cancellationToken);
+                return NvJpegNativeDecoder.TryResizeBitmapToGpu(
+                    source, size, fastPreview: false, cancellationToken,
+                    out var image) ? image : null;
+            }, cancellationToken);
+            if (gpuRendered is not null)
+            {
+                if (!AddGpuRenderOwned(key, gpuRendered)) gpuRendered.Dispose();
+                return;
+            }
         }
 
         // The caller owns this source clone until the await completes, so another

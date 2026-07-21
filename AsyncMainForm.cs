@@ -210,7 +210,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         PersistentPreviewCache.Configure(
             _settings.PersistentCachePath, _settings.FullViewDiskCacheMB,
             _settings.ThumbnailDiskCacheMB);
-        NvJpegNativeDecoder.Configure(_settings.UseNvJpeg);
+        ImagePipelineTuning.Configure(_settings);
+        NvJpegNativeDecoder.Configure(_settings.UseNvJpeg, _settings);
         PdfRendering.PdfiumProcessCount = _settings.PdfiumProcessCount;
         ApplyImageMagickThreadLimit();
         ApplyFastPreviewSchedulerSettings();
@@ -261,6 +262,11 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _thumbnailGrid.SetCacheLimits(
             ThumbnailCacheLimitBytes, ThumbnailFastPreviewCacheLimitBytes);
         _thumbnailGrid.SetInternalPreviewMaxSize(_settings.ThumbnailMaxPreviewSizePx);
+        _thumbnailGrid.ConfigureGpuUploadBudgets(
+            _settings.ThumbnailIdleUploadBudgetMs,
+            _settings.ThumbnailScrollUploadBudgetMs,
+            _settings.ThumbnailUploadBudgetMB,
+            _settings.ThumbnailUploadsPerFrame);
         _bottomPanel.Visible = _settings.SliderVisible;
         _toolbar.Visible = true;
         _viewer.Visible = !_thumbnailMode;
@@ -1770,6 +1776,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     {
         var page = book.Pages[index];
         if (page.Decode is not null) return page.Decode();
+        using var formatLease = ImagePipelineTuning.EnterFormat(
+            page.Name, _bookCancellation?.Token ?? CancellationToken.None);
         if (Path.GetExtension(page.Name).Equals(".webp", StringComparison.OrdinalIgnoreCase))
         {
             try
@@ -1876,9 +1884,6 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         CancellationToken cancellationToken)
     {
         var page = book.Pages[pageIndex];
-        if (!EncodedJpegRenderer.Supports(page))
-            return Task.FromResult<Bitmap?>(null);
-
         return RenderWorkScheduler.RunFastCodecAsync<Bitmap?>(
             () =>
             {
@@ -1887,12 +1892,19 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                         PersistentPreviewKind.FullView, book, pageIndex,
                         bounds, rotation, quality: 0, out var cached))
                     return cached;
-                var preview = EncodedJpegRenderer.RenderThumbnail(
-                    page, bounds, rotation, quality: 0,
-                    fastPreview: true, cancellationToken).Bitmap;
+                Bitmap? preview;
+                if (EncodedJpegRenderer.Supports(page))
+                    preview = EncodedJpegRenderer.RenderThumbnail(
+                        page, bounds, rotation, quality: 0,
+                        fastPreview: true, cancellationToken).Bitmap;
+                else if (!WicFastPreviewDecoder.TryDecode(
+                             page, bounds, cancellationToken, out preview))
+                    return null;
+                else if (rotation != 0)
+                    ApplyRotation(preview!, rotation);
                 PersistentPreviewCache.StoreCopyInBackground(
                     PersistentPreviewKind.FullView, book, pageIndex,
-                    bounds, rotation, quality: 0, preview);
+                    bounds, rotation, quality: 0, preview!);
                 return preview;
             },
             cancellationToken);
@@ -2553,8 +2565,48 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         }
         else
         {
-            using var image = await LoadThumbnailSourceAsync(
+            Bitmap? wic = null;
+            if (fastPreview && WicFastPreviewDecoder.Supports(entry))
+                wic = await RenderWorkScheduler.RunFastCodecAsync(
+                    () => WicFastPreviewDecoder.TryDecode(
+                        entry, targetSize, cancellationToken, out var decoded)
+                        ? decoded : null, cancellationToken).ConfigureAwait(false);
+            if (wic is not null && rotation != 0) ApplyRotation(wic, rotation);
+            using var image = wic ?? await LoadThumbnailSourceAsync(
                 book, page, cancellationToken).ConfigureAwait(false);
+            var sourceBytes = (long)image.Width * image.Height * 4;
+            if (fastPreview && ImagePipelineTuning.UseGenericGpuFastPreview &&
+                sourceBytes <= ImagePipelineTuning.GenericGpuFastMaximumSourceBytes)
+            {
+                var gpu = await RenderWorkScheduler.RunFastCodecAsync(() =>
+                {
+                    using var lease = ImagePipelineTuning.EnterGenericGpu(cancellationToken);
+                    return GpuContactSheetRenderer.TryScale(
+                        image, targetSize, cancellationToken);
+                }, cancellationToken).ConfigureAwait(false);
+                if (gpu is not null)
+                {
+                    // WIC already produced the target-sized preview. Persist it
+                    // before transferring ownership of the visible result to D3D.
+                    if (wic is not null)
+                        PersistentPreviewCache.StoreCopyInBackground(
+                            persistentKind, book, page, targetSize, rotation,
+                            persistentQuality, image);
+                    return new GeneratedThumbnail(null, gpu);
+                }
+            }
+            if (!fastPreview && ImagePipelineTuning.UseGenericGpuLanczos &&
+                sourceBytes >= ImagePipelineTuning.GenericGpuMinimumSourceBytes)
+            {
+                var gpu = await RenderWorkScheduler.RunFullAsync(() =>
+                {
+                    using var lease = ImagePipelineTuning.EnterGenericGpu(cancellationToken);
+                    return NvJpegNativeDecoder.TryResizeBitmapToGpu(
+                        image, targetSize, fastPreview: false, cancellationToken,
+                        out var rendered) ? rendered : null;
+                }, cancellationToken).ConfigureAwait(false);
+                if (gpu is not null) return new GeneratedThumbnail(null, gpu);
+            }
             Bitmap? thumbnail = null;
             try
             {
@@ -3717,10 +3769,34 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     {
         _viewer.ReturnToFit();
         using var dialog = new ReaderSettingsDialog(_settings) { Icon = Icon };
+        dialog.BenchmarkRunningChanged += (_, running) =>
+        {
+            if (running)
+            {
+                lock (_warmStateGate)
+                {
+                    if (_warmCancellation is not null)
+                        CancelAndDisposeInBackground(_warmCancellation);
+                    _warmCancellation = null;
+                    _bookPrecacheStarted = false;
+                }
+                CancelThumbnailWork();
+                return;
+            }
+            if (_cache is { } benchmarkCache && _book is { } benchmarkBook)
+                RequestCacheWarm(_pageIndex, benchmarkCache, benchmarkBook);
+            if (_thumbnailMode) _ = LoadThumbnailsProgressivelyAsync();
+        };
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
 
         var qualityChanged = _settings.LanczosQuality != dialog.LanczosQuality;
         var nvJpegChanged = _settings.UseNvJpeg != dialog.UseNvJpeg;
+        var imagePipelineChanged = nvJpegChanged ||
+            _settings.UseWicFastPreview != dialog.UseWicFastPreview ||
+            _settings.UseGenericGpuFastPreview != dialog.UseGenericGpuFastPreview ||
+            _settings.UseGenericGpuLanczos != dialog.UseGenericGpuLanczos ||
+            _settings.GenericGpuMinimumSourceMB != dialog.GenericGpuMinimumSourceMB ||
+            _settings.GenericGpuFastMaximumSourceMB != dialog.GenericGpuFastMaximumSourceMB;
         var pdfiumProcessCountChanged =
             _settings.PdfiumProcessCount != dialog.PdfiumProcessCount;
         var colorManagementChanged =
@@ -3731,8 +3807,42 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _settings.PdfiumProcessCount = dialog.PdfiumProcessCount;
         PdfRendering.PdfiumProcessCount = _settings.PdfiumProcessCount;
         _settings.UseMonitorColorProfile = dialog.UseMonitorColorProfile;
-        NvJpegNativeDecoder.Configure(_settings.UseNvJpeg);
+        _settings.JpegCpuFastWorkers = dialog.JpegCpuFastWorkers;
+        _settings.JpegCpuBackgroundWorkers = dialog.JpegCpuBackgroundWorkers;
+        _settings.NvJpegWorkerCount = dialog.NvJpegWorkerCount;
+        _settings.NvJpegBatchSize = dialog.NvJpegBatchSize;
+        _settings.NvJpegBatchDelayMs = dialog.NvJpegBatchDelayMs;
+        _settings.NvJpegVramHeadroomPercent = dialog.NvJpegVramHeadroomPercent;
+        _settings.UseWicFastPreview = dialog.UseWicFastPreview;
+        _settings.WicFastPreviewWorkers = dialog.WicFastPreviewWorkers;
+        _settings.PngDecodeWorkers = dialog.PngDecodeWorkers;
+        _settings.WebPDecodeWorkers = dialog.WebPDecodeWorkers;
+        _settings.GifDecodeWorkers = dialog.GifDecodeWorkers;
+        _settings.TiffDecodeWorkers = dialog.TiffDecodeWorkers;
+        _settings.BmpDecodeWorkers = dialog.BmpDecodeWorkers;
+        _settings.GenericFallbackWorkers = dialog.GenericFallbackWorkers;
+        _settings.UseGenericGpuFastPreview = dialog.UseGenericGpuFastPreview;
+        _settings.UseGenericGpuLanczos = dialog.UseGenericGpuLanczos;
+        _settings.GenericGpuWorkers = dialog.GenericGpuWorkers;
+        _settings.GenericGpuMinimumSourceMB = dialog.GenericGpuMinimumSourceMB;
+        _settings.GenericGpuFastMaximumSourceMB = dialog.GenericGpuFastMaximumSourceMB;
+        _settings.ThumbnailIdleUploadBudgetMs = dialog.ThumbnailIdleUploadBudgetMs;
+        _settings.ThumbnailScrollUploadBudgetMs = dialog.ThumbnailScrollUploadBudgetMs;
+        _settings.ThumbnailUploadBudgetMB = dialog.ThumbnailUploadBudgetMB;
+        _settings.ThumbnailUploadsPerFrame = dialog.ThumbnailUploadsPerFrame;
+        ImagePipelineTuning.Configure(_settings);
+        NvJpegNativeDecoder.Configure(_settings.UseNvJpeg, _settings);
+        _thumbnailGrid.ConfigureGpuUploadBudgets(
+            _settings.ThumbnailIdleUploadBudgetMs,
+            _settings.ThumbnailScrollUploadBudgetMs,
+            _settings.ThumbnailUploadBudgetMB,
+            _settings.ThumbnailUploadsPerFrame);
         _settings.AutoOptimizePerformance = dialog.AutoOptimizePerformance;
+        _settings.UseBenchmarkProfile = dialog.UseBenchmarkProfile;
+        _settings.BenchmarkDatasetMode = dialog.BenchmarkDatasetMode;
+        _settings.BenchmarkDatasetPath = dialog.BenchmarkDatasetPath;
+        _settings.LastBenchmarkUtc = dialog.BenchmarkCompletedUtc;
+        _settings.LastBenchmarkSummary = dialog.BenchmarkSummary;
         if (!_settings.AutoOptimizePerformance)
         {
             _settings.CacheAheadMB = dialog.CacheAheadMB;
@@ -3740,6 +3850,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             _settings.PreviewCacheMB = dialog.PreviewCacheMB;
             _settings.ThumbnailCacheMB = dialog.ThumbnailCacheMB;
             _settings.ThumbnailFastPreviewCacheMB = dialog.ThumbnailFastPreviewCacheMB;
+            _settings.GlobalFastPreviewConcurrency = dialog.GlobalFastPreviewConcurrency;
             _settings.FastPreviewWorkerCount = dialog.FastPreviewWorkerCount;
             _settings.FastPreviewThreadsPerWorker = dialog.FastPreviewThreadsPerWorker;
             _settings.PrecacheWorkerCount = dialog.PrecacheWorkerCount;
@@ -3810,9 +3921,9 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             }
             ScheduleRelaxedCacheTrim(cache);
             RequestCacheWarm(_pageIndex, cache, book);
-            if (qualityChanged || nvJpegChanged) _ = ShowPageAsync();
+            if (qualityChanged || imagePipelineChanged) _ = ShowPageAsync();
         }
-        if ((qualityChanged || performanceChanged) && _thumbnailMode)
+        if ((qualityChanged || performanceChanged || imagePipelineChanged) && _thumbnailMode)
             _ = LoadThumbnailsProgressivelyAsync();
         UpdateNavigationToolbar();
     }
@@ -3828,6 +3939,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private void ApplyFastPreviewSchedulerSettings() =>
         RenderWorkScheduler.Configure(
+            _performance.GlobalFastPreviewConcurrency,
             _performance.FastPreviewWorkerCount, _performance.FastPreviewThreadsPerWorker,
             _performance.PrecacheWorkerCount, _performance.ImageMagickThreadsPerImage);
 

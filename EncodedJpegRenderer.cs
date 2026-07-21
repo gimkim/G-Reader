@@ -146,6 +146,8 @@ internal static class EncodedJpegRenderer
                 return new Result(output, nvJpegLandscape);
             }
         }
+        using var cpuLease = ImagePipelineTuning.EnterJpegCpu(
+            fastPreview, cancellationToken);
         if (TurboJpegNativeDecoder.TryDecode(
                 page, new Size(width, height), rotation,
                 fastPreview ? 1 : 2, fastPreview, cancellationToken,

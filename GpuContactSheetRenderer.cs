@@ -1,4 +1,7 @@
 using System.Numerics;
+using System.Runtime.InteropServices;
+using DrawingImageLockMode = System.Drawing.Imaging.ImageLockMode;
+using DrawingPixelFormat = System.Drawing.Imaging.PixelFormat;
 using Vortice;
 using Vortice.DCommon;
 using Vortice.Direct2D1;
@@ -14,6 +17,86 @@ internal static class GpuContactSheetRenderer
     private static ID2D1Factory1? _factory;
     private static ID2D1Device? _device;
     private static ID2D1DeviceContext? _context;
+
+    public static GpuRenderedImage? TryScale(
+        Bitmap source, System.Drawing.Size bounds, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var scale = Math.Min(1d, Math.Min(
+            Math.Max(1, bounds.Width) / (double)Math.Max(1, source.Width),
+            Math.Max(1, bounds.Height) / (double)Math.Max(1, source.Height)));
+        var target = new System.Drawing.Size(
+            Math.Max(1, (int)Math.Round(source.Width * scale)),
+            Math.Max(1, (int)Math.Round(source.Height * scale)));
+        var converted = source.PixelFormat == DrawingPixelFormat.Format32bppPArgb
+            ? source : null;
+        using var owned = converted is null ? new Bitmap(source.Width, source.Height,
+            DrawingPixelFormat.Format32bppPArgb) : null;
+        if (owned is not null)
+        {
+            using var graphics = Graphics.FromImage(owned);
+            graphics.DrawImageUnscaled(source, 0, 0);
+            converted = owned;
+        }
+        var stride = checked(converted!.Width * 4);
+        var pixels = new byte[checked(stride * converted.Height)];
+        var data = converted.LockBits(new Rectangle(0, 0, converted.Width, converted.Height),
+            DrawingImageLockMode.ReadOnly, DrawingPixelFormat.Format32bppPArgb);
+        try
+        {
+            for (var y = 0; y < converted.Height; y++)
+                Marshal.Copy(data.Scan0 + y * data.Stride, pixels, y * stride, stride);
+        }
+        finally { converted.UnlockBits(data); }
+        cancellationToken.ThrowIfCancellationRequested();
+        using var uploaded = GpuInteropDevice.CreateImageFromBgra(
+            pixels, converted.Width, converted.Height);
+        return uploaded is null ? null : TryScale(uploaded, target);
+    }
+
+    private static GpuRenderedImage? TryScale(
+        GpuRenderedImage source, System.Drawing.Size targetSize)
+    {
+        lock (Gate)
+        {
+            try
+            {
+                EnsureContext();
+                if (_context is null) return null;
+                var texture = GpuInteropDevice.CreateTexture(
+                    targetSize.Width, targetSize.Height, renderTarget: true);
+                if (texture is null) return null;
+                try
+                {
+                    using var sourceSurface = source.Texture.QueryInterface<IDXGISurface>();
+                    using var input = _context.CreateBitmapFromDxgiSurface(sourceSurface,
+                        new BitmapProperties1(new PixelFormat(Format.B8G8R8A8_UNorm,
+                            Vortice.DCommon.AlphaMode.Premultiplied), 96f, 96f,
+                            BitmapOptions.None));
+                    using var outputSurface = texture.QueryInterface<IDXGISurface>();
+                    using var output = _context.CreateBitmapFromDxgiSurface(outputSurface,
+                        new BitmapProperties1(new PixelFormat(Format.B8G8R8A8_UNorm,
+                            Vortice.DCommon.AlphaMode.Premultiplied), 96f, 96f,
+                            BitmapOptions.Target));
+                    _context.Target = output;
+                    _context.BeginDraw();
+                    _context.Clear(new Color4(0, 0, 0, 0));
+                    _context.DrawBitmap(input, new RawRectF(0, 0,
+                        targetSize.Width, targetSize.Height), 1f,
+                        BitmapInterpolationMode.Linear, null);
+                    var result = _context.EndDraw();
+                    _context.Target = null;
+                    if (result.Failure) return null;
+                    var rendered = new GpuRenderedImage(texture, IntPtr.Zero,
+                        targetSize.Width, targetSize.Height, _ => { });
+                    texture = null;
+                    return rendered;
+                }
+                finally { _context.Target = null; texture?.Dispose(); }
+            }
+            catch { return null; }
+        }
+    }
 
     public static GpuRenderedImage? TryCompose(
         IReadOnlyList<GpuRenderedImage> images, System.Drawing.Size targetSize)

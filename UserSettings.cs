@@ -26,8 +26,40 @@ internal sealed class UserSettings
     public int LanczosQuality { get; set; } = 1;
     public bool UseNvJpeg { get; set; }
     public int PdfiumProcessCount { get; set; } = 4;
+    // Advanced codec defaults mirror the previously hard-coded scheduler.
+    public int JpegCpuFastWorkers { get; set; } = Math.Clamp(
+        Environment.ProcessorCount, 1, 64);
+    public int JpegCpuBackgroundWorkers { get; set; } = Math.Clamp(
+        Environment.ProcessorCount, 1, 64);
+    public int NvJpegWorkerCount { get; set; } = 16;
+    public int NvJpegBatchSize { get; set; } = 8;
+    public int NvJpegBatchDelayMs { get; set; } = 2;
+    public int NvJpegVramHeadroomPercent { get; set; } = 15;
+    public bool UseWicFastPreview { get; set; } = true;
+    public int WicFastPreviewWorkers { get; set; } = 4;
+    public int PngDecodeWorkers { get; set; } = 4;
+    public int WebPDecodeWorkers { get; set; } = 4;
+    public int GifDecodeWorkers { get; set; } = 4;
+    public int TiffDecodeWorkers { get; set; } = 4;
+    public int BmpDecodeWorkers { get; set; } = 4;
+    public int GenericFallbackWorkers { get; set; } = 3;
+    public bool UseGenericGpuFastPreview { get; set; } = true;
+    public bool UseGenericGpuLanczos { get; set; } = true;
+    public int GenericGpuWorkers { get; set; } = 4;
+    public int GenericGpuMinimumSourceMB { get; set; } = 16;
+    public int GenericGpuFastMaximumSourceMB { get; set; } = 64;
+    public double ThumbnailIdleUploadBudgetMs { get; set; } = 6.0;
+    public double ThumbnailScrollUploadBudgetMs { get; set; } = 4.0;
+    public int ThumbnailUploadBudgetMB { get; set; } = 64;
+    public int ThumbnailUploadsPerFrame { get; set; } = 128;
     public bool UseMonitorColorProfile { get; set; } = true;
     public bool AutoOptimizePerformance { get; set; }
+    public bool UseBenchmarkProfile { get; set; }
+    // 0 = generated temporary comprehensive dataset, 1 = custom folder.
+    public int BenchmarkDatasetMode { get; set; }
+    public string BenchmarkDatasetPath { get; set; } = string.Empty;
+    public DateTime? LastBenchmarkUtc { get; set; }
+    public string LastBenchmarkSummary { get; set; } = string.Empty;
     public int CacheAheadMB { get; set; } = 3072;
     public int CacheBehindMB { get; set; } = 1024;
     public int PreviewCacheMB { get; set; } = 512;
@@ -37,6 +69,8 @@ internal sealed class UserSettings
     public int FullViewDiskCacheMB { get; set; } = 4096;
     public int ThumbnailDiskCacheMB { get; set; } = 4096;
     public int ThumbnailMaxPreviewSizePx { get; set; } = 360;
+    // Zero migrates older settings to the scheduler's former workers x threads limit.
+    public int GlobalFastPreviewConcurrency { get; set; }
     public int FastPreviewWorkerCount { get; set; } = 4;
     public int FastPreviewThreadsPerWorker { get; set; } = 2;
     public int PrecacheWorkerCount { get; set; } = 3;
@@ -74,9 +108,18 @@ internal sealed class UserSettings
         try
         {
             var path = File.Exists(FilePath) ? FilePath : LegacyFilePath;
-            return File.Exists(path)
+            var settings = File.Exists(path)
                 ? JsonSerializer.Deserialize<UserSettings>(File.ReadAllText(path)) ?? new()
                 : CreateFirstRunDefaults();
+            // Older benchmark builds could select 16 PDFium processes. Keep
+            // manual values untouched, but repair that unsafe automatic result.
+            if (settings.UseBenchmarkProfile && settings.PdfiumProcessCount > 8)
+                settings.PdfiumProcessCount = 8;
+            if (settings.GlobalFastPreviewConcurrency <= 0)
+                settings.GlobalFastPreviewConcurrency = Math.Clamp(
+                    settings.FastPreviewWorkerCount * settings.FastPreviewThreadsPerWorker,
+                    1, Math.Clamp(Environment.ProcessorCount, 1, 64));
+            return settings;
         }
         catch { return CreateFirstRunDefaults(); }
     }
@@ -84,17 +127,7 @@ internal sealed class UserSettings
     private static UserSettings CreateFirstRunDefaults()
     {
         var settings = new UserSettings { AutoOptimizePerformance = true };
-        var profile = PerformanceProfile.Detect();
-        settings.CacheAheadMB = profile.CacheAheadMB;
-        settings.CacheBehindMB = profile.CacheBehindMB;
-        settings.PreviewCacheMB = profile.PreviewCacheMB;
-        settings.ThumbnailCacheMB = profile.ThumbnailCacheMB;
-        settings.ThumbnailFastPreviewCacheMB = profile.ThumbnailFastPreviewCacheMB;
-        settings.FastPreviewWorkerCount = profile.FastPreviewWorkerCount;
-        settings.FastPreviewThreadsPerWorker = profile.FastPreviewThreadsPerWorker;
-        settings.PrecacheWorkerCount = profile.PrecacheWorkerCount;
-        settings.ImageMagickThreadsPerImage = profile.ImageMagickThreadsPerImage;
-        settings.ZoomImageMagickThreadsPerImage = profile.ZoomImageMagickThreadsPerImage;
+        AutomaticInitialValueProfile.Detect().ApplyTo(settings);
         return settings;
     }
 

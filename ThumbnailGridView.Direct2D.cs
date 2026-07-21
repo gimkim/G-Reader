@@ -33,14 +33,14 @@ internal sealed partial class ThumbnailGridView
     private const long MinimumGpuCacheBytes = 64L * 1024 * 1024;
     private const long MaximumGpuCacheBytes = 512L * 1024 * 1024;
     private const long GpuCacheHeadroomBytes = 64L * 1024 * 1024;
-    private const double IdleUploadBudgetMilliseconds = 6.0;
-    private const double InteractiveUploadBudgetMilliseconds = 4.0;
+    private double _idleUploadBudgetMilliseconds = 6.0;
+    private double _interactiveUploadBudgetMilliseconds = 4.0;
     private const long MinimumIdleUploadBytes = 8L * 1024 * 1024;
     private const long MinimumInteractiveUploadBytes = 8L * 1024 * 1024;
-    private const long MaximumUploadBytesPerFrame = 64L * 1024 * 1024;
-    private const int MaximumTextureUploadsPerFrame = 128;
+    private long _maximumUploadBytesPerFrame = 64L * 1024 * 1024;
+    private int _maximumTextureUploadsPerFrame = 128;
 
-    private struct TextureUploadBudget(long timeLimitTicks, long byteLimit)
+    private struct TextureUploadBudget(long timeLimitTicks, long byteLimit, int uploadLimit)
     {
         public long TimeLimitTicks { get; } = timeLimitTicks;
         public long RemainingBytes { get; private set; } = byteLimit;
@@ -48,7 +48,7 @@ internal sealed partial class ThumbnailGridView
         public int UploadCount { get; private set; }
 
         public readonly bool CanUpload(long bytes) => UploadCount == 0 ||
-            UploadCount < MaximumTextureUploadsPerFrame &&
+            UploadCount < uploadLimit &&
             UsedTicks < TimeLimitTicks && RemainingBytes >= bytes;
 
         public void Record(long bytes, long elapsedTicks)
@@ -149,6 +149,16 @@ internal sealed partial class ThumbnailGridView
         if (!changed) return;
         DisposeThumbnailColorResources();
         Invalidate();
+    }
+
+    public void ConfigureGpuUploadBudgets(
+        double idleMilliseconds, double scrollingMilliseconds,
+        int maximumMegabytes, int maximumTextures)
+    {
+        _idleUploadBudgetMilliseconds = Math.Clamp(idleMilliseconds, 0.5, 50.0);
+        _interactiveUploadBudgetMilliseconds = Math.Clamp(scrollingMilliseconds, 0.5, 50.0);
+        _maximumUploadBytesPerFrame = Math.Clamp(maximumMegabytes, 1, 4096) * 1024L * 1024;
+        _maximumTextureUploadsPerFrame = Math.Clamp(maximumTextures, 1, 1024);
     }
 
     private IDWriteTextFormat CreateTextFormat(
@@ -687,8 +697,8 @@ internal sealed partial class ThumbnailGridView
     private TextureUploadBudget CreateTextureUploadBudget(bool interactive)
     {
         var milliseconds = interactive
-            ? InteractiveUploadBudgetMilliseconds
-            : IdleUploadBudgetMilliseconds;
+            ? _interactiveUploadBudgetMilliseconds
+            : _idleUploadBudgetMilliseconds;
         var timeTicks = Math.Max(1L,
             (long)Math.Ceiling(Stopwatch.Frequency * milliseconds / 1000.0));
         var minimumBytes = interactive
@@ -697,8 +707,9 @@ internal sealed partial class ThumbnailGridView
         var predictedBytes = (long)Math.Ceiling(
             Volatile.Read(ref _measuredUploadBytesPerSecond) * milliseconds / 1000.0);
         var byteLimit = Math.Clamp(predictedBytes, minimumBytes,
-            MaximumUploadBytesPerFrame);
-        return new TextureUploadBudget(timeTicks, byteLimit);
+            _maximumUploadBytesPerFrame);
+        return new TextureUploadBudget(timeTicks, byteLimit,
+            _maximumTextureUploadsPerFrame);
     }
 
     private void UpdateMeasuredUploadThroughput(long bytes, long elapsedTicks)

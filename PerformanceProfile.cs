@@ -6,6 +6,7 @@ internal sealed record PerformanceProfile(
     int PreviewCacheMB,
     int ThumbnailCacheMB,
     int ThumbnailFastPreviewCacheMB,
+    int GlobalFastPreviewConcurrency,
     int FastPreviewWorkerCount,
     int FastPreviewThreadsPerWorker,
     int PrecacheWorkerCount,
@@ -18,6 +19,7 @@ internal sealed record PerformanceProfile(
         settings.PreviewCacheMB,
         settings.ThumbnailCacheMB,
         settings.ThumbnailFastPreviewCacheMB,
+        settings.GlobalFastPreviewConcurrency,
         settings.FastPreviewWorkerCount,
         settings.FastPreviewThreadsPerWorker,
         settings.PrecacheWorkerCount,
@@ -25,6 +27,7 @@ internal sealed record PerformanceProfile(
         settings.ZoomImageMagickThreadsPerImage);
 
     public static PerformanceProfile Resolve(UserSettings settings) =>
+        settings.UseBenchmarkProfile ? FromSettings(settings) :
         settings.AutoOptimizePerformance ? Detect() : FromSettings(settings);
 
     public static PerformanceProfile Detect()
@@ -52,6 +55,7 @@ internal sealed record PerformanceProfile(
         if (availableMB < 8192) fastWorkers = Math.Min(fastWorkers, 3);
         var fastThreads = Math.Clamp(
             (logicalCpu + fastWorkers - 1) / fastWorkers, 1, 16);
+        var globalFastConcurrency = Math.Clamp(fastWorkers * fastThreads, 1, logicalCpu);
         var magickThreads = Math.Clamp(
             (logicalCpu + precacheWorkers - 1) / precacheWorkers, 2, 16);
         // Zoom normally has one latency-sensitive viewport job. Leave one
@@ -62,7 +66,8 @@ internal sealed record PerformanceProfile(
         return new PerformanceProfile(
             checked((int)aheadMB), checked((int)behindMB),
             checked((int)previewMB), checked((int)thumbnailMB),
-            checked((int)thumbnailFastMB), fastWorkers, fastThreads,
+            checked((int)thumbnailFastMB), globalFastConcurrency,
+            fastWorkers, fastThreads,
             precacheWorkers, magickThreads, zoomMagickThreads);
     }
 
