@@ -68,6 +68,43 @@ internal static class GpuInteropDevice
         }
         catch { return null; }
     }
+
+    public static unsafe GpuRenderedImage? CreateImageFromBgra(
+        byte[] pixels, int width, int height)
+    {
+        if (Device is not { } device || width <= 0 || height <= 0) return null;
+        var rowPitch = checked(width * 4);
+        if (pixels.Length < checked(rowPitch * height)) return null;
+        ID3D11Texture2D? texture = null;
+        try
+        {
+            fixed (byte* pointer = pixels)
+            {
+                var initial = new SubresourceData(
+                    pointer, (uint)rowPitch, (uint)(rowPitch * height));
+                var description = new Texture2DDescription
+                {
+                    Width = (uint)width,
+                    Height = (uint)height,
+                    MipLevels = 1,
+                    ArraySize = 1,
+                    Format = Format.B8G8R8A8_UNorm,
+                    SampleDescription = new SampleDescription(1, 0),
+                    Usage = ResourceUsage.Default,
+                    BindFlags = BindFlags.ShaderResource,
+                    CPUAccessFlags = CpuAccessFlags.None,
+                    MiscFlags = ResourceOptionFlags.None
+                };
+                texture = device.CreateTexture2D(description, initial);
+                var result = new GpuRenderedImage(
+                    texture, IntPtr.Zero, width, height, _ => { });
+                texture = null;
+                return result;
+            }
+        }
+        catch { return null; }
+        finally { texture?.Dispose(); }
+    }
 }
 
 internal sealed class GpuRenderedImage : IDisposable

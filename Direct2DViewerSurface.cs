@@ -59,6 +59,12 @@ internal sealed class Direct2DViewerSurface : Control
     private ID2D1Bitmap? _leftBitmap;
     private ID2D1Bitmap? _rightBitmap;
     private ID2D1Bitmap? _zoomBaseBitmap;
+    private ID2D1Bitmap? _leftAnimatedGpuBitmap;
+    private ID2D1Bitmap? _rightAnimatedGpuBitmap;
+    private GpuRenderedImage? _leftAnimatedGpuSource;
+    private GpuRenderedImage? _rightAnimatedGpuSource;
+    private int _leftAnimationRotation;
+    private int _rightAnimationRotation;
     private readonly List<ZoomDetailLayer> _zoomDetailLayers = [];
     private readonly Dictionary<string, ID2D1ColorContext> _colorContexts = [];
     private readonly Dictionary<ID2D1Bitmap, ID2D1Effect> _colorEffects =
@@ -106,6 +112,7 @@ internal sealed class Direct2DViewerSurface : Control
 
     public void Present(Bitmap? left, Bitmap? right, Rectangle leftBounds, Rectangle rightBounds)
     {
+        ReleaseAnimatedGpuPages();
         EnsureRenderTarget();
         _leftBitmap = GetOrCreateBitmap(left);
         _rightBitmap = GetOrCreateBitmap(right);
@@ -146,6 +153,7 @@ internal sealed class Direct2DViewerSurface : Control
         GpuRenderedImage? left, GpuRenderedImage? right,
         Rectangle leftBounds, Rectangle rightBounds)
     {
+        ReleaseAnimatedGpuPages();
         EnsureRenderTarget();
         _leftBitmap = GetOrCreateGpuBitmap(left);
         _rightBitmap = GetOrCreateGpuBitmap(right);
@@ -174,6 +182,58 @@ internal sealed class Direct2DViewerSurface : Control
         else _leftBitmap = bitmap;
         DrawFrame();
     }
+
+    public void PresentAnimatedPageGpu(
+        bool rightPage, GpuRenderedImage frame, int rotation)
+    {
+        EnsureRenderTarget();
+        if (_deviceContext is null)
+        {
+            frame.Dispose();
+            return;
+        }
+        ID2D1Bitmap? bitmap = null;
+        try
+        {
+            using var surface = frame.Texture.QueryInterface<IDXGISurface>();
+            bitmap = _deviceContext.CreateBitmapFromDxgiSurface(surface,
+                new BitmapProperties1(new Vortice.DCommon.PixelFormat(
+                    Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Ignore),
+                    96f, 96f, BitmapOptions.None));
+            ID2D1Bitmap? oldBitmap;
+            GpuRenderedImage? oldSource;
+            if (rightPage)
+            {
+                oldBitmap = _rightAnimatedGpuBitmap;
+                oldSource = _rightAnimatedGpuSource;
+                _rightAnimatedGpuBitmap = bitmap;
+                _rightAnimatedGpuSource = frame;
+                _rightAnimationRotation = rotation;
+                _rightBitmap = bitmap;
+            }
+            else
+            {
+                oldBitmap = _leftAnimatedGpuBitmap;
+                oldSource = _leftAnimatedGpuSource;
+                _leftAnimatedGpuBitmap = bitmap;
+                _leftAnimatedGpuSource = frame;
+                _leftAnimationRotation = rotation;
+                _leftBitmap = bitmap;
+            }
+            bitmap = null;
+            DrawFrame();
+            DisposeTransientColorEffect(oldBitmap);
+            oldBitmap?.Dispose();
+            oldSource?.Dispose();
+        }
+        catch
+        {
+            bitmap?.Dispose();
+            frame.Dispose();
+        }
+    }
+
+    public void StopAnimatedGpuPages() => ReleaseAnimatedGpuPages();
 
     public void BeginZoom(bool useRightPage, Rectangle baseBounds)
     {
@@ -247,6 +307,7 @@ internal sealed class Direct2DViewerSurface : Control
 
     public void ClearFrame()
     {
+        ReleaseAnimatedGpuPages();
         _leftBitmap = null;
         _rightBitmap = null;
         _zoomBaseBitmap = null;
@@ -534,8 +595,12 @@ internal sealed class Direct2DViewerSurface : Control
             }
             else
             {
-                DrawBitmap(_leftBitmap, _leftBounds, _leftColorProfile);
-                DrawBitmap(_rightBitmap, _rightBounds, _rightColorProfile);
+                DrawBitmap(_leftBitmap, _leftBounds, _leftColorProfile,
+                    ReferenceEquals(_leftBitmap, _leftAnimatedGpuBitmap)
+                        ? _leftAnimationRotation : 0);
+                DrawBitmap(_rightBitmap, _rightBounds, _rightColorProfile,
+                    ReferenceEquals(_rightBitmap, _rightAnimatedGpuBitmap)
+                        ? _rightAnimationRotation : 0);
             }
             var result = target.EndDraw();
             if (result.Failure) DiscardDeviceResources();
@@ -549,25 +614,64 @@ internal sealed class Direct2DViewerSurface : Control
         }
     }
 
-    private void DrawBitmap(ID2D1Bitmap? bitmap, Rectangle bounds, byte[]? sourceProfile)
+    private void DrawBitmap(ID2D1Bitmap? bitmap, Rectangle bounds,
+        byte[]? sourceProfile, int rotation = 0)
     {
         var target = (ID2D1RenderTarget?)_deviceContext ?? _renderTarget;
         if (bitmap is null || target is null || bounds.Width <= 0 || bounds.Height <= 0) return;
-        var destination = new RawRectF(bounds.Left, bounds.Top, bounds.Right, bounds.Bottom);
+        var rotated = rotation is 90 or 270;
+        var drawWidth = rotated ? bounds.Height : bounds.Width;
+        var drawHeight = rotated ? bounds.Width : bounds.Height;
+        var center = new Vector2(bounds.Left + bounds.Width / 2f,
+            bounds.Top + bounds.Height / 2f);
+        var drawLeft = center.X - drawWidth / 2f;
+        var drawTop = center.Y - drawHeight / 2f;
+        var destination = new RawRectF(drawLeft, drawTop,
+            drawLeft + drawWidth, drawTop + drawHeight);
+        var rotationTransform = rotation == 0
+            ? Matrix3x2.Identity
+            : Matrix3x2.CreateRotation(rotation * MathF.PI / 180f, center);
         if (_colorManagementEnabled && _monitorColorProfile is { Length: > 0 } &&
             _deviceContext is { } context && TryGetColorEffect(bitmap, sourceProfile) is { } effect)
         {
             var previous = context.Transform;
             context.Transform = Matrix3x2.CreateScale(
-                    bounds.Width / bitmap.Size.Width, bounds.Height / bitmap.Size.Height) *
-                Matrix3x2.CreateTranslation(bounds.Left, bounds.Top);
+                    drawWidth / bitmap.Size.Width, drawHeight / bitmap.Size.Height) *
+                Matrix3x2.CreateTranslation(drawLeft, drawTop) * rotationTransform;
             using var output = effect.Output;
             context.DrawImage(output, Vector2.Zero, null,
                 InterpolationMode.Linear, CompositeMode.SourceOver);
             context.Transform = previous;
             return;
         }
+        var oldTransform = target.Transform;
+        target.Transform = rotationTransform;
         target.DrawBitmap(bitmap, destination, 1f, BitmapInterpolationMode.Linear, null);
+        target.Transform = oldTransform;
+    }
+
+    private void ReleaseAnimatedGpuPages()
+    {
+        if (ReferenceEquals(_leftBitmap, _leftAnimatedGpuBitmap)) _leftBitmap = null;
+        if (ReferenceEquals(_rightBitmap, _rightAnimatedGpuBitmap)) _rightBitmap = null;
+        DisposeTransientColorEffect(_leftAnimatedGpuBitmap);
+        DisposeTransientColorEffect(_rightAnimatedGpuBitmap);
+        _leftAnimatedGpuBitmap?.Dispose();
+        _rightAnimatedGpuBitmap?.Dispose();
+        _leftAnimatedGpuSource?.Dispose();
+        _rightAnimatedGpuSource?.Dispose();
+        _leftAnimatedGpuBitmap = null;
+        _rightAnimatedGpuBitmap = null;
+        _leftAnimatedGpuSource = null;
+        _rightAnimatedGpuSource = null;
+        _leftAnimationRotation = 0;
+        _rightAnimationRotation = 0;
+    }
+
+    private void DisposeTransientColorEffect(ID2D1Bitmap? bitmap)
+    {
+        if (bitmap is not null && _colorEffects.Remove(bitmap, out var effect))
+            effect.Dispose();
     }
 
     private unsafe ID2D1Effect? TryGetColorEffect(ID2D1Bitmap bitmap, byte[]? sourceProfile)
@@ -659,6 +763,7 @@ internal sealed class Direct2DViewerSurface : Control
     private void DisposeBitmaps()
     {
         _gpuTrimTimer.Stop();
+        ReleaseAnimatedGpuPages();
         _leftBitmap = null;
         _rightBitmap = null;
         _zoomBaseBitmap = null;

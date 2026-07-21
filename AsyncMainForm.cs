@@ -114,6 +114,11 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         new(StringComparer.OrdinalIgnoreCase);
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, Task<byte[]?>>
         _embeddedColorProfiles = new(StringComparer.OrdinalIgnoreCase);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte>
+        _animationLoads = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<AnimationFrameSet, string> _activeAnimationKeys = [];
+    private string? _retainedAnimationKey;
+    private AnimationFrameSet? _retainedAnimation;
     private CancellationTokenSource? _monitorProfileCancellation;
     private string? _monitorProfileDevice;
 
@@ -305,6 +310,16 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             UpdateFileInfoLabel();
             ShowToast(percent > 0 ? $"Zoom {percent}%" : "Fit to screen", 750);
         };
+        _viewer.AnimationReleased += (releasedPageIndex, frames) =>
+        {
+            if (_activeAnimationKeys.Remove(frames, out var key) &&
+                !IsDisposed && !Disposing && _book is { } currentBook &&
+                key.StartsWith(Path.GetFullPath(currentBook.SourcePath) + "|",
+                    StringComparison.OrdinalIgnoreCase))
+                RetainAnimation(key, frames);
+            else
+                _ = Task.Run(frames.Dispose);
+        };
         _slideTimer.Tick += (_, _) => NextPage();
         DragEnter += OnDragEnter;
         DragDrop += OnDragDrop;
@@ -329,6 +344,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             CancelBookWork(retainPageCache: false);
             DisposeRetainedPageCaches();
             _viewer.ClearBookCache();
+            ClearRetainedAnimation();
             SaveSettings();
         };
         FormClosed += (_, _) =>
@@ -939,43 +955,126 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     {
         var visiblePageCount = secondIndex >= 0 ? 2 : 1;
         var clientSize = _viewer.ClientSize;
+        var animationToken = _bookCancellation?.Token ?? cancellationToken;
         if (AnimatedImageRenderer.MayAnimate(book.Pages[firstIndex]))
-            _ = LoadVisibleAnimationAsync(
-                book, firstIndex, visiblePageCount, clientSize, cancellationToken);
+            StartVisibleAnimation(
+                book, firstIndex, visiblePageCount, clientSize, animationToken);
         if (secondIndex >= 0 && AnimatedImageRenderer.MayAnimate(book.Pages[secondIndex]))
-            _ = LoadVisibleAnimationAsync(
-                book, secondIndex, visiblePageCount, clientSize, cancellationToken);
+            StartVisibleAnimation(
+                book, secondIndex, visiblePageCount, clientSize, animationToken);
+    }
+
+    private void StartVisibleAnimation(
+        Book book, int pageIndex, int visiblePageCount, Size clientSize,
+        CancellationToken cancellationToken)
+    {
+        var key = GetAnimationKey(book, pageIndex, visiblePageCount);
+        if (_retainedAnimationKey == key && _retainedAnimation is { } cached)
+        {
+            _retainedAnimation = null;
+            _retainedAnimationKey = null;
+            AttachAnimation(key, pageIndex, cached);
+            return;
+        }
+        if (!_animationLoads.TryAdd(key, 0)) return;
+        _ = LoadVisibleAnimationAsync(
+            book, pageIndex, visiblePageCount, clientSize,
+            key, cancellationToken);
     }
 
     private async Task LoadVisibleAnimationAsync(
         Book book, int pageIndex, int visiblePageCount, Size clientSize,
-        CancellationToken cancellationToken)
+        string animationKey, CancellationToken cancellationToken)
     {
-        AnimationFrameSet? frames = null;
         try
         {
             // Animation expansion is visible-page work, but it must not occupy
             // the fast-preview lane or delay the first still frame/full render.
-            frames = await RenderWorkScheduler.RunFullAsync(
-                () => AnimatedImageRenderer.Decode(
+            void Decode()
+            {
+                AnimatedImageRenderer.DecodeProgressively(
                     book.Pages[pageIndex], clientSize, visiblePageCount,
                     _rotations.GetValueOrDefault(pageIndex),
-                    _settings.LanczosQuality, cancellationToken),
-                cancellationToken);
-            cancellationToken.ThrowIfCancellationRequested();
-            if (frames is null || _book != book) return;
-            _viewer.SetAnimationFrames(pageIndex, frames);
-            frames = null;
+                    cancellationToken, frames =>
+                    {
+                        try
+                        {
+                            BeginInvoke(() =>
+                            {
+                                if (cancellationToken.IsCancellationRequested ||
+                                    _book != book)
+                                {
+                                    _ = Task.Run(frames.Dispose);
+                                    return;
+                                }
+                                if (_pageIndex == pageIndex ||
+                                    GetSecondPageIndex(ignoreAutoSingle: true) == pageIndex)
+                                    AttachAnimation(animationKey, pageIndex, frames);
+                                else
+                                    RetainAnimation(animationKey, frames);
+                            });
+                        }
+                        catch (InvalidOperationException)
+                        {
+                            _ = Task.Run(frames.Dispose);
+                        }
+                    });
+            }
+
+            if (Path.GetExtension(book.Pages[pageIndex].Name).Equals(
+                    ".webp", StringComparison.OrdinalIgnoreCase))
+            {
+                // A GPU animation is a long-lived producer/consumer stream.
+                // Give it a dedicated background thread instead of permanently
+                // occupying a full-preview/Lanczos scheduler slot.
+                await Task.Factory.StartNew(Decode, cancellationToken,
+                    TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            }
+            else
+            {
+                await RenderWorkScheduler.RunFullAsync(
+                    () =>
+                    {
+                        Decode();
+                        return true;
+                    }, cancellationToken);
+            }
         }
         catch (OperationCanceledException) { }
         catch (Exception exception)
         {
             System.Diagnostics.Debug.WriteLine($"Animated image load failed: {exception}");
         }
-        finally
-        {
-            if (frames is not null) _ = Task.Run(frames.Dispose);
-        }
+        finally { _animationLoads.TryRemove(animationKey, out _); }
+    }
+
+    private string GetAnimationKey(Book book, int pageIndex, int visiblePageCount) =>
+        string.Join("|", Path.GetFullPath(book.SourcePath), pageIndex,
+            visiblePageCount, _rotations.GetValueOrDefault(pageIndex));
+
+    private void AttachAnimation(string key, int pageIndex, AnimationFrameSet frames)
+    {
+        _activeAnimationKeys[frames] = key;
+        _viewer.SetAnimationFrames(
+            pageIndex, frames, _rotations.GetValueOrDefault(pageIndex));
+    }
+
+    private void RetainAnimation(string key, AnimationFrameSet frames)
+    {
+        if (ReferenceEquals(_retainedAnimation, frames)) return;
+        var previous = _retainedAnimation;
+        _retainedAnimation = frames;
+        _retainedAnimationKey = key;
+        if (previous is not null) _ = Task.Run(previous.Dispose);
+    }
+
+    private void ClearRetainedAnimation()
+    {
+        var retained = _retainedAnimation;
+        _retainedAnimation = null;
+        _retainedAnimationKey = null;
+        _activeAnimationKeys.Clear();
+        if (retained is not null) _ = Task.Run(retained.Dispose);
     }
 
     private async Task ShowImmediateDecodePreviewAsync(
@@ -1614,7 +1713,23 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private Bitmap DecodePage(Book book, int index)
     {
-        using var stream = book.Pages[index].Open();
+        var page = book.Pages[index];
+        if (Path.GetExtension(page.Name).Equals(".webp", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                // Static preview/cache work intentionally decodes only frame 1.
+                // Animation frames are requested lazily only by the visible-page path.
+                return AnimatedImageRenderer.DecodeWebPPoster(
+                    page, _bookCancellation?.Token ?? CancellationToken.None);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception exception)
+            {
+                System.Diagnostics.Debug.WriteLine($"libwebp poster decode failed: {exception}");
+            }
+        }
+        using var stream = page.Open();
         try { using var source = Image.FromStream(stream); return new Bitmap(source); }
         catch (ArgumentException)
         {
@@ -2826,6 +2941,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private void CancelBookWork(bool retainPageCache = true)
     {
+        ClearRetainedAnimation();
         _viewerRendering = false;
         Interlocked.Increment(ref _fileInfoVersion);
         _currentFileName = "No file open";

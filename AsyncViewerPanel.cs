@@ -46,6 +46,7 @@ internal sealed class AsyncViewerPanel : Panel
         public bool RightPage { get; set; } = rightPage;
         public int FrameIndex { get; set; }
         public long NextFrameAt { get; set; }
+        public int Rotation { get; set; }
     }
 
     private readonly PictureBox _left = CreatePictureBox();
@@ -128,6 +129,7 @@ internal sealed class AsyncViewerPanel : Panel
     public event EventHandler? ViewportRenderContextChanged;
     public event EventHandler<bool>? ZoomModeChanged;
     public event EventHandler<int>? ZoomPercentChanged;
+    public event Action<int, AnimationFrameSet>? AnimationReleased;
 
     public Func<int, CancellationToken, Task<Size>>? ZoomSourceSizeRequested { get; set; }
     public Func<int, Rectangle, Size, bool, CancellationToken, Task<ZoomPatchSurface>>?
@@ -610,9 +612,10 @@ internal sealed class AsyncViewerPanel : Panel
         BeginRender();
     }
 
-    public void SetAnimationFrames(int pageIndex, AnimationFrameSet frames)
+    public void SetAnimationFrames(
+        int pageIndex, AnimationFrameSet frames, int rotation = 0)
     {
-        if (frames.Frames.Length <= 1 || frames.Delays.Length != frames.Frames.Length ||
+        if ((!frames.IsGpuStream && frames.Count <= 1) || frames.Count == 0 ||
             (pageIndex != _firstIndex && pageIndex != _secondIndex))
         {
             DisposeAnimationFramesInBackground(frames);
@@ -623,10 +626,22 @@ internal sealed class AsyncViewerPanel : Panel
         var leftPageIndex = JapaneseMode ? _secondIndex : _firstIndex;
         var animation = new ActiveAnimation(frames, pageIndex != leftPageIndex)
         {
-            NextFrameAt = Environment.TickCount64 + frames.Delays[0]
+            Rotation = ((rotation % 360) + 360) % 360,
+            NextFrameAt = Environment.TickCount64 +
+                (frames.IsGpuStream
+                    ? 16
+                    : frames.TryGetFrame(0, out _, out var firstDelay) ? firstDelay : 100)
         };
         _activeAnimations[pageIndex] = animation;
-        _direct2DSurface.PresentAnimatedPage(animation.RightPage, frames.Frames[0]);
+        if (frames.IsGpuStream && frames.TryTakeGpu(out var gpuFrame, out var gpuDelay) &&
+            gpuFrame is not null)
+        {
+            animation.NextFrameAt = Environment.TickCount64 + gpuDelay;
+            _direct2DSurface.PresentAnimatedPageGpu(
+                animation.RightPage, gpuFrame, animation.Rotation);
+        }
+        else if (frames.TryGetFrame(0, out var firstFrame, out _) && firstFrame is not null)
+            _direct2DSurface.PresentAnimatedPage(animation.RightPage, firstFrame);
         ScheduleAnimationTimer();
     }
 
@@ -638,10 +653,19 @@ internal sealed class AsyncViewerPanel : Panel
             return;
         }
         _animationTimer.Stop();
+        _direct2DSurface.StopAnimatedGpuPages();
         var animations = _activeAnimations.Values.ToArray();
         _activeAnimations.Clear();
-        foreach (var animation in animations)
-            DisposeAnimationFramesInBackground(animation.Frames);
+        foreach (var pair in animations)
+        {
+            var pageIndex = pair.RightPage
+                ? (JapaneseMode ? _firstIndex : _secondIndex)
+                : (JapaneseMode ? _secondIndex : _firstIndex);
+            if (AnimationReleased is { } released && pageIndex >= 0)
+                released(pageIndex, pair.Frames);
+            else
+                DisposeAnimationFramesInBackground(pair.Frames);
+        }
     }
 
     public void PresentImmediatePreview(
@@ -1624,16 +1648,34 @@ internal sealed class AsyncViewerPanel : Panel
         foreach (var animation in _activeAnimations.Values)
         {
             if (now < animation.NextFrameAt) continue;
-            var guard = animation.Frames.Frames.Length;
+            if (animation.Frames.IsGpuStream)
+            {
+                if (animation.Frames.TryTakeGpu(out var gpuFrame, out var gpuDelay) &&
+                    gpuFrame is not null)
+                {
+                    animation.NextFrameAt = now + gpuDelay;
+                    _direct2DSurface.PresentAnimatedPageGpu(
+                        animation.RightPage, gpuFrame, animation.Rotation);
+                }
+                else animation.NextFrameAt = now + 8;
+                continue;
+            }
+            var publishedCount = animation.Frames.Count;
+            if (publishedCount <= 1) continue;
+            var guard = publishedCount;
             do
             {
                 animation.FrameIndex =
-                    (animation.FrameIndex + 1) % animation.Frames.Frames.Length;
-                animation.NextFrameAt += animation.Frames.Delays[animation.FrameIndex];
+                    (animation.FrameIndex + 1) % publishedCount;
+                if (animation.Frames.TryGetFrame(
+                        animation.FrameIndex, out _, out var frameDelay))
+                    animation.NextFrameAt += frameDelay;
+                else break;
             }
             while (now >= animation.NextFrameAt && --guard > 0);
-            _direct2DSurface.PresentAnimatedPage(
-                animation.RightPage, animation.Frames.Frames[animation.FrameIndex]);
+            if (animation.Frames.TryGetFrame(
+                    animation.FrameIndex, out var frame, out _) && frame is not null)
+                _direct2DSurface.PresentAnimatedPage(animation.RightPage, frame);
         }
         ScheduleAnimationTimer();
     }
@@ -1652,8 +1694,9 @@ internal sealed class AsyncViewerPanel : Panel
     {
         if (_zoomMode) return;
         foreach (var animation in _activeAnimations.Values)
-            _direct2DSurface.PresentAnimatedPage(
-                animation.RightPage, animation.Frames.Frames[animation.FrameIndex]);
+            if (animation.Frames.TryGetFrame(
+                    animation.FrameIndex, out var frame, out _) && frame is not null)
+                _direct2DSurface.PresentAnimatedPage(animation.RightPage, frame);
     }
 
     private static void DisposeAnimationFramesInBackground(AnimationFrameSet frames) =>

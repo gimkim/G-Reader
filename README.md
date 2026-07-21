@@ -141,7 +141,7 @@ G Reader separates interactive display work from decoding, preview generation, L
 - While scrolling continuously, a coalescing viewport queue samples the visible range about every 180 ms and requests only missing fast previews in and just around the viewport. It never cancels the main thumbnail batch and retains only the newest pending viewport, avoiding event floods and long queues.
 - High-frequency wheel input is combined to match display update cadence. Focused precision-touchpad input preserves sub-notch deltas, while asynchronous Raw Input keeps hover scrolling available when the app is unfocused.
 
-Animated files are inspected and decoded only when the matching page is visible. Static images continue through the normal fast cache path without animation overhead.
+Animated files are inspected and decoded only when the matching page is visible. Animated WebP uses libwebp as a lazy multi-threaded frame stream: the first frame starts immediately, decoded BGRA is uploaded directly into a D3D11 texture, and Direct2D performs linear GPU scaling during composition. A one-frame producer queue plus the displayed texture forms a bounded double buffer, so animation does not create `Bitmap` objects, run per-frame CPU Lanczos, or retain every full-resolution frame in VRAM. Thumbnail and still-preview work decodes only frame one. Static images continue through the normal cache path without animation overhead.
 
 ## Cache and performance settings
 
