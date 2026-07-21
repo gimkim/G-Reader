@@ -123,7 +123,7 @@ internal sealed partial class ThumbnailGridView
             Vortice.Direct2D1.FactoryType.SingleThreaded, DebugLevel.None);
         _thumbnailWriteFactory = Vortice.DirectWrite.DWrite.DWriteCreateFactory<IDWriteFactory>(
             Vortice.DirectWrite.FactoryType.Shared);
-        _thumbnailNameFormat = CreateTextFormat(11.5f, FontWeight.Normal, noWrap: false);
+        _thumbnailNameFormat = CreateTextFormat(14f, FontWeight.Normal, noWrap: false);
         _thumbnailNumberFormat = CreateTextFormat(11f, FontWeight.Bold, noWrap: true);
         _thumbnailIconFormat = CreateTextFormat(13f, FontWeight.Bold, noWrap: true);
         _thumbnailPlaceholderFormat = CreateTextFormat(12f, FontWeight.Normal, noWrap: false);

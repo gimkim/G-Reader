@@ -356,7 +356,7 @@ internal static class PersistentPreviewCache
         var heightBucket = RoundUp(Math.Max(32, bounds.Height), 32);
         // Fast and Lanczos contact sheets are independent so a quick placeholder
         // can never mask a completed full-quality disk entry.
-        var identity = string.Join('\n', "greader-browse-preview-v7-two-stage",
+        var identity = string.Join('\n', "greader-browse-preview-v8-shallow-folder-cover",
             fastPreview ? "fast" : "full", sourcePath,
             length, modifiedTicks, widthBucket, heightBucket,
             fastPreview ? 0 : quality, GetPdfEngineIdentity(sourcePath));

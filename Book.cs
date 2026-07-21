@@ -90,32 +90,41 @@ internal sealed class Book
         if (Directory.Exists(path))
         {
             var pages = new List<PageEntry>(maximumPages);
-            var pending = new Queue<string>();
-            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            pending.Enqueue(path);
-            while (pending.Count > 0 && pages.Count < maximumPages && visited.Count < 32)
+
+            void AddImagesFrom(string folder)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                var folder = pending.Dequeue();
-                if (!visited.Add(folder)) continue;
                 try
                 {
                     foreach (var file in Directory.EnumerateFiles(folder)
                                  .Where(IsSupportedImage)
                                  .OrderBy(file => file, NumericFirstComparer.Instance))
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         var captured = file;
                         pages.Add(new PageEntry(Path.GetFileName(captured),
                             () => File.OpenRead(captured)));
                         if (pages.Count == maximumPages) break;
                     }
-                    if (pages.Count < maximumPages)
-                        foreach (var child in Directory.EnumerateDirectories(folder)
-                                     .OrderBy(child => child, NumericFirstComparer.Instance))
-                            pending.Enqueue(child);
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
             }
+
+            // A folder's own images are its cover. Only when it has none do we
+            // inspect direct children, and never descend into grandchildren.
+            AddImagesFrom(path);
+            if (pages.Count > 0) return pages;
+
+            try
+            {
+                foreach (var child in Directory.EnumerateDirectories(path)
+                             .OrderBy(child => child, NumericFirstComparer.Instance))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    AddImagesFrom(child);
+                    if (pages.Count == maximumPages) break;
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
             return pages;
         }
         if (IsSupportedArchive(path))

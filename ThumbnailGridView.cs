@@ -320,7 +320,9 @@ internal sealed partial class ThumbnailGridView : Panel
                 firstVisible, lastVisible);
             AddByDistance(anchor, 0, ItemCount - 1, firstVisible, lastVisible);
         }
-        return result.Select(item => item < _folders.Length
+        return result.Where(item => item >= _folders.Length ||
+                !_folders[item].IsParent)
+            .Select(item => item < _folders.Length
                 ? new ThumbnailPreviewWorkItem(true, item)
                 : new ThumbnailPreviewWorkItem(false, item - _folders.Length))
             .ToArray();
@@ -349,7 +351,9 @@ internal sealed partial class ThumbnailGridView : Panel
             if (after <= last)
                 result.Add(ToPreviewWorkItem(after));
         }
-        return result.ToArray();
+        return result.Where(work => !work.IsBrowse ||
+                !_folders[work.Index].IsParent)
+            .ToArray();
     }
 
     private ThumbnailPreviewWorkItem ToPreviewWorkItem(int item) =>
