@@ -8,6 +8,7 @@ namespace CDisplayEx.CSharp;
 internal static class EncodedJpegRenderer
 {
     internal readonly record struct Result(Bitmap Bitmap, bool Landscape);
+    internal readonly record struct GpuResult(GpuRenderedImage Image, bool Landscape);
 
     public static bool Supports(PageEntry page)
     {
@@ -93,6 +94,30 @@ internal static class EncodedJpegRenderer
             quality, fastPreview, cancellationToken);
     }
 
+    public static GpuResult? RenderReaderGpu(
+        PageEntry page, Size clientSize, int visiblePageCount, int rotation,
+        bool fastPreview, CancellationToken cancellationToken)
+    {
+        const int gap = 10;
+        var availableWidth = Math.Max(100, clientSize.Width - gap * 3);
+        var availableHeight = Math.Max(100, clientSize.Height - gap * 2);
+        var targetWidth = visiblePageCount == 2 ? availableWidth / 2 : availableWidth;
+        return NvJpegNativeDecoder.TryDecodeToGpu(
+            page, new Size(targetWidth, availableHeight), rotation, fastPreview,
+            cancellationToken, out var image, out var landscape) && image is not null
+            ? new GpuResult(image, landscape)
+            : null;
+    }
+
+    public static GpuResult? RenderThumbnailGpu(
+        PageEntry page, Size bounds, int rotation, bool fastPreview, int jpegQuality,
+        CancellationToken cancellationToken) =>
+        NvJpegNativeDecoder.TryDecodeThumbnailToGpu(
+            page, new Size(Math.Max(32, bounds.Width), Math.Max(32, bounds.Height)),
+            rotation, fastPreview, jpegQuality, cancellationToken,
+            out var image, out var landscape) &&
+        image is not null ? new GpuResult(image, landscape) : null;
+
     public static Result RenderThumbnail(
         PageEntry page, Size bounds, int rotation, int quality,
         bool fastPreview, CancellationToken cancellationToken) =>
@@ -105,6 +130,22 @@ internal static class EncodedJpegRenderer
         cancellationToken.ThrowIfCancellationRequested();
         var width = Math.Max(32, bounds.Width);
         var height = Math.Max(32, bounds.Height);
+        if (NvJpegNativeDecoder.TryDecode(
+                page, new Size(width, height), rotation,
+                fastPreview ? 1 : 2, fastPreview, cancellationToken,
+                out var nvJpegDecoded, out var nvJpegLandscape) &&
+            nvJpegDecoded is not null)
+        {
+            using (nvJpegDecoded)
+            {
+                var output = fastPreview
+                    ? AsyncViewerPanel.CreateFastThumbnail(
+                        nvJpegDecoded, new Size(width, height), 1, cancellationToken)
+                    : AsyncViewerPanel.CreateLanczosThumbnail(
+                        nvJpegDecoded, new Size(width, height), quality, cancellationToken);
+                return new Result(output, nvJpegLandscape);
+            }
+        }
         if (TurboJpegNativeDecoder.TryDecode(
                 page, new Size(width, height), rotation,
                 fastPreview ? 1 : 2, fastPreview, cancellationToken,

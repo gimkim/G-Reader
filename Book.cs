@@ -218,17 +218,19 @@ internal sealed class Book
         var file = StorageFile.GetFileFromPathAsync(pdfPath).AsTask().GetAwaiter().GetResult();
         var document = PdfDocument.LoadFromFileAsync(file).AsTask().GetAwaiter().GetResult();
         var pages = Enumerable.Range(0, checked((int)document.PageCount))
-            .Select(index => new PageEntry($"Page {index + 1}", () => RenderPdfPage(pdfPath, index)))
+            // Keep the parsed document shared by every page entry. Previously
+            // each decode reopened and reparsed the complete PDF, multiplying
+            // startup cost across pre-cache workers.
+            .Select(index => new PageEntry(
+                $"Page {index + 1}", () => RenderPdfPage(document, index)))
             .ToArray();
         if (pages.Length == 0) throw new InvalidDataException("The PDF contains no pages.");
         return new Book(pdfPath, pages,
             parentFolder: Path.GetDirectoryName(pdfPath));
     }
 
-    private static Stream RenderPdfPage(string pdfPath, int index)
+    private static Stream RenderPdfPage(PdfDocument document, int index)
     {
-        var file = StorageFile.GetFileFromPathAsync(pdfPath).AsTask().GetAwaiter().GetResult();
-        var document = PdfDocument.LoadFromFileAsync(file).AsTask().GetAwaiter().GetResult();
         using var page = document.GetPage((uint)index);
         using var random = new InMemoryRandomAccessStream();
         var options = new PdfPageRenderOptions

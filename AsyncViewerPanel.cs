@@ -3,6 +3,13 @@ using System.Drawing.Imaging;
 
 namespace CDisplayEx.CSharp;
 
+internal sealed class ZoomPatchSurface(Bitmap? bitmap, GpuRenderedImage? gpu) : IDisposable
+{
+    public Bitmap? Bitmap { get; private set; } = bitmap;
+    public GpuRenderedImage? Gpu { get; private set; } = gpu;
+    public void Dispose() { Bitmap?.Dispose(); Gpu?.Dispose(); Bitmap = null; Gpu = null; }
+}
+
 internal sealed class AsyncViewerPanel : Panel
 {
     internal readonly record struct PreRenderContext(
@@ -19,9 +26,17 @@ internal sealed class AsyncViewerPanel : Panel
         public int ActiveReaders { get; set; }
         public bool Retired { get; set; }
     }
-    private sealed class ZoomDetailPatch(Bitmap bitmap, Rectangle bounds)
+    private sealed class GpuRenderCacheItem(GpuRenderedImage image, long sequence)
     {
-        public Bitmap Bitmap { get; } = bitmap;
+        public GpuRenderedImage Image { get; } = image;
+        public long Sequence { get; set; } = sequence;
+        public long Bytes { get; } = image.Bytes;
+        public int ActiveReaders { get; set; }
+        public bool Retired { get; set; }
+    }
+    private sealed class ZoomDetailPatch(ZoomPatchSurface surface, Rectangle bounds)
+    {
+        public ZoomPatchSurface Surface { get; } = surface;
         public Rectangle Bounds { get; set; } = bounds;
     }
     private readonly record struct ZoomCropRequest(Rectangle Source, Rectangle Destination);
@@ -51,12 +66,16 @@ internal sealed class AsyncViewerPanel : Panel
     private readonly object _sourceLeaseGate = new();
     private readonly Dictionary<RenderKey, RenderCacheItem> _renderCache = [];
     private readonly Dictionary<RenderLookupKey, RenderKey> _renderLookup = [];
+    private readonly Dictionary<RenderKey, GpuRenderCacheItem> _gpuRenderCache = [];
+    private readonly Dictionary<RenderLookupKey, RenderKey> _gpuRenderLookup = [];
     private readonly Dictionary<RenderKey, RenderCacheItem> _previewCache = [];
     private readonly Dictionary<RenderLookupKey, RenderKey> _previewLookup = [];
+    private readonly Dictionary<RenderKey, GpuRenderCacheItem> _gpuPreviewCache = [];
+    private readonly Dictionary<RenderLookupKey, RenderKey> _gpuPreviewLookup = [];
     private readonly System.Collections.Concurrent.ConcurrentDictionary<int, long> _renderBytesByPage = [];
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<(long Context, int Page), long>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(long Context, int Page, string PageKey), long>
         _renderBytesByContextPage = [];
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<(long Context, int Page), int> _cachedPageCounts = [];
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(long Context, int Page, string PageKey), int> _cachedPageCounts = [];
     private readonly Dictionary<Image, int> _sourceReaders = [];
     private readonly HashSet<Image> _retiredSources = [];
     private Image? _first;
@@ -75,6 +94,7 @@ internal sealed class AsyncViewerPanel : Panel
     private long _previewCacheLimitBytes;
     private long _renderContextVersion = 1;
     private long _displayedContextVersion;
+    private string _activeBookPrefix = string.Empty;
     private bool _displayedPreview;
     private Size _lastRenderControlSize;
     private float _zoom = 1f;
@@ -110,7 +130,7 @@ internal sealed class AsyncViewerPanel : Panel
     public event EventHandler<int>? ZoomPercentChanged;
 
     public Func<int, CancellationToken, Task<Size>>? ZoomSourceSizeRequested { get; set; }
-    public Func<int, Rectangle, Size, bool, CancellationToken, Task<Bitmap>>?
+    public Func<int, Rectangle, Size, bool, CancellationToken, Task<ZoomPatchSurface>>?
         ZoomCropRequested { get; set; }
 
     public bool FitToScreen { get; set; } = true;
@@ -123,6 +143,9 @@ internal sealed class AsyncViewerPanel : Panel
 
     public Image? CurrentImage => _first;
     public long RenderCacheBytes => Volatile.Read(ref _renderCacheBytes);
+    public long ActiveRenderCacheBytes => _renderBytesByContextPage
+        .Where(pair => IsActivePageKey(pair.Key.PageKey))
+        .Sum(pair => pair.Value);
     public long PreviewCacheBytes => Volatile.Read(ref _previewCacheBytes);
     public bool IsShowingPreview => _displayedPreview;
     public bool IsZoomMode => _zoomMode;
@@ -160,29 +183,51 @@ internal sealed class AsyncViewerPanel : Panel
         var context = Volatile.Read(ref _renderContextVersion);
         return _renderBytesByContextPage
             .Where(pair => pair.Key.Context == context &&
+                IsActivePageKey(pair.Key.PageKey) &&
                 (ahead ? pair.Key.Page >= center : pair.Key.Page < center))
             .Sum(pair => pair.Value);
     }
 
+    public void ConfigureColorManagement(bool enabled, byte[]? monitorProfile) =>
+        _direct2DSurface.ConfigureColorManagement(enabled, monitorProfile);
+
+    public void SetPageColorProfiles(byte[]? left, byte[]? right) =>
+        _direct2DSurface.SetPageColorProfiles(left, right);
+
+    public void ActivateBookCache(string sourcePath)
+    {
+        _activeBookPrefix = Path.GetFullPath(sourcePath) + "|";
+    }
+
     public void TrimRenderCacheDirectional(int center, long aheadBytes, long behindBytes)
     {
+        TrimRetainedRenderCache(Math.Max(0, aheadBytes) + Math.Max(0, behindBytes));
         TrimRenderSide(center, true, aheadBytes);
         TrimRenderSide(center, false, behindBytes);
     }
 
     public void TrimPreviewCache(int center, long maximumBytes)
     {
+        TrimRetainedPreviewCache(maximumBytes);
         if (PreviewCacheBytes <= maximumBytes) return;
         KeyValuePair<RenderKey, RenderCacheItem>[] candidates;
+        KeyValuePair<RenderKey, GpuRenderCacheItem>[] gpuCandidates;
         lock (_previewCacheGate)
+        {
             candidates = _previewCache.ToArray();
+            gpuCandidates = _gpuPreviewCache.ToArray();
+        }
 
         // Preview eviction has its own lock and quota. Keep the pages nearest to
         // the current position without touching the high-quality render cache.
         Array.Sort(candidates, (left, right) =>
             Math.Abs(right.Key.PageIndex - center).CompareTo(
                 Math.Abs(left.Key.PageIndex - center)));
+        Array.Sort(gpuCandidates, (left, right) =>
+            Math.Abs(right.Key.PageIndex - center).CompareTo(
+                Math.Abs(left.Key.PageIndex - center)));
         List<Bitmap> evicted = [];
+        List<GpuRenderedImage> gpuEvicted = [];
         const int batchSize = 24;
         for (var offset = 0; offset < candidates.Length &&
             PreviewCacheBytes > maximumBytes; offset += batchSize)
@@ -203,7 +248,27 @@ internal sealed class AsyncViewerPanel : Panel
             }
             Thread.Yield();
         }
+        for (var offset = 0; offset < gpuCandidates.Length &&
+            PreviewCacheBytes > maximumBytes; offset += batchSize)
+        {
+            lock (_previewCacheGate)
+            {
+                foreach (var candidate in gpuCandidates.Skip(offset).Take(batchSize))
+                {
+                    if (_previewCacheBytes <= maximumBytes) break;
+                    if (!_gpuPreviewCache.TryGetValue(candidate.Key, out var item) ||
+                        item.ActiveReaders != 0 || !_gpuPreviewCache.Remove(candidate.Key)) continue;
+                    _previewCacheBytes -= item.Bytes;
+                    _gpuPreviewLookup.Remove(new RenderLookupKey(
+                        candidate.Key.PageIndex, candidate.Key.PageKey,
+                        candidate.Key.VisiblePageCount, candidate.Key.ContextVersion));
+                    gpuEvicted.Add(item.Image);
+                }
+            }
+            Thread.Yield();
+        }
         foreach (var bitmap in evicted) lock (bitmap) bitmap.Dispose();
+        foreach (var image in gpuEvicted) image.Dispose();
     }
 
     public Task DiscardStaleRenderContextsAsync()
@@ -212,6 +277,7 @@ internal sealed class AsyncViewerPanel : Panel
         return Task.Run(() =>
         {
             List<Bitmap> evicted = [];
+            List<GpuRenderedImage> gpuEvicted = [];
             KeyValuePair<RenderKey, RenderCacheItem>[] renderCandidates;
             lock (_renderCacheGate)
                 renderCandidates = _renderCache
@@ -236,6 +302,25 @@ internal sealed class AsyncViewerPanel : Panel
                 Thread.Yield();
             }
 
+            KeyValuePair<RenderKey, GpuRenderCacheItem>[] gpuRenderCandidates;
+            lock (_renderCacheGate)
+                gpuRenderCandidates = _gpuRenderCache
+                    .Where(pair => pair.Key.ContextVersion != currentContext).ToArray();
+            foreach (var candidate in gpuRenderCandidates)
+            {
+                lock (_renderCacheGate)
+                {
+                    if (candidate.Value.ActiveReaders != 0 ||
+                        !_gpuRenderCache.Remove(candidate.Key)) continue;
+                    _renderCacheBytes -= candidate.Value.Bytes;
+                    SubtractRenderStats(candidate.Key, candidate.Value.Bytes);
+                    _gpuRenderLookup.Remove(new RenderLookupKey(
+                        candidate.Key.PageIndex, candidate.Key.PageKey,
+                        candidate.Key.VisiblePageCount, candidate.Key.ContextVersion));
+                    gpuEvicted.Add(candidate.Value.Image);
+                }
+            }
+
             KeyValuePair<RenderKey, RenderCacheItem>[] previewCandidates;
             lock (_previewCacheGate)
                 previewCandidates = _previewCache
@@ -257,7 +342,25 @@ internal sealed class AsyncViewerPanel : Panel
                 }
                 Thread.Yield();
             }
+            KeyValuePair<RenderKey, GpuRenderCacheItem>[] gpuPreviewCandidates;
+            lock (_previewCacheGate)
+                gpuPreviewCandidates = _gpuPreviewCache
+                    .Where(pair => pair.Key.ContextVersion != currentContext).ToArray();
+            foreach (var candidate in gpuPreviewCandidates)
+            {
+                lock (_previewCacheGate)
+                {
+                    if (candidate.Value.ActiveReaders != 0 ||
+                        !_gpuPreviewCache.Remove(candidate.Key)) continue;
+                    _previewCacheBytes -= candidate.Value.Bytes;
+                    _gpuPreviewLookup.Remove(new RenderLookupKey(
+                        candidate.Key.PageIndex, candidate.Key.PageKey,
+                        candidate.Key.VisiblePageCount, candidate.Key.ContextVersion));
+                    gpuEvicted.Add(candidate.Value.Image);
+                }
+            }
             foreach (var bitmap in evicted) lock (bitmap) bitmap.Dispose();
+            foreach (var image in gpuEvicted) image.Dispose();
         });
     }
 
@@ -265,10 +368,16 @@ internal sealed class AsyncViewerPanel : Panel
     {
         if (GetDirectionalRenderBytes(center, ahead) <= maximumBytes) return;
         KeyValuePair<RenderKey, RenderCacheItem>[] candidates;
+        KeyValuePair<RenderKey, GpuRenderCacheItem>[] gpuCandidates;
         lock (_renderCacheGate)
         {
             candidates = _renderCache
-                .Where(pair => ahead ? pair.Key.PageIndex >= center : pair.Key.PageIndex < center)
+                .Where(pair => IsActivePageKey(pair.Key.PageKey) &&
+                    (ahead ? pair.Key.PageIndex >= center : pair.Key.PageIndex < center))
+                .ToArray();
+            gpuCandidates = _gpuRenderCache
+                .Where(pair => IsActivePageKey(pair.Key.PageKey) &&
+                    (ahead ? pair.Key.PageIndex >= center : pair.Key.PageIndex < center))
                 .ToArray();
         }
 
@@ -276,7 +385,11 @@ internal sealed class AsyncViewerPanel : Panel
         Array.Sort(candidates, (left, right) => ahead
             ? right.Key.PageIndex.CompareTo(left.Key.PageIndex)
             : left.Key.PageIndex.CompareTo(right.Key.PageIndex));
+        Array.Sort(gpuCandidates, (left, right) => ahead
+            ? right.Key.PageIndex.CompareTo(left.Key.PageIndex)
+            : left.Key.PageIndex.CompareTo(right.Key.PageIndex));
         List<Bitmap> evicted = [];
+        List<GpuRenderedImage> gpuEvicted = [];
         var sideBytes = GetDirectionalRenderBytes(center, ahead);
         const int batchSize = 24;
         for (var offset = 0; offset < candidates.Length && sideBytes > maximumBytes; offset += batchSize)
@@ -299,7 +412,131 @@ internal sealed class AsyncViewerPanel : Panel
             }
             Thread.Yield();
         }
+        for (var offset = 0; offset < gpuCandidates.Length && sideBytes > maximumBytes;
+            offset += batchSize)
+        {
+            lock (_renderCacheGate)
+            {
+                foreach (var candidate in gpuCandidates.Skip(offset).Take(batchSize))
+                {
+                    if (sideBytes <= maximumBytes) break;
+                    if (!_gpuRenderCache.TryGetValue(candidate.Key, out var item) ||
+                        item.ActiveReaders != 0 || !_gpuRenderCache.Remove(candidate.Key)) continue;
+                    sideBytes -= item.Bytes;
+                    _renderCacheBytes -= item.Bytes;
+                    SubtractRenderStats(candidate.Key, item.Bytes);
+                    _gpuRenderLookup.Remove(new RenderLookupKey(
+                        candidate.Key.PageIndex, candidate.Key.PageKey,
+                        candidate.Key.VisiblePageCount, candidate.Key.ContextVersion));
+                    gpuEvicted.Add(item.Image);
+                }
+            }
+            Thread.Yield();
+        }
         foreach (var bitmap in evicted) lock (bitmap) bitmap.Dispose();
+        foreach (var image in gpuEvicted) image.Dispose();
+    }
+
+    private bool IsActivePageKey(string pageKey) =>
+        _activeBookPrefix.Length == 0 ||
+        pageKey.StartsWith(_activeBookPrefix, StringComparison.OrdinalIgnoreCase);
+
+    private void TrimRetainedRenderCache(long activeAllowanceBytes)
+    {
+        if (RenderCacheBytes <= activeAllowanceBytes) return;
+        KeyValuePair<RenderKey, RenderCacheItem>[] cpu;
+        KeyValuePair<RenderKey, GpuRenderCacheItem>[] gpu;
+        lock (_renderCacheGate)
+        {
+            cpu = _renderCache.Where(pair => !IsActivePageKey(pair.Key.PageKey))
+                .OrderBy(pair => pair.Value.Sequence).ToArray();
+            gpu = _gpuRenderCache.Where(pair => !IsActivePageKey(pair.Key.PageKey))
+                .OrderBy(pair => pair.Value.Sequence).ToArray();
+        }
+        var candidates = cpu.Select(pair => (pair.Value.Sequence, Cpu: pair, Gpu: default(KeyValuePair<RenderKey, GpuRenderCacheItem>), IsGpu: false))
+            .Concat(gpu.Select(pair => (pair.Value.Sequence, Cpu: default(KeyValuePair<RenderKey, RenderCacheItem>), Gpu: pair, IsGpu: true)))
+            .OrderBy(pair => pair.Sequence).ToArray();
+        List<Bitmap> bitmaps = [];
+        List<GpuRenderedImage> gpuImages = [];
+        foreach (var candidate in candidates)
+        {
+            if (RenderCacheBytes <= activeAllowanceBytes) break;
+            lock (_renderCacheGate)
+            {
+                if (candidate.IsGpu)
+                {
+                    var key = candidate.Gpu.Key;
+                    if (!_gpuRenderCache.TryGetValue(key, out var item) ||
+                        item.ActiveReaders != 0 || !_gpuRenderCache.Remove(key)) continue;
+                    _renderCacheBytes -= item.Bytes;
+                    SubtractRenderStats(key, item.Bytes);
+                    _gpuRenderLookup.Remove(new RenderLookupKey(key.PageIndex, key.PageKey,
+                        key.VisiblePageCount, key.ContextVersion));
+                    gpuImages.Add(item.Image);
+                }
+                else
+                {
+                    var key = candidate.Cpu.Key;
+                    if (!_renderCache.TryGetValue(key, out var item) ||
+                        item.ActiveReaders != 0 || !_renderCache.Remove(key)) continue;
+                    _renderCacheBytes -= item.Bytes;
+                    SubtractRenderStats(key, item.Bytes);
+                    _renderLookup.Remove(new RenderLookupKey(key.PageIndex, key.PageKey,
+                        key.VisiblePageCount, key.ContextVersion));
+                    bitmaps.Add(item.Bitmap);
+                }
+            }
+        }
+        foreach (var bitmap in bitmaps) lock (bitmap) bitmap.Dispose();
+        foreach (var image in gpuImages) image.Dispose();
+    }
+
+    private void TrimRetainedPreviewCache(long activeAllowanceBytes)
+    {
+        if (PreviewCacheBytes <= activeAllowanceBytes) return;
+        KeyValuePair<RenderKey, RenderCacheItem>[] cpu;
+        KeyValuePair<RenderKey, GpuRenderCacheItem>[] gpu;
+        lock (_previewCacheGate)
+        {
+            cpu = _previewCache.Where(pair => !IsActivePageKey(pair.Key.PageKey))
+                .OrderBy(pair => pair.Value.Sequence).ToArray();
+            gpu = _gpuPreviewCache.Where(pair => !IsActivePageKey(pair.Key.PageKey))
+                .OrderBy(pair => pair.Value.Sequence).ToArray();
+        }
+        var candidates = cpu.Select(pair => (pair.Value.Sequence, Cpu: pair, Gpu: default(KeyValuePair<RenderKey, GpuRenderCacheItem>), IsGpu: false))
+            .Concat(gpu.Select(pair => (pair.Value.Sequence, Cpu: default(KeyValuePair<RenderKey, RenderCacheItem>), Gpu: pair, IsGpu: true)))
+            .OrderBy(pair => pair.Sequence).ToArray();
+        List<Bitmap> bitmaps = [];
+        List<GpuRenderedImage> gpuImages = [];
+        foreach (var candidate in candidates)
+        {
+            if (PreviewCacheBytes <= activeAllowanceBytes) break;
+            lock (_previewCacheGate)
+            {
+                if (candidate.IsGpu)
+                {
+                    var key = candidate.Gpu.Key;
+                    if (!_gpuPreviewCache.TryGetValue(key, out var item) ||
+                        item.ActiveReaders != 0 || !_gpuPreviewCache.Remove(key)) continue;
+                    _previewCacheBytes -= item.Bytes;
+                    _gpuPreviewLookup.Remove(new RenderLookupKey(key.PageIndex, key.PageKey,
+                        key.VisiblePageCount, key.ContextVersion));
+                    gpuImages.Add(item.Image);
+                }
+                else
+                {
+                    var key = candidate.Cpu.Key;
+                    if (!_previewCache.TryGetValue(key, out var item) ||
+                        item.ActiveReaders != 0 || !_previewCache.Remove(key)) continue;
+                    _previewCacheBytes -= item.Bytes;
+                    _previewLookup.Remove(new RenderLookupKey(key.PageIndex, key.PageKey,
+                        key.VisiblePageCount, key.ContextVersion));
+                    bitmaps.Add(item.Bitmap);
+                }
+            }
+        }
+        foreach (var bitmap in bitmaps) lock (bitmap) bitmap.Dispose();
+        foreach (var image in gpuImages) image.Dispose();
     }
 
     public AsyncViewerPanel()
@@ -457,6 +694,9 @@ internal sealed class AsyncViewerPanel : Panel
         string firstKey, string? secondKey, int firstIndex, int secondIndex)
     {
         var visiblePageCount = secondIndex >= 0 ? 2 : 1;
+        if (TryPresentGpuCachedPages(
+                firstKey, secondKey, firstIndex, secondIndex, visiblePageCount))
+            return true;
         RenderCacheItem? firstItem;
         RenderCacheItem? secondItem;
         var firstIsPreview = false;
@@ -573,7 +813,9 @@ internal sealed class AsyncViewerPanel : Panel
     {
         var lookup = new RenderLookupKey(pageIndex, pageKey, visiblePageCount, contextVersion);
         lock (_renderCacheGate)
-            return _renderLookup.TryGetValue(lookup, out var key) && _renderCache.ContainsKey(key);
+            return (_renderLookup.TryGetValue(lookup, out var key) && _renderCache.ContainsKey(key)) ||
+                   (_gpuRenderLookup.TryGetValue(lookup, out var gpuKey) &&
+                    _gpuRenderCache.ContainsKey(gpuKey));
     }
 
     public HashSet<int> GetStaleCachedPages(long currentContextVersion) =>
@@ -586,7 +828,8 @@ internal sealed class AsyncViewerPanel : Panel
     {
         var context = Volatile.Read(ref _renderContextVersion);
         var pages = _cachedPageCounts
-            .Where(pair => pair.Key.Context == context && pair.Value > 0)
+            .Where(pair => pair.Key.Context == context &&
+                IsActivePageKey(pair.Key.PageKey) && pair.Value > 0)
             .Select(pair => pair.Key.Page)
             .ToHashSet();
         if (!pages.Contains(center)) return (-1, -1);
@@ -616,6 +859,31 @@ internal sealed class AsyncViewerPanel : Panel
         DisposeRendered();
         ClearRenderCache();
         ClearPreviewCache();
+        _left.Visible = false;
+        _right.Visible = false;
+        AutoScrollPosition = Point.Empty;
+        AutoScrollMinSize = Size.Empty;
+        Invalidate();
+    }
+
+    public void RetireBookCache()
+    {
+        StopAnimations();
+        ReturnToFit();
+        CancelRender();
+        _renderVersion++;
+        RetireSource(_first);
+        RetireSource(_second);
+        _first = null;
+        _second = null;
+        _firstKey = null;
+        _secondKey = null;
+        _firstIndex = -1;
+        _secondIndex = -1;
+        _displayedPreview = false;
+        _loadingPlaceholder.Visible = false;
+        DisposeRendered(clearSurface: false);
+        _direct2DSurface.ClearFrame();
         _left.Visible = false;
         _right.Visible = false;
         AutoScrollPosition = Point.Empty;
@@ -677,6 +945,21 @@ internal sealed class AsyncViewerPanel : Panel
 
         if (generatePreview && Volatile.Read(ref _previewCacheLimitBytes) > 0)
         {
+            var gpuPreview = await RenderWorkScheduler.RunFastCodecAsync(
+                () => EncodedJpegRenderer.RenderReaderGpu(
+                    page, context.ClientSize, visiblePageCount, rotation,
+                    fastPreview: true, cancellationToken),
+                cancellationToken).ConfigureAwait(false);
+            if (gpuPreview is { } directPreview)
+            {
+                var directKey = new RenderKey(
+                    pageIndex, pageKey, directPreview.Image.Width, directPreview.Image.Height,
+                    visiblePageCount, context.Version);
+                if (!AddGpuPreviewOwned(directKey, directPreview.Image))
+                    directPreview.Image.Dispose();
+            }
+            else
+            {
             var preview = await RenderWorkScheduler.RunFastCodecAsync(
                 () => EncodedJpegRenderer.RenderReader(
                     page, context.ClientSize, visiblePageCount, rotation,
@@ -686,6 +969,22 @@ internal sealed class AsyncViewerPanel : Panel
                 pageIndex, pageKey, preview.Bitmap.Width, preview.Bitmap.Height,
                 visiblePageCount, context.Version);
             if (!AddPreviewOwned(previewKey, preview.Bitmap)) preview.Bitmap.Dispose();
+            }
+        }
+
+        var gpuRendered = await RenderWorkScheduler.RunFullAsync(
+            () => EncodedJpegRenderer.RenderReaderGpu(
+                page, context.ClientSize, visiblePageCount, rotation,
+                fastPreview: false, cancellationToken),
+            cancellationToken).ConfigureAwait(false);
+        if (gpuRendered is { } directRendered)
+        {
+            var directKey = new RenderKey(
+                pageIndex, pageKey, directRendered.Image.Width, directRendered.Image.Height,
+                visiblePageCount, context.Version);
+            if (!AddGpuRenderOwned(directKey, directRendered.Image))
+                directRendered.Image.Dispose();
+            return;
         }
 
         var rendered = await RenderWorkScheduler.RunFullAsync(
@@ -1104,7 +1403,7 @@ internal sealed class AsyncViewerPanel : Panel
             return;
         }
 
-        (ZoomCropRequest Request, Bitmap? Bitmap)[] results = [];
+        (ZoomCropRequest Request, ZoomPatchSurface? Surface)[] results = [];
         try
         {
             RenderingStateChanged?.Invoke(this, true);
@@ -1117,13 +1416,12 @@ internal sealed class AsyncViewerPanel : Panel
             cancellation.Token.ThrowIfCancellationRequested();
             if (!_zoomMode || version != _zoomInteractionVersion) return;
 
-            var fastPatches = new Dictionary<Rectangle, Bitmap>();
+            var fastPatches = new Dictionary<Rectangle, ZoomPatchSurface>();
             foreach (var result in results)
             {
-                if (result.Bitmap is not { } bitmap) continue;
-                fastPatches[result.Request.Destination] = bitmap;
-                _zoomDetailPatches.Add(new ZoomDetailPatch(bitmap, result.Request.Destination));
-                _direct2DSurface.AddZoomDetail(bitmap, result.Request.Destination);
+                if (result.Surface is not { } surface) continue;
+                fastPatches[result.Request.Destination] = surface;
+                AddZoomPatch(surface, result.Request.Destination);
             }
             results = [];
 
@@ -1135,11 +1433,10 @@ internal sealed class AsyncViewerPanel : Panel
 
             foreach (var result in results)
             {
-                if (result.Bitmap is not { } bitmap) continue;
-                _zoomDetailPatches.Add(new ZoomDetailPatch(bitmap, result.Request.Destination));
-                _direct2DSurface.AddZoomDetail(bitmap, result.Request.Destination);
-                if (fastPatches.Remove(result.Request.Destination, out var fastBitmap))
-                    RemoveZoomDetailPatch(fastBitmap);
+                if (result.Surface is not { } surface) continue;
+                AddZoomPatch(surface, result.Request.Destination);
+                if (fastPatches.Remove(result.Request.Destination, out var fastSurface))
+                    RemoveZoomDetailPatch(fastSurface);
             }
             results = [];
             PruneZoomDetailPatches();
@@ -1152,7 +1449,7 @@ internal sealed class AsyncViewerPanel : Panel
         finally
         {
             foreach (var result in results)
-                if (result.Bitmap is { } bitmap) DisposeSourceInBackground(bitmap);
+                result.Surface?.Dispose();
             if (ReferenceEquals(_zoomRenderCancellation, cancellation))
             {
                 _zoomRenderCancellation = null;
@@ -1163,8 +1460,8 @@ internal sealed class AsyncViewerPanel : Panel
         }
     }
 
-    private async Task<(ZoomCropRequest Request, Bitmap? Bitmap)> RenderZoomPatchAsync(
-        Func<int, Rectangle, Size, bool, CancellationToken, Task<Bitmap>> renderer,
+    private async Task<(ZoomCropRequest Request, ZoomPatchSurface? Surface)> RenderZoomPatchAsync(
+        Func<int, Rectangle, Size, bool, CancellationToken, Task<ZoomPatchSurface>> renderer,
         ZoomCropRequest request, bool fastPreview, CancellationToken cancellationToken)
     {
         try
@@ -1242,25 +1539,38 @@ internal sealed class AsyncViewerPanel : Panel
             var patch = _zoomDetailPatches[index];
             if (patch.Bounds.IntersectsWith(retention)) continue;
             _zoomDetailPatches.RemoveAt(index);
-            _direct2DSurface.RemoveZoomDetail(patch.Bitmap);
-            RetireSource(patch.Bitmap);
+            RemoveZoomSurfaceFromRenderer(patch.Surface);
+            patch.Surface.Dispose();
         }
     }
 
     private void ClearZoomDetail()
     {
         _direct2DSurface.ClearZoomDetails();
-        foreach (var patch in _zoomDetailPatches) RetireSource(patch.Bitmap);
+        foreach (var patch in _zoomDetailPatches) patch.Surface.Dispose();
         _zoomDetailPatches.Clear();
     }
 
-    private void RemoveZoomDetailPatch(Bitmap bitmap)
+    private void AddZoomPatch(ZoomPatchSurface surface, Rectangle bounds)
+    {
+        _zoomDetailPatches.Add(new ZoomDetailPatch(surface, bounds));
+        if (surface.Gpu is { } gpu) _direct2DSurface.AddZoomDetailGpu(gpu, bounds);
+        else if (surface.Bitmap is { } bitmap) _direct2DSurface.AddZoomDetail(bitmap, bounds);
+    }
+
+    private void RemoveZoomSurfaceFromRenderer(ZoomPatchSurface surface)
+    {
+        if (surface.Gpu is { } gpu) _direct2DSurface.RemoveZoomDetailGpu(gpu);
+        else if (surface.Bitmap is { } bitmap) _direct2DSurface.RemoveZoomDetail(bitmap);
+    }
+
+    private void RemoveZoomDetailPatch(ZoomPatchSurface surface)
     {
         var index = _zoomDetailPatches.FindIndex(
-            patch => ReferenceEquals(patch.Bitmap, bitmap));
+            patch => ReferenceEquals(patch.Surface, surface));
         if (index >= 0) _zoomDetailPatches.RemoveAt(index);
-        _direct2DSurface.RemoveZoomDetail(bitmap);
-        RetireSource(bitmap);
+        RemoveZoomSurfaceFromRenderer(surface);
+        surface.Dispose();
     }
 
     private void CancelAndDisposeZoomRender()
@@ -1807,6 +2117,125 @@ internal sealed class AsyncViewerPanel : Panel
         }
     }
 
+    private bool TryPresentGpuCachedPages(
+        string firstKey, string? secondKey, int firstIndex, int secondIndex,
+        int visiblePageCount)
+    {
+        GpuRenderCacheItem? first;
+        GpuRenderCacheItem? second;
+        var firstPreview = false;
+        var secondPreview = false;
+        lock (_renderCacheGate)
+        {
+            first = AcquireCurrentGpuRender(firstIndex, firstKey, visiblePageCount);
+            second = secondIndex >= 0 && secondKey is not null
+                ? AcquireCurrentGpuRender(secondIndex, secondKey, visiblePageCount)
+                : null;
+        }
+        if (first is null || (secondIndex >= 0 && second is null))
+        {
+            lock (_previewCacheGate)
+            {
+                if (first is null)
+                {
+                    first = AcquireCurrentGpuPreview(firstIndex, firstKey, visiblePageCount);
+                    firstPreview = first is not null;
+                }
+                if (secondIndex >= 0 && second is null && secondKey is not null)
+                {
+                    second = AcquireCurrentGpuPreview(secondIndex, secondKey, visiblePageCount);
+                    secondPreview = second is not null;
+                }
+            }
+        }
+        if (first is null || (secondIndex >= 0 && second is null))
+        {
+            lock (_previewCacheGate)
+            {
+                if (firstPreview) ReleaseGpuCacheItem(first);
+                if (secondPreview) ReleaseGpuCacheItem(second);
+            }
+            lock (_renderCacheGate)
+            {
+                if (!firstPreview) ReleaseGpuCacheItem(first);
+                if (!secondPreview) ReleaseGpuCacheItem(second);
+            }
+            return false;
+        }
+
+        try
+        {
+            CancelRender();
+            _renderVersion++;
+            RetireSource(_first);
+            RetireSource(_second);
+            _first = null;
+            _second = null;
+            _firstKey = firstKey;
+            _secondKey = secondKey;
+            _firstIndex = firstIndex;
+            _secondIndex = secondIndex;
+            var rendered = JapaneseMode
+                ? new[] { second?.Image, first.Image }
+                : new[] { first.Image, second?.Image };
+            const int gap = 10;
+            var availableHeight = Math.Max(100, ClientSize.Height - gap * 2);
+            var sizes = rendered.Select(image => image is null
+                ? Size.Empty : new Size(image.Width, image.Height)).ToArray();
+            ApplyRenderedGpu(rendered[0], rendered[1], sizes, availableHeight, gap);
+            _displayedPreview = firstPreview || secondPreview;
+            RenderingStateChanged?.Invoke(this, false);
+            return true;
+        }
+        finally
+        {
+            lock (_previewCacheGate)
+            {
+                if (firstPreview) ReleaseGpuCacheItem(first);
+                if (secondPreview) ReleaseGpuCacheItem(second);
+            }
+            lock (_renderCacheGate)
+            {
+                if (!firstPreview) ReleaseGpuCacheItem(first);
+                if (!secondPreview) ReleaseGpuCacheItem(second);
+            }
+        }
+    }
+
+    private void ApplyRenderedGpu(
+        GpuRenderedImage? left, GpuRenderedImage? right, Size[] sizes,
+        int availableHeight, int gap)
+    {
+        _loadingPlaceholder.Visible = false;
+        DisposeRendered(clearSurface: false);
+        var boxes = new[] { _left, _right };
+        var visibleSizes = sizes.Where(size => !size.IsEmpty).ToArray();
+        var contentWidth = visibleSizes.Sum(size => size.Width) +
+            Math.Max(0, visibleSizes.Length - 1) * gap;
+        var x = Math.Max(gap, (ClientSize.Width - contentWidth) / 2);
+        SuspendLayout();
+        try
+        {
+            _left.Image = null;
+            _right.Image = null;
+            _left.Visible = left is not null;
+            _right.Visible = right is not null;
+            for (var i = 0; i < boxes.Length; i++)
+            {
+                if (sizes[i].IsEmpty) continue;
+                boxes[i].SetBounds(x,
+                    gap + Math.Max(0, (availableHeight - sizes[i].Height) / 2),
+                    sizes[i].Width, sizes[i].Height, BoundsSpecified.All);
+                x += sizes[i].Width + gap;
+            }
+            AutoScrollPosition = Point.Empty;
+            AutoScrollMinSize = Size.Empty;
+        }
+        finally { ResumeLayout(false); }
+        _direct2DSurface.PresentGpu(left, right, _left.Bounds, _right.Bounds);
+        _displayedContextVersion = _renderContextVersion;
+    }
+
     private void ApplyRendered(
         Bitmap? left, Bitmap? right, Size[] sizes, int availableHeight, int gap,
         bool retainBitmaps = true)
@@ -1939,12 +2368,44 @@ internal sealed class AsyncViewerPanel : Panel
 
     private bool ContainsRender(RenderKey key)
     {
-        lock (_renderCacheGate) return _renderCache.ContainsKey(key);
+        lock (_renderCacheGate)
+            return _renderCache.ContainsKey(key) || _gpuRenderCache.ContainsKey(key);
     }
 
     private bool ContainsPreview(RenderKey key)
     {
-        lock (_previewCacheGate) return _previewCache.ContainsKey(key);
+        lock (_previewCacheGate)
+            return _previewCache.ContainsKey(key) || _gpuPreviewCache.ContainsKey(key);
+    }
+
+    private GpuRenderCacheItem? AcquireCurrentGpuRender(
+        int pageIndex, string pageKey, int visiblePageCount)
+    {
+        var lookup = new RenderLookupKey(pageIndex, pageKey, visiblePageCount, _renderContextVersion);
+        if (!_gpuRenderLookup.TryGetValue(lookup, out var key) ||
+            !_gpuRenderCache.TryGetValue(key, out var item)) return null;
+        item.ActiveReaders++;
+        item.Sequence = Interlocked.Increment(ref _renderCacheSequence);
+        return item;
+    }
+
+    private GpuRenderCacheItem? AcquireCurrentGpuPreview(
+        int pageIndex, string pageKey, int visiblePageCount)
+    {
+        var lookup = new RenderLookupKey(pageIndex, pageKey, visiblePageCount, _renderContextVersion);
+        if (!_gpuPreviewLookup.TryGetValue(lookup, out var key) ||
+            !_gpuPreviewCache.TryGetValue(key, out var item)) return null;
+        item.ActiveReaders++;
+        item.Sequence = Interlocked.Increment(ref _renderCacheSequence);
+        return item;
+    }
+
+    private static void ReleaseGpuCacheItem(GpuRenderCacheItem? item)
+    {
+        if (item is null) return;
+        item.ActiveReaders--;
+        if (item.ActiveReaders == 0 && item.Retired)
+            _ = Task.Run(item.Image.Dispose);
     }
 
     private RenderCacheItem? AcquireCurrentRender(
@@ -2052,10 +2513,35 @@ internal sealed class AsyncViewerPanel : Panel
             _renderCacheBytes += item.Bytes;
             _renderBytesByPage.AddOrUpdate(key.PageIndex, item.Bytes, (_, bytes) => bytes + item.Bytes);
             _renderBytesByContextPage.AddOrUpdate(
-                (key.ContextVersion, key.PageIndex), item.Bytes,
+                (key.ContextVersion, key.PageIndex, key.PageKey), item.Bytes,
                 (_, bytes) => bytes + item.Bytes);
             _cachedPageCounts.AddOrUpdate(
-                (key.ContextVersion, key.PageIndex), 1, (_, count) => count + 1);
+                (key.ContextVersion, key.PageIndex, key.PageKey), 1, (_, count) => count + 1);
+            return true;
+        }
+    }
+
+    private bool AddGpuRenderOwned(RenderKey key, GpuRenderedImage image)
+    {
+        if (key.ContextVersion != Volatile.Read(ref _renderContextVersion)) return false;
+        lock (_renderCacheGate)
+        {
+            if (_gpuRenderCache.TryGetValue(key, out var existing))
+            {
+                existing.Sequence = Interlocked.Increment(ref _renderCacheSequence);
+                return false;
+            }
+            var item = new GpuRenderCacheItem(
+                image, Interlocked.Increment(ref _renderCacheSequence));
+            _gpuRenderCache[key] = item;
+            _gpuRenderLookup[new RenderLookupKey(
+                key.PageIndex, key.PageKey, key.VisiblePageCount, key.ContextVersion)] = key;
+            _renderCacheBytes += item.Bytes;
+            _renderBytesByPage.AddOrUpdate(key.PageIndex, item.Bytes, (_, bytes) => bytes + item.Bytes);
+            _renderBytesByContextPage.AddOrUpdate(
+                (key.ContextVersion, key.PageIndex, key.PageKey), item.Bytes, (_, bytes) => bytes + item.Bytes);
+            _cachedPageCounts.AddOrUpdate(
+                (key.ContextVersion, key.PageIndex, key.PageKey), 1, (_, count) => count + 1);
             return true;
         }
     }
@@ -2080,6 +2566,27 @@ internal sealed class AsyncViewerPanel : Panel
         }
     }
 
+    private bool AddGpuPreviewOwned(RenderKey key, GpuRenderedImage image)
+    {
+        if (Volatile.Read(ref _previewCacheLimitBytes) <= 0 ||
+            key.ContextVersion != Volatile.Read(ref _renderContextVersion)) return false;
+        lock (_previewCacheGate)
+        {
+            if (_gpuPreviewCache.TryGetValue(key, out var existing))
+            {
+                existing.Sequence = Interlocked.Increment(ref _renderCacheSequence);
+                return false;
+            }
+            var item = new GpuRenderCacheItem(
+                image, Interlocked.Increment(ref _renderCacheSequence));
+            _gpuPreviewCache[key] = item;
+            _gpuPreviewLookup[new RenderLookupKey(
+                key.PageIndex, key.PageKey, key.VisiblePageCount, key.ContextVersion)] = key;
+            _previewCacheBytes += item.Bytes;
+            return true;
+        }
+    }
+
     // Called while _renderCacheGate is held. Readers enumerate the concurrent
     // counters without entering the foreground cache-lookup lock.
     private void SubtractRenderStats(RenderKey key, long bytes)
@@ -2091,7 +2598,7 @@ internal sealed class AsyncViewerPanel : Panel
             else _renderBytesByPage.TryRemove(key.PageIndex, out _);
         }
 
-        var contextPage = (key.ContextVersion, key.PageIndex);
+        var contextPage = (key.ContextVersion, key.PageIndex, key.PageKey);
         if (_renderBytesByContextPage.TryGetValue(contextPage, out var contextBytes))
         {
             var remaining = contextBytes - bytes;
@@ -2099,7 +2606,7 @@ internal sealed class AsyncViewerPanel : Panel
             else _renderBytesByContextPage.TryRemove(contextPage, out _);
         }
 
-        var pageKey = (key.ContextVersion, key.PageIndex);
+        var pageKey = (key.ContextVersion, key.PageIndex, key.PageKey);
         if (_cachedPageCounts.TryGetValue(pageKey, out var count))
         {
             if (count > 1) _cachedPageCounts[pageKey] = count - 1;
@@ -2141,6 +2648,7 @@ internal sealed class AsyncViewerPanel : Panel
     private void ClearRenderCache()
     {
         Bitmap[] images;
+        GpuRenderedImage[] gpuImages;
         lock (_renderCacheGate)
         {
             images = _renderCache.Values
@@ -2148,23 +2656,32 @@ internal sealed class AsyncViewerPanel : Panel
                 .Select(item => item.Bitmap).ToArray();
             foreach (var item in _renderCache.Values.Where(item => item.ActiveReaders > 0))
                 item.Retired = true;
+            gpuImages = _gpuRenderCache.Values
+                .Where(item => item.ActiveReaders == 0)
+                .Select(item => item.Image).ToArray();
+            foreach (var item in _gpuRenderCache.Values.Where(item => item.ActiveReaders > 0))
+                item.Retired = true;
             _renderCache.Clear();
             _renderLookup.Clear();
+            _gpuRenderCache.Clear();
+            _gpuRenderLookup.Clear();
             _renderBytesByPage.Clear();
             _renderBytesByContextPage.Clear();
             _cachedPageCounts.Clear();
             _renderCacheBytes = 0;
         }
-        if (images.Length > 0)
+        if (images.Length > 0 || gpuImages.Length > 0)
             _ = Task.Run(() =>
             {
                 foreach (var image in images) lock (image) image.Dispose();
+                foreach (var image in gpuImages) image.Dispose();
             });
     }
 
     private void ClearPreviewCache()
     {
         Bitmap[] images;
+        GpuRenderedImage[] gpuImages;
         lock (_previewCacheGate)
         {
             images = _previewCache.Values
@@ -2172,14 +2689,22 @@ internal sealed class AsyncViewerPanel : Panel
                 .Select(item => item.Bitmap).ToArray();
             foreach (var item in _previewCache.Values.Where(item => item.ActiveReaders > 0))
                 item.Retired = true;
+            gpuImages = _gpuPreviewCache.Values
+                .Where(item => item.ActiveReaders == 0)
+                .Select(item => item.Image).ToArray();
+            foreach (var item in _gpuPreviewCache.Values.Where(item => item.ActiveReaders > 0))
+                item.Retired = true;
             _previewCache.Clear();
             _previewLookup.Clear();
+            _gpuPreviewCache.Clear();
+            _gpuPreviewLookup.Clear();
             _previewCacheBytes = 0;
         }
-        if (images.Length > 0)
+        if (images.Length > 0 || gpuImages.Length > 0)
             _ = Task.Run(() =>
             {
                 foreach (var image in images) lock (image) image.Dispose();
+                foreach (var image in gpuImages) image.Dispose();
             });
     }
 

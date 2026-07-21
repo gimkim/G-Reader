@@ -7,12 +7,23 @@ internal sealed partial class ThumbnailGridView : Panel
     private const int ScrollingViewportRefreshIntervalMs = 180;
     private readonly ThumbnailRenderCache _fullCache = new();
     private readonly ThumbnailRenderCache _fastPreviewCache = new();
-    private readonly ThumbnailRenderCache _browsePreviewCache = new();
+    private readonly ThumbnailRenderCache _browseFullPreviewCache = new();
+    private readonly ThumbnailRenderCache _browseFastPreviewCache = new();
+    private readonly GpuThumbnailRenderCache _gpuFullCache = new();
+    private readonly GpuThumbnailRenderCache _gpuFastPreviewCache = new();
+    private readonly GpuThumbnailRenderCache _gpuBrowseFullPreviewCache = new();
+    private readonly GpuThumbnailRenderCache _gpuBrowseFastPreviewCache = new();
     private readonly System.Windows.Forms.Timer _renderSizeDebounce = new() { Interval = 180 };
     private readonly System.Windows.Forms.Timer _priorityRefreshDebounce = new() { Interval = 45 };
     private readonly System.Windows.Forms.Timer _smoothScrollTimer = new() { Interval = 8 };
+    private readonly System.Windows.Forms.Timer _scrollingViewportRefreshTimer = new()
+    {
+        Interval = ScrollingViewportRefreshIntervalMs
+    };
     private readonly System.Collections.Concurrent.ConcurrentDictionary<int, string>
         _generationStates = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<int, byte[]>
+        _pageColorProfiles = new();
     private readonly object _invalidationGate = new();
     private readonly HashSet<int> _pendingInvalidationItems = [];
     private bool _invalidationDispatchScheduled;
@@ -143,18 +154,33 @@ internal sealed partial class ThumbnailGridView : Panel
             BrowsePriorityChanged?.Invoke(this, EventArgs.Empty);
         };
         _smoothScrollTimer.Tick += (_, _) => AdvanceSmoothScroll();
+        _scrollingViewportRefreshTimer.Tick += (_, _) =>
+        {
+            _scrollingViewportRefreshTimer.Stop();
+            PublishLatestVisiblePreviewRefresh();
+        };
     }
 
     public void SetCacheLimits(long fullCacheBytes, long fastPreviewCacheBytes)
     {
         _fullCache.SetLimit(fullCacheBytes);
         _fastPreviewCache.SetLimit(fastPreviewCacheBytes);
-        var browseLimit = fastPreviewCacheBytes <= 0 ? 0 :
+        var browseFastLimit = fastPreviewCacheBytes <= 0 ? 0 :
             Math.Clamp(fastPreviewCacheBytes / 4,
                 16L * 1024 * 1024, 128L * 1024 * 1024);
-        Volatile.Write(ref _browsePreviewCacheLimitBytes, browseLimit);
-        _browsePreviewCache.SetLimit(browseLimit);
-        SetGpuCacheLimit(fullCacheBytes, fastPreviewCacheBytes, browseLimit);
+        var browseFullLimit = fullCacheBytes <= 0 ? 0 :
+            Math.Clamp(fullCacheBytes / 4,
+                32L * 1024 * 1024, 256L * 1024 * 1024);
+        Volatile.Write(ref _browsePreviewCacheLimitBytes,
+            Math.Max(browseFastLimit, browseFullLimit));
+        _browseFullPreviewCache.SetLimit(browseFullLimit);
+        _browseFastPreviewCache.SetLimit(browseFastLimit);
+        _gpuFullCache.SetLimit(fullCacheBytes);
+        _gpuFastPreviewCache.SetLimit(fastPreviewCacheBytes);
+        _gpuBrowseFullPreviewCache.SetLimit(browseFullLimit);
+        _gpuBrowseFastPreviewCache.SetLimit(browseFastLimit);
+        SetGpuCacheLimit(fullCacheBytes, fastPreviewCacheBytes,
+            browseFullLimit + browseFastLimit);
         Invalidate();
     }
 
@@ -166,9 +192,20 @@ internal sealed partial class ThumbnailGridView : Panel
         UpdateRenderTargetSize();
     }
 
+    public void SetPageColorProfile(int page, byte[]? profile)
+    {
+        if (page < 0 || page >= _pageCount) return;
+        if (profile is { Length: > 0 }) _pageColorProfiles[page] = profile.ToArray();
+        else _pageColorProfiles.TryRemove(page, out _);
+        InvalidateCellThreadSafe(page);
+    }
+
     public void ClearFullQualityCache()
     {
         _fullCache.Clear();
+        _gpuFullCache.Clear();
+        _browseFullPreviewCache.Clear();
+        _gpuBrowseFullPreviewCache.Clear();
         ClearGpuTextureCache();
         Invalidate();
     }
@@ -178,12 +215,18 @@ internal sealed partial class ThumbnailGridView : Panel
     {
         _fullCache.Clear();
         _fastPreviewCache.Clear();
-        _browsePreviewCache.Clear();
+        _browseFullPreviewCache.Clear();
+        _browseFastPreviewCache.Clear();
+        _gpuFullCache.Clear();
+        _gpuFastPreviewCache.Clear();
+        _gpuBrowseFullPreviewCache.Clear();
+        _gpuBrowseFastPreviewCache.Clear();
         ClearGpuTextureCache();
         _pageNames = pageNames.Select(GetDisplayFileName).ToArray();
         _folders = folders?.ToArray() ?? [];
         _pageCount = _pageNames.Length;
         _generationStates.Clear();
+        _pageColorProfiles.Clear();
         _selectedPage = _pageCount == 0 ? -1 : Math.Clamp(_selectedPage, 0, _pageCount - 1);
         _selectedItem = _selectedPage >= 0 ? _folders.Length + _selectedPage :
             _folders.Length > 0 ? 0 : -1;
@@ -191,10 +234,16 @@ internal sealed partial class ThumbnailGridView : Panel
         UpdateVirtualLayout();
     }
 
-    public bool HasFullThumbnail(int page, Size size) => _fullCache.HasExact(page, size);
-    public bool HasFastPreview(int page, Size size) => _fastPreviewCache.HasExact(page, size);
-    public bool HasBrowsePreview(int item, Size size) =>
-        _browsePreviewCache.HasExact(item, size);
+    public bool HasFullThumbnail(int page, Size size) =>
+        _fullCache.HasExact(page, size) || _gpuFullCache.HasExact(page, size);
+    public bool HasFastPreview(int page, Size size) =>
+        _fastPreviewCache.HasExact(page, size) || _gpuFastPreviewCache.HasExact(page, size);
+    public bool HasBrowseFullPreview(int item, Size size) =>
+        _browseFullPreviewCache.HasExact(item, size) ||
+        _gpuBrowseFullPreviewCache.HasExact(item, size);
+    public bool HasBrowseFastPreview(int item, Size size) =>
+        _browseFastPreviewCache.HasExact(item, size) ||
+        _gpuBrowseFastPreviewCache.HasExact(item, size);
 
     public Bitmap? CloneBestPagePreview(int page)
     {
@@ -298,14 +347,25 @@ internal sealed partial class ThumbnailGridView : Panel
             ? new ThumbnailPreviewWorkItem(true, item)
             : new ThumbnailPreviewWorkItem(false, item - _folders.Length);
 
-    public void SetBrowsePreview(int item, Size size, Bitmap preview)
+    public void SetBrowsePreview(
+        int item, Size size, Bitmap preview, bool fastPreview)
     {
         if (item < 0 || item >= _folders.Length)
         {
             preview.Dispose();
             return;
         }
-        _browsePreviewCache.AddOwned(item, size, preview);
+        if (fastPreview) _browseFastPreviewCache.AddOwned(item, size, preview);
+        else _browseFullPreviewCache.AddOwned(item, size, preview);
+        InvalidateItemThreadSafe(item);
+    }
+
+    public void SetBrowsePreviewGpu(
+        int item, Size size, GpuRenderedImage preview, bool fastPreview)
+    {
+        if (item < 0 || item >= _folders.Length) { preview.Dispose(); return; }
+        if (fastPreview) _gpuBrowseFastPreviewCache.AddOwned(item, size, preview);
+        else _gpuBrowseFullPreviewCache.AddOwned(item, size, preview);
         InvalidateItemThreadSafe(item);
     }
 
@@ -318,6 +378,15 @@ internal sealed partial class ThumbnailGridView : Panel
         }
         if (fastPreview) _fastPreviewCache.AddOwned(page, size, thumbnail);
         else _fullCache.AddOwned(page, size, thumbnail);
+        InvalidateCellThreadSafe(page);
+    }
+
+    public void SetThumbnailGpu(
+        int page, Size size, GpuRenderedImage thumbnail, bool fastPreview)
+    {
+        if (page < 0 || page >= _pageCount) { thumbnail.Dispose(); return; }
+        if (fastPreview) _gpuFastPreviewCache.AddOwned(page, size, thumbnail);
+        else _gpuFullCache.AddOwned(page, size, thumbnail);
         InvalidateCellThreadSafe(page);
     }
 
@@ -618,9 +687,11 @@ internal sealed partial class ThumbnailGridView : Panel
             _renderSizeDebounce.Dispose();
             _priorityRefreshDebounce.Dispose();
             _smoothScrollTimer.Dispose();
+            _scrollingViewportRefreshTimer.Dispose();
             _fullCache.Dispose();
             _fastPreviewCache.Dispose();
-            _browsePreviewCache.Dispose();
+            _browseFullPreviewCache.Dispose();
+            _browseFastPreviewCache.Dispose();
             DisposeThumbnailDirect2D();
         }
         base.Dispose(disposing);
@@ -785,6 +856,7 @@ internal sealed partial class ThumbnailGridView : Panel
         UpdateVisibleItemRange();
         RequestVisiblePreviewRefreshIfDue();
         ScrollPaintedContent(previous - value);
+        PresentScrollingFrameIfDue();
     }
 
     private void StopSmoothScroll()
@@ -834,10 +906,26 @@ internal sealed partial class ThumbnailGridView : Panel
             var elapsedMilliseconds =
                 (now - _lastScrollingViewportRefreshTick) * 1000d /
                 System.Diagnostics.Stopwatch.Frequency;
-            if (elapsedMilliseconds < ScrollingViewportRefreshIntervalMs) return;
+            if (elapsedMilliseconds < ScrollingViewportRefreshIntervalMs)
+            {
+                _scrollingViewportRefreshTimer.Interval = Math.Max(1,
+                    (int)Math.Ceiling(ScrollingViewportRefreshIntervalMs - elapsedMilliseconds));
+                _scrollingViewportRefreshTimer.Stop();
+                _scrollingViewportRefreshTimer.Start();
+                return;
+            }
         }
+        PublishLatestVisiblePreviewRefresh();
+    }
 
-        _lastScrollingViewportRefreshTick = now;
+    private void PublishLatestVisiblePreviewRefresh()
+    {
+        if (!Visible || ItemCount == 0) return;
+        var first = Volatile.Read(ref _firstVisibleItem);
+        var last = Volatile.Read(ref _lastVisibleItem);
+        if (first == _lastScrollingViewportFirstItem &&
+            last == _lastScrollingViewportLastItem) return;
+        _lastScrollingViewportRefreshTick = System.Diagnostics.Stopwatch.GetTimestamp();
         _lastScrollingViewportFirstItem = first;
         _lastScrollingViewportLastItem = last;
         VisiblePreviewRefreshRequested?.Invoke(this, EventArgs.Empty);

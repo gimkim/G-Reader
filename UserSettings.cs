@@ -24,6 +24,8 @@ internal sealed class UserSettings
     public bool Shadow { get; set; } = true;
     public bool FitToScreen { get; set; } = true;
     public int LanczosQuality { get; set; } = 1;
+    public bool UseNvJpeg { get; set; }
+    public bool UseMonitorColorProfile { get; set; } = true;
     public bool AutoOptimizePerformance { get; set; }
     public int CacheAheadMB { get; set; } = 3072;
     public int CacheBehindMB { get; set; } = 1024;
@@ -46,6 +48,7 @@ internal sealed class UserSettings
     public bool ArchivePageSortDescending { get; set; }
     // 0 = off, 1 = folders, 2 = archives/PDFs, 3 = both.
     public int AutoMoveMode { get; set; }
+    public bool PreviousBookOpensLastPage { get; set; } = true;
     public string RandomLibraryPath { get; set; } = string.Empty;
     public bool HasWindowBounds { get; set; }
     public bool WindowMaximized { get; set; }

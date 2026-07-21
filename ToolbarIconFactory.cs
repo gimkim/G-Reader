@@ -167,6 +167,21 @@ internal static class ToolbarIconFactory
         }
     });
 
+    public static Image Fullscreen(bool enabled) => Draw(g =>
+    {
+        using var pen = Pen(enabled ? Accent : Ink, 2.1f);
+        var inset = enabled ? 6 : 3;
+        var length = enabled ? 5 : 6;
+        g.DrawLine(pen, inset, inset + length, inset, inset);
+        g.DrawLine(pen, inset, inset, inset + length, inset);
+        g.DrawLine(pen, 24 - inset - length, inset, 24 - inset, inset);
+        g.DrawLine(pen, 24 - inset, inset, 24 - inset, inset + length);
+        g.DrawLine(pen, inset, 24 - inset - length, inset, 24 - inset);
+        g.DrawLine(pen, inset, 24 - inset, inset + length, 24 - inset);
+        g.DrawLine(pen, 24 - inset - length, 24 - inset, 24 - inset, 24 - inset);
+        g.DrawLine(pen, 24 - inset, 24 - inset, 24 - inset, 24 - inset - length);
+    });
+
     public static Image Settings() => Draw(g =>
     {
         using var pen = Pen(Ink, 2); using var fill = new SolidBrush(Color.FromArgb(70, 98, 145));

@@ -9,7 +9,8 @@ internal enum PersistentPreviewKind
     FullView,
     ThumbnailFast,
     ThumbnailFinal,
-    BrowseThumbnail
+    BrowseThumbnailFast,
+    BrowseThumbnailFinal
 }
 
 /// <summary>
@@ -18,12 +19,16 @@ internal enum PersistentPreviewKind
 /// </summary>
 internal static class PersistentPreviewCache
 {
+    public readonly record struct ClearResult(int FileCount, long Bytes, int FailedCount);
+
     private sealed record Configuration(
         string Root, long FullViewLimitBytes, long ThumbnailLimitBytes);
 
     private const long Megabyte = 1024L * 1024;
     private const long MaximumQuotaMB = 1024L * 1024;
-    private static readonly SemaphoreSlim Writers = new(2, 2);
+    private const int WriterConcurrency = 2;
+    private static readonly SemaphoreSlim Writers = new(
+        WriterConcurrency, WriterConcurrency);
     private static Configuration _configuration = new(
         UserSettings.DefaultPersistentCachePath,
         4096L * Megabyte, 4096L * Megabyte);
@@ -33,19 +38,78 @@ internal static class PersistentPreviewCache
     public static void Configure(
         string? root, int fullViewLimitMB, int thumbnailLimitMB)
     {
-        string resolved;
-        try
-        {
-            resolved = Path.GetFullPath(string.IsNullOrWhiteSpace(root)
-                ? UserSettings.DefaultPersistentCachePath
-                : Environment.ExpandEnvironmentVariables(root.Trim()));
-        }
-        catch { resolved = UserSettings.DefaultPersistentCachePath; }
+        var resolved = ResolveRoot(root);
         Volatile.Write(ref _configuration, new Configuration(
             resolved,
             Math.Clamp((long)fullViewLimitMB, 0, MaximumQuotaMB) * Megabyte,
             Math.Clamp((long)thumbnailLimitMB, 0, MaximumQuotaMB) * Megabyte));
         ScheduleCleanup(force: true);
+    }
+
+    public static async Task<ClearResult> ClearAllAsync(string? root)
+    {
+        var cacheRoot = Path.Combine(ResolveRoot(root), "v2");
+        var acquired = 0;
+        try
+        {
+            // Hold every writer slot so files cannot be created while the cache
+            // tree is being enumerated and removed. This method resumes away from
+            // the caller's UI context before doing filesystem work.
+            for (; acquired < WriterConcurrency; acquired++)
+                await Writers.WaitAsync().ConfigureAwait(false);
+
+            if (!Directory.Exists(cacheRoot)) return new ClearResult(0, 0, 0);
+            var fileCount = 0;
+            var failedCount = 0;
+            var bytes = 0L;
+            foreach (var path in Directory.EnumerateFiles(
+                         cacheRoot, "*", SearchOption.AllDirectories))
+            {
+                try
+                {
+                    var length = 0L;
+                    try { length = new FileInfo(path).Length; }
+                    catch { }
+                    File.Delete(path);
+                    fileCount++;
+                    bytes += length;
+                }
+                catch { failedCount++; }
+            }
+            try
+            {
+                foreach (var directory in Directory.EnumerateDirectories(
+                             cacheRoot, "*", SearchOption.AllDirectories)
+                         .OrderByDescending(path => path.Length))
+                {
+                    try { Directory.Delete(directory, recursive: false); }
+                    catch { }
+                }
+                Directory.Delete(cacheRoot, recursive: false);
+            }
+            catch { }
+            Volatile.Write(ref _lastCleanupTick, 0);
+            return new ClearResult(fileCount, bytes, failedCount);
+        }
+        finally
+        {
+            while (acquired > 0)
+            {
+                Writers.Release();
+                acquired--;
+            }
+        }
+    }
+
+    private static string ResolveRoot(string? root)
+    {
+        try
+        {
+            return Path.GetFullPath(string.IsNullOrWhiteSpace(root)
+                ? UserSettings.DefaultPersistentCachePath
+                : Environment.ExpandEnvironmentVariables(root.Trim()));
+        }
+        catch { return UserSettings.DefaultPersistentCachePath; }
     }
 
     public static bool TryLoad(
@@ -103,6 +167,37 @@ internal static class PersistentPreviewCache
         StoreOwnedCopyInBackground(kind, path, copy);
     }
 
+    public static void StoreEncodedInBackground(
+        PersistentPreviewKind kind, Book book, int pageIndex, Size bounds,
+        int rotation, int quality, byte[] encodedJpeg)
+    {
+        var configuration = Volatile.Read(ref _configuration);
+        if (encodedJpeg.Length == 0 || GetLimit(configuration, kind) <= 0) return;
+        string path;
+        try { path = GetPath(configuration, kind, book, pageIndex, bounds, rotation, quality); }
+        catch { return; }
+        _ = Task.Run(async () =>
+        {
+            await Writers.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (File.Exists(path)) return;
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                try
+                {
+                    await File.WriteAllBytesAsync(temporary, encodedJpeg).ConfigureAwait(false);
+                    try { File.Move(temporary, path, overwrite: false); }
+                    catch (IOException) when (File.Exists(path)) { }
+                }
+                finally { try { File.Delete(temporary); } catch { } }
+                ScheduleCleanup(force: false);
+            }
+            catch { }
+            finally { Writers.Release(); }
+        });
+    }
+
     private static void StoreOwnedCopyInBackground(
         PersistentPreviewKind kind, string path, Bitmap copy)
     {
@@ -138,14 +233,16 @@ internal static class PersistentPreviewCache
     }
 
     public static bool TryLoadBrowse(
-        string sourcePath, Size bounds, out Bitmap? bitmap)
+        string sourcePath, Size bounds, bool fastPreview, int quality,
+        out Bitmap? bitmap)
     {
         bitmap = null;
         var configuration = Volatile.Read(ref _configuration);
         if (configuration.ThumbnailLimitBytes <= 0) return false;
         try
         {
-            var path = GetBrowsePath(configuration, sourcePath, bounds);
+            var path = GetBrowsePath(
+                configuration, sourcePath, bounds, fastPreview, quality);
             if (!File.Exists(path)) return false;
             using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
                 FileShare.ReadWrite | FileShare.Delete, 128 * 1024,
@@ -166,7 +263,8 @@ internal static class PersistentPreviewCache
     }
 
     public static void StoreBrowseCopyInBackground(
-        string sourcePath, Size bounds, Bitmap preview)
+        string sourcePath, Size bounds, bool fastPreview, int quality,
+        Bitmap preview)
     {
         var configuration = Volatile.Read(ref _configuration);
         if (configuration.ThumbnailLimitBytes <= 0) return;
@@ -174,14 +272,21 @@ internal static class PersistentPreviewCache
         try { copy = new Bitmap(preview); }
         catch { return; }
         string path;
-        try { path = GetBrowsePath(configuration, sourcePath, bounds); }
+        try
+        {
+            path = GetBrowsePath(
+                configuration, sourcePath, bounds, fastPreview, quality);
+        }
         catch
         {
             copy.Dispose();
             return;
         }
         StoreOwnedCopyInBackground(
-            PersistentPreviewKind.BrowseThumbnail, path, copy);
+            fastPreview
+                ? PersistentPreviewKind.BrowseThumbnailFast
+                : PersistentPreviewKind.BrowseThumbnailFinal,
+            path, copy);
     }
 
     private static string GetPath(
@@ -207,13 +312,16 @@ internal static class PersistentPreviewCache
         var bucketUnit = kind == PersistentPreviewKind.FullView ? 256 : 32;
         var widthBucket = RoundUp(Math.Max(32, bounds.Width), bucketUnit);
         var heightBucket = RoundUp(Math.Max(32, bounds.Height), bucketUnit);
-        var identity = string.Join('\n', "greader-preview-v2", kind, sourcePath,
+        // v3 invalidates previews produced before the nvJPEG RGBI/BGRI channel
+        // order correction; keeping the same category lets quota cleanup remove
+        // old v2 files normally.
+        var identity = string.Join('\n', "greader-preview-v3-color", kind, sourcePath,
             book.Pages[pageIndex].Name, length, modifiedTicks,
             NormalizeRotation(rotation), widthBucket, heightBucket,
             kind == PersistentPreviewKind.ThumbnailFinal ? quality : 0);
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)))
             .ToLowerInvariant();
-        var extension = kind == PersistentPreviewKind.BrowseThumbnail
+        var extension = IsBrowseKind(kind)
             ? ".png" : ".jpg";
         return Path.Combine(GetCategoryRoot(configuration, kind),
             hash[..2], hash + extension);
@@ -225,7 +333,8 @@ internal static class PersistentPreviewCache
             kind == PersistentPreviewKind.FullView ? "full-view" : "thumbnails");
 
     private static string GetBrowsePath(
-        Configuration configuration, string sourcePath, Size bounds)
+        Configuration configuration, string sourcePath, Size bounds,
+        bool fastPreview, int quality)
     {
         sourcePath = Path.GetFullPath(sourcePath);
         var length = 0L;
@@ -244,12 +353,18 @@ internal static class PersistentPreviewCache
         catch { }
         var widthBucket = RoundUp(Math.Max(32, bounds.Width), 32);
         var heightBucket = RoundUp(Math.Max(32, bounds.Height), 32);
-        var identity = string.Join('\n', "greader-browse-preview-v2", sourcePath,
-            length, modifiedTicks, widthBucket, heightBucket);
+        // Fast and Lanczos contact sheets are independent so a quick placeholder
+        // can never mask a completed full-quality disk entry.
+        var identity = string.Join('\n', "greader-browse-preview-v7-two-stage",
+            fastPreview ? "fast" : "full", sourcePath,
+            length, modifiedTicks, widthBucket, heightBucket,
+            fastPreview ? 0 : quality);
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)))
             .ToLowerInvariant();
         return Path.Combine(GetCategoryRoot(
-            configuration, PersistentPreviewKind.BrowseThumbnail),
+            configuration, fastPreview
+                ? PersistentPreviewKind.BrowseThumbnailFast
+                : PersistentPreviewKind.BrowseThumbnailFinal),
             hash[..2], hash + ".png");
     }
 
@@ -271,7 +386,7 @@ internal static class PersistentPreviewCache
     private static void SaveImage(
         Bitmap bitmap, string path, PersistentPreviewKind kind, long quality)
     {
-        if (kind == PersistentPreviewKind.BrowseThumbnail)
+        if (IsBrowseKind(kind))
         {
             bitmap.Save(path, ImageFormat.Png);
             return;
@@ -288,6 +403,10 @@ internal static class PersistentPreviewCache
             System.Drawing.Imaging.Encoder.Quality, quality);
         bitmap.Save(path, codec, parameters);
     }
+
+    private static bool IsBrowseKind(PersistentPreviewKind kind) =>
+        kind is PersistentPreviewKind.BrowseThumbnailFast or
+            PersistentPreviewKind.BrowseThumbnailFinal;
 
     private static void ScheduleCleanup(bool force)
     {

@@ -54,9 +54,10 @@ internal sealed record PerformanceProfile(
             (logicalCpu + fastWorkers - 1) / fastWorkers, 1, 16);
         var magickThreads = Math.Clamp(
             (logicalCpu + precacheWorkers - 1) / precacheWorkers, 2, 16);
-        // Zoom has only one interactive viewport job in the common case, so it
-        // can spend substantially more cores per image than batch pre-cache.
-        var zoomMagickThreads = Math.Clamp(logicalCpu / 2, 4, 32);
+        // Zoom normally has one latency-sensitive viewport job. Leave one
+        // logical processor available for the UI/OS and give the rest to its
+        // Lanczos render.
+        var zoomMagickThreads = Math.Max(1, logicalCpu - 1);
 
         return new PerformanceProfile(
             checked((int)aheadMB), checked((int)behindMB),

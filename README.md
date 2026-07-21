@@ -12,9 +12,11 @@ The project focuses on immediate interaction: opening, scrolling, page navigatio
 - Automatic single-page display for landscape or unusually wide images
 - Always-fit default view with smooth pointer-anchored zoom and 100% double-click zoom
 - Progressive preview rendering followed by final Lanczos quality
+- Monitor ICC color management enabled by default, including embedded image profiles and automatic profile switching when the window moves between displays
 - Virtualized thumbnail browser that remains practical with thousands of items
 - Folder, archive, and PDF contact sheets generated progressively around the viewport
 - Configurable and automatically optimized worker counts, per-image threads, and cache budgets
+- Automatic optimization assigns Zoom Lanczos all logical processors except one reserved for UI and operating-system responsiveness
 - Animated GIF and animated WebP playback without changing the static-image cache path
 - Drag-and-drop, command-line opening, Explorer integration, and configurable toolbar hotkeys
 
@@ -36,6 +38,7 @@ The project focuses on immediate interaction: opening, scrolling, page navigatio
 - Optionally displays landscape pages as a single page while the reader remains in two-page mode.
 - Places and navigates spreads according to the selected LTR or RTL direction.
 - Uses Left/Right, Home/End, mouse wheel, the bottom position slider, or configurable toolbar shortcuts for navigation.
+- Configurable fullscreen mode removes the toolbar and window chrome; its compact translucent page slider floats over the image without changing layout.
 - Returns to Fit immediately when changing pages from a zoomed view.
 - Copies the current file with `Ctrl+C`; a two-page spread copies both source files.
 
@@ -53,6 +56,7 @@ The project focuses on immediate interaction: opening, scrolling, page navigatio
 
 - Uses a Direct2D virtual grid: only visible cells are drawn, so the control itself does not create thousands of child controls.
 - Single-click selects an item; double-click or `Enter` opens it.
+- Long folder, archive, and PDF names wrap into a centered multi-line label inside the tile instead of being clipped beyond its border.
 - Arrow keys always move the thumbnail selection. Home and End move to the first and last item across folders, archives, PDFs, and images.
 - `Ctrl+mouse wheel` changes the number of images per row.
 - Mouse-wheel and precision-touchpad input scrolls by continuous pixels with browser-style easing instead of fixed lines.
@@ -84,12 +88,14 @@ Folder view keeps the stable group order **Folder → Archive/PDF → Image**, t
 
 At a book boundary, automatic library navigation can be disabled or limited to folders, archives/PDFs, or both. Navigation follows the same grouped and sorted order shown by the parent thumbnail view.
 
+Settings can choose whether moving to the previous book opens its last page or its first page. Moving to the next book continues to open at the first page.
+
 ## Opening and Windows integration
 
 - Open a file or folder from the toolbar.
 - Drag a file or folder onto the window; G Reader activates and takes focus after the drop.
 - Configure a library root and use **Open random** to choose an eligible folder, archive, or PDF recursively.
-- Use **Open in Explorer** to select the current image, or the current archive/PDF source file.
+- Use **Open in Explorer** to select the current image or archive/PDF source file. In Thumbnail view, a selected folder, archive, or PDF tile is selected in Explorer instead.
 - Register G Reader per-user as an available Windows image viewer from Settings.
 - Images launched through the Explorer association always open in full-page, single-page mode.
 - When possible, an image opened from Explorer follows the source Explorer window's current item order; natural numeric ordering is the fallback.
@@ -108,15 +114,23 @@ Command-line examples:
 
 G Reader separates interactive display work from decoding, preview generation, Lanczos resizing, and cache cleanup.
 
+- Embedded ICC metadata and the active Windows monitor profile are read off the UI thread. Direct2D applies cached source-to-monitor transforms on the GPU for full-page, zoom, and image-thumbnail rendering; color management can be disabled in Settings.
+- Changing folders, archives, or PDFs retains decoded and resized pages from recent books as low-priority cache entries. Returning can reuse ready pages, while retained entries are evicted before active-book data whenever the configured memory budget is needed.
 - Full-page presentation and the thumbnail grid use independent Direct2D HWND render targets.
-- Thumbnail images and contact sheets upload lazily into a dedicated GPU texture LRU. Rendering uploads at most four textures per frame both while idle and during active scrolling, allowing visible thumbnails to populate at full speed while the frame-sized cap prevents an unbounded upload burst.
+- Thumbnail images and contact sheets upload lazily into a dedicated GPU texture LRU. An adaptive uploader measures observed transfer throughput and limits each frame by both elapsed upload time and bytes: idle frames receive a larger budget to fill high-resolution grids quickly, while scrolling uses a smaller latency budget to preserve input responsiveness.
+- Continuous touchpad gestures use a paced Direct2D present path (up to 30 FPS) with a 4 ms / minimum 8 MB adaptive upload budget, so Windows paint-message coalescing cannot hide newly completed or newly uploaded thumbnails until scrolling stops. Viewport priority refreshes retain the latest deferred position instead of dropping it inside the throttle interval.
 - Thumbnail labels, placeholders, vector icons, badges, and the overlay scrollbar use DirectWrite/Direct2D rather than GDI+ painting.
 - Static page navigation can reuse a GPU-side LRU of recently uploaded surfaces.
 - Fast previews are scheduled ahead of final-quality Lanczos work.
+- Folder, archive, and PDF contact sheets use the same two-stage policy as image thumbnails: a fast contact sheet appears first, then a separately cached Lanczos contact sheet replaces it. Fast and final entries have independent RAM and persistent-disk identities.
+- PDF contact sheets open and parse a document once per quality pass and rasterize only near the useful output size. Normal PDF reading shares one parsed `PdfDocument` across all page entries instead of reopening the complete file for every pre-cache decode.
 - Large JPEG files request a decoder-scaled DCT source near the useful output resolution, avoiding unnecessary full 45 MP managed bitmaps.
+- Optional NVIDIA nvJPEG decoding keeps a shared CUDA context warm and reuses decoder states, streams, pinned host buffers, and VRAM allocations. Full view, rotated pages, zoom viewport patches, page thumbnails, and folder/archive contact sheets can remain GPU-resident through NPP and CUDA–D3D11 interop. Background batch concurrency is calculated from current free/total VRAM and each source/output image's estimated working set, with 15% (at least 1 GB) kept as headroom and one stream reserved for visible-page and zoom requests; unsupported paths immediately fall back to TurboJPEG rather than delaying the UI.
+- Zoom keeps up to two full-resolution decoded JPEG sources in a bounded VRAM LRU, then generates only newly exposed viewport regions. GPU-created page thumbnails are encoded by nvJPEG before the reduced compressed bytes are sent to the persistent disk cache.
 - JPEG fit/thumbnail rendering first uses the native TurboJPEG 3.1 decoder directly into BGRA memory, bypassing ImageMagick's decode wrapper. Unsupported precision/colorspace or native failures fall back to the established Magick.NET path.
 - JPEG decode is codec-bound and does not scale well inside one image. G Reader therefore converts otherwise-unused per-image thread capacity into additional concurrent JPEG jobs, capped by the machine's logical CPU count. Generic large-image paths retain their configured worker gate to avoid multiplying full-resolution RAM usage.
-- Non-JPEG resize paths pass BGRA buffers directly between System.Drawing and Magick.NET where possible.
+- Non-JPEG thumbnails decode their source once and derive both the immediate fast preview and final Lanczos result before releasing the large source bitmap. Worker gates bound the number of decoded PNG, WebP, BMP, GIF, and TIFF sources resident at once.
+- Non-JPEG and animated paths pass BGRA pixels directly between Magick.NET and System.Drawing, avoiding the previous in-memory BMP encode/decode round trip.
 - Window resizing uses stale-while-revalidate: the previous surface remains visible until fast and final replacements arrive.
 - Decoding, cache discovery, archive scanning, resizing, and bulk disposal stay off the WinForms UI thread.
 - Cancellation callbacks are asynchronous so stale render work does not hold the UI thread.
@@ -146,6 +160,8 @@ Configurable values include:
 - ImageMagick threads per image
 - Zoom-refinement ImageMagick threads
 - Reader background color
+
+The persistent-cache section also provides **Clear all disk cache**. Deletion is confirmed first, runs away from the UI thread, coordinates with active cache writers, and reports the removed file count and size.
 
 The manual defaults use a soft 4,096 MB page-cache target split into 3,072 MB ahead and 1,024 MB behind. Actual automatic values depend on the machine.
 
@@ -225,6 +241,7 @@ Requirements:
 
 - Windows 10 or Windows 11, x64
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)
+- Optional nvJPEG acceleration: an NVIDIA driver plus matching CUDA runtime libraries (`cudart`, `nvjpeg`, and preferably `nppc`/`nppif`) in the application directory, `PATH`, or a CUDA Toolkit `bin` directory. The normal CPU decoder remains available without CUDA.
 
 Restore and build:
 
@@ -275,4 +292,4 @@ The following CDisplayEx-style features are outside this project's scope:
 
 ## Notes
 
-G Reader is a Windows-only application. Image resizing is CPU-based through Magick.NET/ImageMagick, while Direct2D accelerates full-page and thumbnail presentation, scrolling, zooming, and interactive movement. PDF support relies on Windows' built-in PDF APIs.
+G Reader is a Windows-only application. The normal image pipeline uses Magick.NET/ImageMagick on the CPU; the optional nvJPEG/NPP pipeline can decode, resize, cache, and present Full-view JPEG surfaces without leaving GPU memory. Direct2D accelerates full-page and thumbnail presentation, scrolling, zooming, and interactive movement. PDF support relies on Windows' built-in PDF APIs.

@@ -5,6 +5,29 @@ namespace CDisplayEx.CSharp;
 
 internal sealed class AsyncMainForm : Form, IMessageFilter
 {
+    private sealed record RetainedPageCache(PageCache Cache, long LastUsed);
+    private sealed class GeneratedThumbnail(Bitmap? bitmap, GpuRenderedImage? gpu) : IDisposable
+    {
+        public Bitmap? Bitmap { get; private set; } = bitmap;
+        public GpuRenderedImage? Gpu { get; private set; } = gpu;
+        public void Publish(ThumbnailGridView grid, int page, Size size, bool fast)
+        {
+            if (Gpu is { } gpuImage)
+            { Gpu = null; grid.SetThumbnailGpu(page, size, gpuImage, fast); return; }
+            if (Bitmap is { } bitmapImage)
+            { Bitmap = null; grid.SetThumbnail(page, size, bitmapImage, fast); }
+        }
+        public void PublishBrowse(
+            ThumbnailGridView grid, int item, Size size, bool fast)
+        {
+            if (Gpu is { } gpuImage)
+            { Gpu = null; grid.SetBrowsePreviewGpu(item, size, gpuImage, fast); return; }
+            if (Bitmap is { } bitmapImage)
+            { Bitmap = null; grid.SetBrowsePreview(item, size, bitmapImage, fast); }
+        }
+        public void Dispose() { Bitmap?.Dispose(); Gpu?.Dispose(); Bitmap = null; Gpu = null; }
+    }
+    private const int BottomBarHeight = 40;
     private int PrecacheWorkerCount => Math.Clamp(_performance.PrecacheWorkerCount, 1, 64);
     private const long Megabyte = 1024L * 1024;
     private long AheadCacheLimitBytes => Math.Max(0L, _performance.CacheAheadMB) * Megabyte;
@@ -32,7 +55,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         Padding = new Padding(6, 4, 6, 4), BackColor = Color.FromArgb(39, 42, 49),
         ForeColor = Color.FromArgb(232, 236, 244)
     };
-    private readonly Panel _bottomPanel = new() { Height = 40, Dock = DockStyle.Bottom, BackColor = Color.FromArgb(36, 38, 44) };
+    private readonly Panel _bottomPanel = new() { Height = BottomBarHeight, Dock = DockStyle.Bottom, BackColor = Color.FromArgb(36, 38, 44) };
     private readonly PositionSlider _positionSlider = new() { Dock = DockStyle.Fill };
     private readonly Label _loadStatus = new()
     {
@@ -86,6 +109,13 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private readonly object _cacheUiUpdateGate = new();
     private readonly Dictionary<string, ToolStripButton> _toolbarActionButtons = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _toolbarBaseTooltips = new(StringComparer.Ordinal);
+    private readonly object _retainedPageCacheGate = new();
+    private readonly Dictionary<string, RetainedPageCache> _retainedPageCaches =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, Task<byte[]?>>
+        _embeddedColorProfiles = new(StringComparer.OrdinalIgnoreCase);
+    private CancellationTokenSource? _monitorProfileCancellation;
+    private string? _monitorProfileDevice;
 
     private Book? _book;
     private PageCache? _cache;
@@ -136,6 +166,13 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private FormWindowState _lastNonMinimizedState = FormWindowState.Normal;
     private FormBorderStyle _savedBorder;
     private FormWindowState _savedState;
+    private Rectangle _savedBounds;
+    private bool _savedTopMost;
+    private bool _savedToolbarVisible;
+    private bool _savedBottomVisible;
+    private bool _savedThumbnailControlsVisible;
+    private bool _savedThumbnailAddressVisible;
+    private FullscreenSliderOverlay? _fullscreenSliderOverlay;
     private ToolStripMenuItem? _doublePageItem;
     private ToolStripMenuItem? _autoSingleLandscapeItem;
     private ToolStripMenuItem? _directionItem;
@@ -153,6 +190,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private ToolStripButton? _pageLayoutButton;
     private ToolStripButton? _autoSingleLandscapeButton;
     private ToolStripButton? _thumbnailModeButton;
+    private ToolStripButton? _fullscreenButton;
     private ToolStripDropDownButton? _folderSortButton;
     private ToolStripDropDownButton? _archiveSortButton;
 
@@ -166,6 +204,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         PersistentPreviewCache.Configure(
             _settings.PersistentCachePath, _settings.FullViewDiskCacheMB,
             _settings.ThumbnailDiskCacheMB);
+        NvJpegNativeDecoder.Configure(_settings.UseNvJpeg);
         ApplyImageMagickThreadLimit();
         ApplyFastPreviewSchedulerSettings();
         _activePrecacheWorkerCount = PrecacheWorkerCount;
@@ -210,6 +249,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _viewer.FitToScreen = true;
         _viewer.ApplyReaderSettings(_settings.LanczosQuality,
             Color.FromArgb(_settings.BackgroundArgb), PreviewCacheLimitBytes);
+        _viewer.ConfigureColorManagement(_settings.UseMonitorColorProfile, null);
+        _thumbnailGrid.ConfigureColorManagement(_settings.UseMonitorColorProfile, null);
         _thumbnailGrid.SetCacheLimits(
             ThumbnailCacheLimitBytes, ThumbnailFastPreviewCacheLimitBytes);
         _thumbnailGrid.SetInternalPreviewMaxSize(_settings.ThumbnailMaxPreviewSizePx);
@@ -272,19 +313,35 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         {
             UpdateBottomInfoWidth();
             PositionToastOverlay();
+            PositionFullscreenSliderOverlay();
             if (!_fullScreen && WindowState != FormWindowState.Minimized)
                 _lastNonMinimizedState = WindowState;
         };
+        LocationChanged += (_, _) =>
+        {
+            PositionFullscreenSliderOverlay();
+            QueueMonitorColorProfileRefresh();
+        };
         Application.AddMessageFilter(this);
-        FormClosing += (_, _) => { CancelRandomOpenWork(); CancelBookWork(); SaveSettings(); };
+        FormClosing += (_, _) =>
+        {
+            CancelRandomOpenWork();
+            CancelBookWork(retainPageCache: false);
+            DisposeRetainedPageCaches();
+            _viewer.ClearBookCache();
+            SaveSettings();
+        };
         FormClosed += (_, _) =>
         {
+            DisposeFullscreenSliderOverlay(restoreBottomPanel: false);
             _toastTimer.Dispose();
             _wheelDispatchTimer.Dispose();
+            CancelAndDisposeInBackground(_monitorProfileCancellation);
             Application.RemoveMessageFilter(this);
         };
         Shown += (_, _) =>
         {
+            QueueMonitorColorProfileRefresh(force: true);
             if (!string.IsNullOrWhiteSpace(_initialPath)) BeginInvoke(new Action(() => _ = TryOpenAsync(_initialPath)));
         };
     }
@@ -370,6 +427,9 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _pageLayoutButton = AddActionTool(null, "Page layout", ToolbarHotkeyCatalog.PageLayout);
         _autoSingleLandscapeButton = AddActionTool(null, "Auto-single landscape", ToolbarHotkeyCatalog.AutoSingleLandscape);
         _directionButton = AddActionTool(null, "LTR / RTL", ToolbarHotkeyCatalog.ReadingDirection);
+        _fullscreenButton = AddActionTool(
+            ToolbarIconFactory.Fullscreen(false), "Toggle fullscreen",
+            ToolbarHotkeyCatalog.Fullscreen);
         AddActionTool(ToolbarIconFactory.Settings(), "Settings", ToolbarHotkeyCatalog.Settings);
         UpdateNavigationToolbar();
     }
@@ -383,6 +443,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             case ToolbarHotkeyCatalog.OpenRandom: OpenRandomBook(); break;
             case ToolbarHotkeyCatalog.OpenInExplorer: RevealCurrentInExplorer(); break;
             case ToolbarHotkeyCatalog.MoveUp: MoveUp(); break;
+            case ToolbarHotkeyCatalog.PreviousContainer: OpenAdjacentContainer(-1); break;
+            case ToolbarHotkeyCatalog.NextContainer: OpenAdjacentContainer(1); break;
             case ToolbarHotkeyCatalog.Start:
                 if (_thumbnailMode) _thumbnailGrid.MoveToBoundary(end: false);
                 else GoToPage(0);
@@ -397,6 +459,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             case ToolbarHotkeyCatalog.PageLayout: CyclePageLayout(); break;
             case ToolbarHotkeyCatalog.AutoSingleLandscape: ToggleAutoSingleLandscape(); break;
             case ToolbarHotkeyCatalog.ReadingDirection: SetReadingDirection(!_viewer.JapaneseMode); break;
+            case ToolbarHotkeyCatalog.Fullscreen: ToggleFullscreen(); break;
             case ToolbarHotkeyCatalog.Settings: ShowReaderSettings(); break;
         }
     }
@@ -495,17 +558,22 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private void RevealCurrentInExplorer()
     {
         var book = _book;
-        if (book is null || book.Pages.Count == 0) return;
+        if (book is null) return;
 
-        var target = book.SourcePath;
-        if (Directory.Exists(book.SourcePath))
+        // In Thumbnail view the selected browse tile is authoritative. This
+        // also works in a library containing only folders/containers and no
+        // image pages.
+        var target = _thumbnailMode ? _thumbnailGrid.SelectedBrowsePath : null;
+        if (string.IsNullOrWhiteSpace(target)) target = book.SourcePath;
+        if (PathsEqual(target, book.SourcePath) && Directory.Exists(book.SourcePath) &&
+            book.Pages.Count > 0)
         {
             var page = _thumbnailMode ? _thumbnailGrid.SelectedPage : _pageIndex;
             page = Math.Clamp(page, 0, book.Pages.Count - 1);
             target = Path.Combine(book.SourcePath, book.Pages[page].Name);
         }
 
-        if (!File.Exists(target))
+        if (!File.Exists(target) && !Directory.Exists(target))
         {
             MessageBox.Show(this, $"The source file could not be found:\n\n{target}",
                 "Open in Explorer", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -637,7 +705,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         CancelRandomOpenWork();
         CancelBookWork();
         _book = null;
-        _viewer.ClearBookCache();
+        _viewer.RetireBookCache();
         BuildThumbnailPlaceholders();
         _suppressPositionEvent = true;
         _positionSlider.Maximum = 0;
@@ -659,7 +727,9 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             cancellation.Token.ThrowIfCancellationRequested();
             if (_bookCancellation != cancellation) return;
             _book = book;
-            _cache = new PageCache(index => DecodePage(book, index));
+            _cache = TakeRetainedPageCache(book.SourcePath) ??
+                new PageCache(index => DecodePage(book, index));
+            _viewer.ActivateBookCache(book.SourcePath);
             _bookPrecacheStarted = false;
             var preferredIndex = string.IsNullOrWhiteSpace(preferredPageName)
                 ? -1
@@ -733,6 +803,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         var firstIndex = _pageIndex;
         lock (_warmStateGate) _requestedWarmCenter = firstIndex;
         var secondCandidate = GetSecondPageIndex(ignoreAutoSingle: true);
+        _ = UpdateVisibleColorProfilesAsync(book, firstIndex, secondCandidate, cancellation.Token);
         var total = secondCandidate >= 0 ? 2 : 1;
         var cachedLandscape = false;
         var knowsLandscape = !_doublePage || !_autoSingleLandscape ||
@@ -1333,7 +1404,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private void ScheduleRelaxedCacheTrim(PageCache cache)
     {
-        var totalBytes = cache.CachedBytes + _viewer.RenderCacheBytes;
+        var totalBytes = cache.CachedBytes + RetainedPageCacheBytes + _viewer.RenderCacheBytes;
         var previewBytes = _viewer.PreviewCacheBytes;
         var mainNeedsTrim = totalBytes > TotalCacheLimitBytes + CacheCleanupHeadroomBytes;
         var previewHeadroom = PreviewCacheLimitBytes == 0
@@ -1358,7 +1429,11 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 // Re-center at cleanup time. Navigation may have moved while the
                 // grace period was running.
                 var trimCenter = Volatile.Read(ref _requestedWarmCenter);
-                if (cache.CachedBytes + _viewer.RenderCacheBytes >
+                var activeBytes = cache.CachedBytes + _viewer.ActiveRenderCacheBytes;
+                var retainedAllowance = Math.Max(0,
+                    TotalCacheLimitBytes - Math.Min(TotalCacheLimitBytes, activeBytes));
+                TrimRetainedPageCaches(retainedAllowance);
+                if (cache.CachedBytes + RetainedPageCacheBytes + _viewer.RenderCacheBytes >
                     TotalCacheLimitBytes + CacheCleanupHeadroomBytes)
                 {
                     var renderAhead = _viewer.GetDirectionalRenderBytes(trimCenter, true);
@@ -1463,6 +1538,79 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private string GetPageCacheKey(Book book, int index) =>
         $"{book.SourcePath}|{index}|{_rotations.GetValueOrDefault(index)}";
 
+    private string GetEmbeddedProfileKey(Book book, int index) =>
+        $"{book.SourcePath}|{book.Pages[index].Name}";
+
+    private Task<byte[]?> GetEmbeddedColorProfileAsync(
+        Book book, int index, CancellationToken cancellationToken)
+    {
+        if (!_settings.UseMonitorColorProfile || index < 0 || index >= book.Pages.Count)
+            return Task.FromResult<byte[]?>(null);
+        var key = GetEmbeddedProfileKey(book, index);
+        var task = _embeddedColorProfiles.GetOrAdd(key, _ => Task.Run(() =>
+            ColorProfileService.ReadEmbeddedProfile(book.Pages[index], CancellationToken.None)));
+        return task.WaitAsync(cancellationToken);
+    }
+
+    private async Task UpdateVisibleColorProfilesAsync(
+        Book book, int firstIndex, int secondIndex, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var firstTask = GetEmbeddedColorProfileAsync(book, firstIndex, cancellationToken);
+            var secondTask = secondIndex >= 0
+                ? GetEmbeddedColorProfileAsync(book, secondIndex, cancellationToken)
+                : Task.FromResult<byte[]?>(null);
+            await Task.WhenAll(firstTask, secondTask).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (IsDisposed || Disposing) return;
+            BeginInvoke(new Action(() =>
+            {
+                if (!ReferenceEquals(_book, book) || _pageIndex != firstIndex) return;
+                _viewer.SetPageColorProfiles(firstTask.Result, secondTask.Result);
+                _thumbnailGrid.SetPageColorProfile(firstIndex, firstTask.Result);
+                if (secondIndex >= 0)
+                    _thumbnailGrid.SetPageColorProfile(secondIndex, secondTask.Result);
+            }));
+        }
+        catch (OperationCanceledException) { }
+        catch (InvalidOperationException) { }
+    }
+
+    private void QueueMonitorColorProfileRefresh(bool force = false)
+    {
+        if (!IsHandleCreated || IsDisposed || Disposing) return;
+        var device = Screen.FromControl(this).DeviceName;
+        if (!force && string.Equals(device, _monitorProfileDevice,
+                StringComparison.OrdinalIgnoreCase)) return;
+        _monitorProfileDevice = device;
+        CancelAndDisposeInBackground(_monitorProfileCancellation);
+        var cancellation = new CancellationTokenSource();
+        _monitorProfileCancellation = cancellation;
+        if (!_settings.UseMonitorColorProfile)
+        {
+            _viewer.ConfigureColorManagement(false, null);
+            _thumbnailGrid.ConfigureColorManagement(false, null);
+            return;
+        }
+        _ = Task.Run(() => ColorProfileService.ReadMonitorProfile(device), cancellation.Token)
+            .ContinueWith(task =>
+            {
+                if (task.IsCanceled || task.IsFaulted || cancellation.IsCancellationRequested ||
+                    IsDisposed || Disposing) return;
+                try
+                {
+                    BeginInvoke(new Action(() =>
+                    {
+                        if (!ReferenceEquals(_monitorProfileCancellation, cancellation)) return;
+                        _viewer.ConfigureColorManagement(true, task.Result);
+                        _thumbnailGrid.ConfigureColorManagement(true, task.Result);
+                    }));
+                }
+                catch (InvalidOperationException) { }
+            }, TaskScheduler.Default);
+    }
+
 
     private Bitmap DecodePage(Book book, int index)
     {
@@ -1472,11 +1620,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         {
             stream.Position = 0;
             using var magick = new MagickImage(stream);
-            magick.Format = MagickFormat.Bmp;
-            using var converted = new MemoryStream();
-            magick.Write(converted); converted.Position = 0;
-            using var decoded = new Bitmap(converted);
-            return new Bitmap(decoded);
+            return MagickBitmapConverter.ToBitmap(magick);
         }
     }
 
@@ -1495,7 +1639,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             linked.Token).ConfigureAwait(false);
     }
 
-    private async Task<Bitmap> RenderZoomCropAsync(
+    private async Task<ZoomPatchSurface> RenderZoomCropAsync(
         int pageIndex, Rectangle sourceCrop, Size outputSize,
         bool fastPreview, CancellationToken cancellationToken)
     {
@@ -1519,14 +1663,24 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                     : AsyncViewerPanel.CreateLanczosViewport(
                         source, sourceCrop, renderSize, _settings.LanczosQuality, linked.Token),
                 linked.Token).ConfigureAwait(false);
-            if (cachedPreview is not null) return cachedPreview;
+            if (cachedPreview is not null) return new ZoomPatchSurface(cachedPreview, null);
         }
 
-        return await RenderWorkScheduler.RunUrgentAsync(
-            () => EncodedJpegRenderer.RenderViewport(
-                entry, sourceCrop, renderSize, rotation,
-                _settings.LanczosQuality, fastPreview, linked.Token),
+        if (EncodedJpegRenderer.Supports(entry))
+        {
+            var gpu = await RenderWorkScheduler.RunUrgentAsync(() =>
+            {
+                return NvJpegNativeDecoder.TryDecodeViewportToGpu(
+                    entry, sourceCrop, renderSize, rotation, fastPreview,
+                    linked.Token, out var image) ? image : null;
+            }, linked.Token).ConfigureAwait(false);
+            if (gpu is not null) return new ZoomPatchSurface(null, gpu);
+        }
+        var bitmap = await RenderWorkScheduler.RunUrgentAsync(
+            () => EncodedJpegRenderer.RenderViewport(entry, sourceCrop, renderSize,
+                rotation, _settings.LanczosQuality, fastPreview, linked.Token),
             linked.Token).ConfigureAwait(false);
+        return new ZoomPatchSurface(bitmap, null);
     }
 
     private static Bitmap RenderCachedZoomPreview(
@@ -1695,12 +1849,59 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         var remainingPages = remainingWork.Where(work => !work.IsBrowse)
             .Select(work => work.Index).ToArray();
         var loaded = 0;
-        var total = book.Pages.Count * 2 + Math.Min(
-            browseEntries.Length, browseWorkLimit);
+        var browseWorkCount = Math.Min(browseEntries.Length, browseWorkLimit);
+        var total = book.Pages.Count * 2 + browseWorkCount * 2;
         var id = BeginProgress("Loading thumbnail previews...", total, false);
         using var genericFastSlots = new SemaphoreSlim(
             Math.Clamp(_performance.FastPreviewWorkerCount, 1, 64));
         using var genericFullSlots = new SemaphoreSlim(PrecacheWorkerCount);
+
+        async Task GenerateNonJpegThumbnailPairAsync(
+            int page, CancellationToken workerToken)
+        {
+            Bitmap? fast = null;
+            Bitmap? full = null;
+            using var source = await LoadThumbnailSourceAsync(
+                book, page, workerToken).ConfigureAwait(false);
+            try
+            {
+                fast = await RenderWorkScheduler.RunFastAsync(
+                    threads => AsyncViewerPanel.CreateFastThumbnail(
+                        source, targetSize, threads, workerToken), workerToken)
+                    .ConfigureAwait(false);
+                workerToken.ThrowIfCancellationRequested();
+                if (!ReferenceEquals(_book, book) || !_thumbnailMode) return;
+                PersistentPreviewCache.StoreCopyInBackground(
+                    PersistentPreviewKind.ThumbnailFast, book, page, targetSize,
+                    _rotations.GetValueOrDefault(page), quality: 0, fast);
+                _thumbnailGrid.SetThumbnail(page, targetSize, fast, fastPreview: true);
+                fast = null;
+                _thumbnailGrid.SetGenerationState(page, "Generating Lanczos...");
+
+                await genericFullSlots.WaitAsync(workerToken).ConfigureAwait(false);
+                try
+                {
+                    full = await RenderWorkScheduler.RunFullAsync(
+                        () => AsyncViewerPanel.CreateLanczosThumbnail(
+                            source, targetSize, _settings.LanczosQuality, workerToken),
+                        workerToken).ConfigureAwait(false);
+                }
+                finally { genericFullSlots.Release(); }
+                workerToken.ThrowIfCancellationRequested();
+                if (!ReferenceEquals(_book, book) || !_thumbnailMode) return;
+                PersistentPreviewCache.StoreCopyInBackground(
+                    PersistentPreviewKind.ThumbnailFinal, book, page, targetSize,
+                    _rotations.GetValueOrDefault(page), _settings.LanczosQuality, full);
+                _thumbnailGrid.SetThumbnail(page, targetSize, full, fastPreview: false);
+                full = null;
+                _thumbnailGrid.SetGenerationState(page, null);
+            }
+            finally
+            {
+                fast?.Dispose();
+                full?.Dispose();
+            }
+        }
 
         async Task<bool> RunPassAsync(IEnumerable<int> phasePages, bool fastPreview)
         {
@@ -1733,6 +1934,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                         {
                             _thumbnailGrid.SetGenerationState(page,
                                 fastPreview ? "Loading preview…" : "Generating Lanczos…");
+                            _ = UpdateThumbnailColorProfileAsync(book, page, workerToken);
                             var thumbnail = await CreateThumbnailAsync(
                                 book, page, targetSize, fastPreview, workerToken)
                                 .ConfigureAwait(false);
@@ -1741,7 +1943,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                                 thumbnail.Dispose();
                                 return;
                             }
-                            _thumbnailGrid.SetThumbnail(page, targetSize, thumbnail, fastPreview);
+                            thumbnail.Publish(_thumbnailGrid, page, targetSize, fastPreview);
                             _thumbnailGrid.SetGenerationState(page, null);
                         }
                         var current = Interlocked.Increment(ref loaded);
@@ -1793,11 +1995,13 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                         }
                         if (work.IsBrowse)
                         {
-                            if (!_thumbnailGrid.HasBrowsePreview(work.Index, targetSize))
+                            if (!_thumbnailGrid.HasBrowseFullPreview(work.Index, targetSize) &&
+                                !_thumbnailGrid.HasBrowseFastPreview(work.Index, targetSize))
                             {
                                 var entry = browseEntries[work.Index];
                                 var preview = await CreateBrowseThumbnailAsync(
-                                    entry.Path, targetSize, workerToken).ConfigureAwait(false);
+                                    entry.Path, targetSize, fastPreview: true, workerToken)
+                                    .ConfigureAwait(false);
                                 if (preview is not null)
                                 {
                                     if (cancellation.IsCancellationRequested ||
@@ -1806,8 +2010,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                                         preview.Dispose();
                                         return;
                                     }
-                                    _thumbnailGrid.SetBrowsePreview(
-                                        work.Index, targetSize, preview);
+                                    preview.PublishBrowse(
+                                        _thumbnailGrid, work.Index, targetSize, fast: true);
                                 }
                             }
                         }
@@ -1818,6 +2022,16 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                                 !_thumbnailGrid.HasFastPreview(page, targetSize))
                             {
                                 _thumbnailGrid.SetGenerationState(page, "Loading preview...");
+                                _ = UpdateThumbnailColorProfileAsync(book, work.Index, workerToken);
+                                if (!encodedPage)
+                                {
+                                    await GenerateNonJpegThumbnailPairAsync(
+                                        page, workerToken).ConfigureAwait(false);
+                                    var pairedCurrent = Interlocked.Increment(ref loaded);
+                                    ReportThumbnailProgress(id, pairedCurrent, total,
+                                        $"Fast previews {pairedCurrent}/{total}");
+                                    return;
+                                }
                                 var thumbnail = await CreateThumbnailAsync(
                                     book, page, targetSize, fastPreview: true, workerToken)
                                     .ConfigureAwait(false);
@@ -1827,8 +2041,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                                     thumbnail.Dispose();
                                     return;
                                 }
-                                _thumbnailGrid.SetThumbnail(
-                                    page, targetSize, thumbnail, fastPreview: true);
+                                thumbnail.Publish(
+                                    _thumbnailGrid, page, targetSize, fast: true);
                                 _thumbnailGrid.SetGenerationState(page, null);
                             }
                         }
@@ -1856,12 +2070,67 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             return !cancellation.IsCancellationRequested;
         }
 
+        async Task<bool> RunBrowseFullPassAsync(
+            IEnumerable<ThumbnailPreviewWorkItem> phaseWork)
+        {
+            var browseWork = phaseWork.Where(work => work.IsBrowse).ToArray();
+            try
+            {
+                await Parallel.ForEachAsync(browseWork, new ParallelOptions
+                {
+                    // A contact sheet decodes up to four sources. Keep the outer
+                    // concurrency at the configured batch-worker count while each
+                    // image can use its configured Lanczos threads internally.
+                    MaxDegreeOfParallelism = PrecacheWorkerCount,
+                    CancellationToken = cancellation.Token
+                }, async (work, workerToken) =>
+                {
+                    try
+                    {
+                        workerToken.ThrowIfCancellationRequested();
+                        if (!_thumbnailGrid.HasBrowseFullPreview(work.Index, targetSize))
+                        {
+                            var entry = browseEntries[work.Index];
+                            var preview = await CreateBrowseThumbnailAsync(
+                                entry.Path, targetSize, fastPreview: false, workerToken)
+                                .ConfigureAwait(false);
+                            if (preview is not null)
+                            {
+                                if (cancellation.IsCancellationRequested ||
+                                    !ReferenceEquals(_book, book) || !_thumbnailMode)
+                                {
+                                    preview.Dispose();
+                                    return;
+                                }
+                                preview.PublishBrowse(
+                                    _thumbnailGrid, work.Index, targetSize, fast: false);
+                            }
+                        }
+                        var current = Interlocked.Increment(ref loaded);
+                        ReportThumbnailProgress(id, current, total,
+                            $"Lanczos contact sheets {current}/{total}");
+                    }
+                    catch (OperationCanceledException) { }
+                    catch
+                    {
+                        var current = Interlocked.Increment(ref loaded);
+                        ReportThumbnailProgress(id, current, total,
+                            $"Contact sheets {current}/{total}");
+                    }
+                }).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { return false; }
+            return !cancellation.IsCancellationRequested;
+        }
+
         // Visible/nearby cells get both stages first. The remaining book receives
         // fast placeholders before its slower Lanczos pass. Browse contact sheets
         // and image placeholders share one ordered worker queue.
         if (!await RunUnifiedFastPassAsync(priorityWork)) return;
+        if (!await RunBrowseFullPassAsync(priorityWork)) return;
         if (!await RunPassAsync(priorityPages, fastPreview: false)) return;
         if (!await RunUnifiedFastPassAsync(remainingWork)) return;
+        if (!await RunBrowseFullPassAsync(remainingWork)) return;
         if (!await RunPassAsync(remainingPages, fastPreview: false)) return;
         if (!cancellation.IsCancellationRequested) EndProgress(id, "Thumbnails ready");
     }
@@ -1876,6 +2145,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private async Task RunVisibleThumbnailRefreshLoopAsync()
     {
+        var attempted = new HashSet<ThumbnailPreviewWorkItem>();
         try
         {
             while (_visibleThumbnailRefreshPending)
@@ -1889,7 +2159,18 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 // overscan, so sampling it during scrolling remains O(viewport)
                 // even when a folder contains many thousands of entries.
                 var targetSize = _thumbnailGrid.RenderTargetSize;
-                var visibleWork = _thumbnailGrid.GetVisiblePreviewPriorityOrder();
+                var allVisibleWork = _thumbnailGrid.GetVisiblePreviewPriorityOrder();
+                var missingVisibleWork = allVisibleWork.Where(work =>
+                        !attempted.Contains(work) && (work.IsBrowse
+                            ? !_thumbnailGrid.HasBrowseFullPreview(work.Index, targetSize) &&
+                              !_thumbnailGrid.HasBrowseFastPreview(work.Index, targetSize)
+                            : !_thumbnailGrid.HasFullThumbnail(work.Index, targetSize) &&
+                              !_thumbnailGrid.HasFastPreview(work.Index, targetSize)))
+                    .ToArray();
+                var batchSize = Math.Clamp(
+                    _performance.FastPreviewWorkerCount * 2, 2, 16);
+                var hasMoreVisibleWork = missingVisibleWork.Length > batchSize;
+                var visibleWork = missingVisibleWork.Take(batchSize).ToArray();
                 if (visibleWork.Length == 0) continue;
                 var visibleBrowseEntries = visibleWork
                     .Where(work => work.IsBrowse)
@@ -1913,10 +2194,11 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                             {
                                 if (!visibleBrowseEntries.TryGetValue(
                                         work.Index, out var browseEntry) ||
-                                    _thumbnailGrid.HasBrowsePreview(work.Index, targetSize))
+                                    _thumbnailGrid.HasBrowseFullPreview(work.Index, targetSize) ||
+                                    _thumbnailGrid.HasBrowseFastPreview(work.Index, targetSize))
                                     return;
                                 var preview = await CreateBrowseThumbnailAsync(
-                                    browseEntry.Path, targetSize, workerToken)
+                                    browseEntry.Path, targetSize, fastPreview: true, workerToken)
                                     .ConfigureAwait(false);
                                 if (preview is null) return;
                                 if (workerToken.IsCancellationRequested || !_thumbnailMode ||
@@ -1925,8 +2207,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                                     preview.Dispose();
                                     return;
                                 }
-                                _thumbnailGrid.SetBrowsePreview(
-                                    work.Index, targetSize, preview);
+                                preview.PublishBrowse(
+                                    _thumbnailGrid, work.Index, targetSize, fast: true);
                                 return;
                             }
 
@@ -1934,6 +2216,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                             if (_thumbnailGrid.HasFullThumbnail(page, targetSize) ||
                                 _thumbnailGrid.HasFastPreview(page, targetSize)) return;
                             _thumbnailGrid.SetGenerationState(page, "Loading preview...");
+                            _ = UpdateThumbnailColorProfileAsync(book, page, workerToken);
                             var thumbnail = await CreateThumbnailAsync(
                                 book, page, targetSize, fastPreview: true, workerToken)
                                 .ConfigureAwait(false);
@@ -1943,8 +2226,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                                 thumbnail.Dispose();
                                 return;
                             }
-                            _thumbnailGrid.SetThumbnail(
-                                page, targetSize, thumbnail, fastPreview: true);
+                            thumbnail.Publish(
+                                _thumbnailGrid, page, targetSize, fast: true);
                             _thumbnailGrid.SetGenerationState(page, null);
                         }
                         catch (OperationCanceledException) { }
@@ -1955,6 +2238,10 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                                     work.Index, "Preview unavailable");
                         }
                     });
+                    foreach (var work in visibleWork) attempted.Add(work);
+                    if (hasMoreVisibleWork && _thumbnailMode &&
+                        ReferenceEquals(_book, book))
+                        _visibleThumbnailRefreshPending = true;
                 }
                 catch (OperationCanceledException) { return; }
             }
@@ -1988,28 +2275,60 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         }, cancellationToken).ConfigureAwait(false);
     }
 
-    private static async Task<Bitmap?> CreateBrowseThumbnailAsync(
-        string path, Size targetSize, CancellationToken cancellationToken)
+    private async Task<GeneratedThumbnail?> CreateBrowseThumbnailAsync(
+        string path, Size targetSize, bool fastPreview,
+        CancellationToken cancellationToken)
     {
         var cached = await Task.Run(() =>
         {
             cancellationToken.ThrowIfCancellationRequested();
             return PersistentPreviewCache.TryLoadBrowse(
-                path, targetSize, out var bitmap) ? bitmap : null;
+                path, targetSize, fastPreview, _settings.LanczosQuality,
+                out var bitmap) ? bitmap : null;
         }, cancellationToken).ConfigureAwait(false);
-        if (cached is not null) return cached;
+        if (cached is not null) return new GeneratedThumbnail(cached, null);
 
-        var preview = await RenderWorkScheduler.RunFastAsync(
-            threads => BrowsePreviewRenderer.Create(
-                path, targetSize, threads, cancellationToken),
-            cancellationToken).ConfigureAwait(false);
+        if (fastPreview)
+        {
+            var gpu = await RenderWorkScheduler.RunFastCodecAsync(
+                () => BrowsePreviewRenderer.CreateGpu(
+                    path, targetSize, fastPreview: true,
+                    _settings.LanczosQuality, cancellationToken),
+                cancellationToken).ConfigureAwait(false);
+            if (gpu is not null) return new GeneratedThumbnail(null, gpu);
+        }
+
+        var preview = fastPreview
+            ? await RenderWorkScheduler.RunFastAsync(
+                threads => BrowsePreviewRenderer.Create(
+                    path, targetSize, threads, fastPreview: true,
+                    _settings.LanczosQuality, cancellationToken),
+                cancellationToken).ConfigureAwait(false)
+            : await RenderWorkScheduler.RunFullAsync(
+                () => BrowsePreviewRenderer.Create(
+                    path, targetSize, _performance.ImageMagickThreadsPerImage,
+                    fastPreview: false, _settings.LanczosQuality, cancellationToken),
+                cancellationToken).ConfigureAwait(false);
         if (preview is not null)
             PersistentPreviewCache.StoreBrowseCopyInBackground(
-                path, targetSize, preview);
-        return preview;
+                path, targetSize, fastPreview, _settings.LanczosQuality, preview);
+        return preview is null ? null : new GeneratedThumbnail(preview, null);
     }
 
-    private async Task<Bitmap> CreateThumbnailAsync(
+    private async Task UpdateThumbnailColorProfileAsync(
+        Book book, int page, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var profile = await GetEmbeddedColorProfileAsync(
+                book, page, cancellationToken).ConfigureAwait(false);
+            if (cancellationToken.IsCancellationRequested || !ReferenceEquals(_book, book)) return;
+            _thumbnailGrid.SetPageColorProfile(page, profile);
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    private async Task<GeneratedThumbnail> CreateThumbnailAsync(
         Book book, int page, Size targetSize, bool fastPreview,
         CancellationToken cancellationToken)
     {
@@ -2026,11 +2345,28 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 persistentKind, book, page, targetSize, rotation,
                 persistentQuality, out var bitmap) ? bitmap : null;
         }, cancellationToken).ConfigureAwait(false);
-        if (cached is not null) return cached;
+        if (cached is not null) return new GeneratedThumbnail(cached, null);
 
         Bitmap result;
         if (EncodedJpegRenderer.Supports(entry))
         {
+            var gpuRendered = fastPreview
+                ? await RenderWorkScheduler.RunFastCodecAsync(
+                    () => EncodedJpegRenderer.RenderThumbnailGpu(
+                        entry, targetSize, rotation, fastPreview: true, jpegQuality: 82,
+                        cancellationToken), cancellationToken).ConfigureAwait(false)
+                : await RenderWorkScheduler.RunFullAsync(
+                    () => EncodedJpegRenderer.RenderThumbnailGpu(
+                        entry, targetSize, rotation, fastPreview: false, jpegQuality: 92,
+                        cancellationToken), cancellationToken).ConfigureAwait(false);
+            if (gpuRendered is { } direct)
+            {
+                if (direct.Image.TakeEncodedJpeg() is { Length: > 0 } encoded)
+                    PersistentPreviewCache.StoreEncodedInBackground(
+                        persistentKind, book, page, targetSize, rotation,
+                        persistentQuality, encoded);
+                return new GeneratedThumbnail(null, direct.Image);
+            }
             var rendered = fastPreview
                 ? await RenderWorkScheduler.RunFastCodecAsync(
                     () => EncodedJpegRenderer.RenderThumbnail(
@@ -2070,7 +2406,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         PersistentPreviewCache.StoreCopyInBackground(
             persistentKind, book, page, targetSize, rotation,
             persistentQuality, result);
-        return result;
+        return new GeneratedThumbnail(result, null);
     }
 
     private int GetSecondPageIndex(bool ignoreAutoSingle = false)
@@ -2272,6 +2608,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         SetToolImage(_pageLayoutButton, ToolbarIconFactory.PageLayout(layoutMode));
         SetToolImage(_autoSingleLandscapeButton, ToolbarIconFactory.AutoSingleLandscape(_autoSingleLandscape));
         SetToolImage(_thumbnailModeButton, ToolbarIconFactory.ThumbnailMode(_thumbnailMode));
+        SetToolImage(_fullscreenButton, ToolbarIconFactory.Fullscreen(_fullScreen));
         SetActionTooltip(_startButton, rtl ? "Start — first page (RTL)" : "Start — first page (LTR)");
         SetActionTooltip(_leftButton, rtl ? "Left — next page" : "Left — previous page");
         SetActionTooltip(_rightButton, rtl ? "Right — previous page" : "Right — next page");
@@ -2298,6 +2635,9 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 ? "View mode: Thumbnail grid (click for Full page)"
                 : "View mode: Full page (click for Thumbnail grid)");
         }
+        if (_fullscreenButton is not null)
+            SetActionTooltip(_fullscreenButton,
+                _fullScreen ? "Exit fullscreen" : "Enter fullscreen");
         RefreshToolbarHotkeyTooltips();
     }
 
@@ -2484,7 +2824,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private void UpdateBottomInfoWidth() =>
         _loadStatus.Width = Math.Clamp((int)Math.Round(ClientSize.Width * 0.56), 320, 620);
 
-    private void CancelBookWork()
+    private void CancelBookWork(bool retainPageCache = true)
     {
         _viewerRendering = false;
         Interlocked.Increment(ref _fileInfoVersion);
@@ -2506,7 +2846,78 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _bookCancellation = null;
         var cache = _cache;
         _cache = null;
-        if (cache is not null) _ = Task.Run(cache.Dispose);
+        if (cache is not null)
+        {
+            if (retainPageCache && _book is { } book)
+                RetainPageCache(book.SourcePath, cache);
+            else
+                _ = Task.Run(cache.Dispose);
+        }
+    }
+
+    private string GetPageCachePoolKey(string sourcePath) => string.Join("|",
+        Path.GetFullPath(sourcePath),
+        (int)_settings.FolderPageSort, _settings.FolderPageSortDescending,
+        (int)_settings.ArchivePageSort, _settings.ArchivePageSortDescending);
+
+    private void RetainPageCache(string sourcePath, PageCache cache)
+    {
+        PageCache? replaced = null;
+        lock (_retainedPageCacheGate)
+        {
+            var key = GetPageCachePoolKey(sourcePath);
+            if (_retainedPageCaches.Remove(key, out var old)) replaced = old.Cache;
+            _retainedPageCaches[key] = new RetainedPageCache(cache, Environment.TickCount64);
+        }
+        if (replaced is not null && !ReferenceEquals(replaced, cache))
+            _ = Task.Run(replaced.Dispose);
+    }
+
+    private PageCache? TakeRetainedPageCache(string sourcePath)
+    {
+        lock (_retainedPageCacheGate)
+        {
+            var key = GetPageCachePoolKey(sourcePath);
+            if (!_retainedPageCaches.Remove(key, out var retained)) return null;
+            return retained.Cache;
+        }
+    }
+
+    private long RetainedPageCacheBytes
+    {
+        get
+        {
+            lock (_retainedPageCacheGate)
+                return _retainedPageCaches.Values.Sum(item => item.Cache.CachedBytes);
+        }
+    }
+
+    private void TrimRetainedPageCaches(long maximumRetainedBytes)
+    {
+        List<PageCache> dispose = [];
+        lock (_retainedPageCacheGate)
+        {
+            var bytes = _retainedPageCaches.Values.Sum(item => item.Cache.CachedBytes);
+            foreach (var pair in _retainedPageCaches.OrderBy(pair => pair.Value.LastUsed).ToArray())
+            {
+                if (bytes <= maximumRetainedBytes) break;
+                if (!_retainedPageCaches.Remove(pair.Key, out var removed)) continue;
+                bytes -= removed.Cache.CachedBytes;
+                dispose.Add(removed.Cache);
+            }
+        }
+        foreach (var cache in dispose) cache.Dispose();
+    }
+
+    private void DisposeRetainedPageCaches()
+    {
+        PageCache[] caches;
+        lock (_retainedPageCacheGate)
+        {
+            caches = _retainedPageCaches.Values.Select(item => item.Cache).ToArray();
+            _retainedPageCaches.Clear();
+        }
+        foreach (var cache in caches) cache.Dispose();
     }
 
     private void CancelThumbnailWork()
@@ -2654,25 +3065,36 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private void OpenAdjacentBook(int direction)
     {
         _viewer.ReturnToFit();
-        if (_settings.AutoMoveMode == 0 || _book is null ||
+        var mode = Math.Clamp(_settings.AutoMoveMode, 0, 3);
+        if (mode == 0 || _book is null ||
             Interlocked.CompareExchange(ref _adjacentBookOpening, 1, 0) != 0) return;
-        _ = OpenAdjacentBookAsync(Math.Sign(direction));
+        _ = OpenAdjacentBookAsync(Math.Sign(direction), mode);
     }
 
-    private async Task OpenAdjacentBookAsync(int direction)
+    private void OpenAdjacentContainer(int direction)
+    {
+        _viewer.ReturnToFit();
+        if (_book is null ||
+            Interlocked.CompareExchange(ref _adjacentBookOpening, 1, 0) != 0) return;
+        // Explicit navigation always includes both folders and archives/PDFs,
+        // independently from the automatic book-boundary preference.
+        _ = OpenAdjacentBookAsync(Math.Sign(direction), mode: 3);
+    }
+
+    private async Task OpenAdjacentBookAsync(int direction, int mode)
     {
         var currentBook = _book;
         try
         {
             if (currentBook is null || direction == 0) return;
             var sourcePath = currentBook.SourcePath;
-            var mode = Math.Clamp(_settings.AutoMoveMode, 0, 3);
             var folderSort = NormalizeSortMode(_settings.FolderPageSort);
             var descending = _settings.FolderPageSortDescending;
             var nextPath = await Task.Run(() => FindAdjacentBook(
                 sourcePath, direction, mode, folderSort, descending));
             if (nextPath is null || !ReferenceEquals(_book, currentBook)) return;
-            await TryOpenAsync(nextPath, openAtEnd: direction < 0);
+            await TryOpenAsync(nextPath,
+                openAtEnd: direction < 0 && _settings.PreviousBookOpensLastPage);
         }
         catch (IOException) { }
         catch (UnauthorizedAccessException) { }
@@ -2717,18 +3139,123 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     {
         if (!_fullScreen)
         {
+            var fullscreenBounds = Screen.FromControl(this).Bounds;
             _savedBorder = FormBorderStyle;
             _savedState = WindowState;
+            _savedBounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+            _savedTopMost = TopMost;
+            _savedToolbarVisible = _toolbar.Visible;
+            _savedBottomVisible = _bottomPanel.Visible;
+            _savedThumbnailControlsVisible = _thumbnailControls.Visible;
+            _savedThumbnailAddressVisible = _thumbnailAddressPanel.Visible;
             _fullScreen = true;
+            _toolbar.Visible = false;
+            _menu.Visible = false;
+            _thumbnailControls.Visible = false;
+            _thumbnailAddressPanel.Visible = false;
+            WindowState = FormWindowState.Normal;
             FormBorderStyle = FormBorderStyle.None;
-            WindowState = FormWindowState.Maximized;
+            Bounds = fullscreenBounds;
+            TopMost = true;
+            // Changing FormBorderStyle can recreate the HWND. Rebind Raw Input
+            // to the final fullscreen handle instead of relying on the timing
+            // of OnHandleCreated during that transition.
+            if (IsHandleCreated) RawMouseWheelInput.Register(Handle);
+            ShowFullscreenSliderOverlay();
+            RestoreFullscreenKeyboardFocus();
+            BeginInvoke(new Action(() =>
+            {
+                if (_fullScreen && IsHandleCreated)
+                    RawMouseWheelInput.Register(Handle);
+            }));
         }
         else
         {
             _fullScreen = false;
+            DisposeFullscreenSliderOverlay(restoreBottomPanel: true);
+            TopMost = _savedTopMost;
+            WindowState = FormWindowState.Normal;
             FormBorderStyle = _savedBorder;
+            Bounds = _savedBounds;
             WindowState = _savedState;
+            _toolbar.Visible = _savedToolbarVisible;
+            _bottomPanel.Visible = _savedBottomVisible;
+            _thumbnailControls.Visible = _savedThumbnailControlsVisible;
+            _thumbnailAddressPanel.Visible = _savedThumbnailAddressVisible;
         }
+        UpdateNavigationToolbar();
+        PerformLayout();
+        _viewer.PerformLayout();
+        if (!_thumbnailMode) _ = ShowPageAsync();
+    }
+
+    private void ShowFullscreenSliderOverlay()
+    {
+        DisposeFullscreenSliderOverlay(restoreBottomPanel: true);
+        if (!_savedBottomVisible) return;
+
+        Controls.Remove(_bottomPanel);
+        _bottomPanel.Dock = DockStyle.Fill;
+        _bottomPanel.Visible = true;
+        var overlay = new FullscreenSliderOverlay();
+        overlay.Controls.Add(_bottomPanel);
+        _fullscreenSliderOverlay = overlay;
+        PositionFullscreenSliderOverlay();
+        overlay.Show(this);
+        PositionFullscreenSliderOverlay();
+        RestoreFullscreenKeyboardFocus();
+    }
+
+    private void RestoreFullscreenKeyboardFocus()
+    {
+        if (!_fullScreen || IsDisposed || Disposing) return;
+        Activate();
+        if (_thumbnailMode) _thumbnailGrid.Focus();
+        else _viewer.Focus();
+        if (!IsHandleCreated) return;
+        BeginInvoke(new Action(() =>
+        {
+            if (!_fullScreen || IsDisposed || Disposing) return;
+            Activate();
+            if (_thumbnailMode) _thumbnailGrid.Focus();
+            else _viewer.Focus();
+        }));
+    }
+
+    private void PositionFullscreenSliderOverlay()
+    {
+        var overlay = _fullscreenSliderOverlay;
+        if (!_fullScreen || overlay is null || overlay.IsDisposed ||
+            !IsHandleCreated) return;
+        try
+        {
+            var client = RectangleToScreen(ClientRectangle);
+            // The panel is Dock.Fill inside the layered form, so its current
+            // Height equals the overlay's previous client height and must never
+            // be used to size that overlay (it caused a self-sustaining ~300 px bar).
+            var height = LogicalToDeviceUnits(BottomBarHeight);
+            overlay.Bounds = new Rectangle(
+                client.Left, client.Bottom - height, client.Width, height);
+        }
+        catch (InvalidOperationException) { }
+    }
+
+    private void DisposeFullscreenSliderOverlay(bool restoreBottomPanel)
+    {
+        var overlay = _fullscreenSliderOverlay;
+        _fullscreenSliderOverlay = null;
+        if (overlay is not null)
+        {
+            if (overlay.Controls.Contains(_bottomPanel))
+                overlay.Controls.Remove(_bottomPanel);
+            overlay.Hide();
+            overlay.Dispose();
+        }
+        if (!restoreBottomPanel || IsDisposed || Disposing) return;
+        if (!Controls.Contains(_bottomPanel)) Controls.Add(_bottomPanel);
+        _bottomPanel.Dock = DockStyle.Bottom;
+        _bottomPanel.Height = BottomBarHeight;
+        _bottomPanel.BringToFront();
     }
 
     private void ScrollViewer(int dx, int dy)
@@ -2751,12 +3278,17 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     {
         var shortcut = ToolbarHotkeyCatalog.Normalize(keyData);
         var keyCode = shortcut & Keys.KeyCode;
-        var moveUpShortcut = ToolbarHotkeyCatalog.GetShortcut(
-            _settings.ToolbarHotkeys, ToolbarHotkeyCatalog.MoveUp);
-        if (moveUpShortcut != Keys.None && shortcut == moveUpShortcut)
+        // These commands may intentionally use modified arrow keys, so they
+        // must run before Thumbnail view takes ownership of all arrow keys.
+        foreach (var actionId in ToolbarHotkeyCatalog.ThumbnailArrowPriorityActions)
         {
-            ExecuteToolbarAction(ToolbarHotkeyCatalog.MoveUp);
-            return true;
+            var actionShortcut = ToolbarHotkeyCatalog.GetShortcut(
+                _settings.ToolbarHotkeys, actionId);
+            if (actionShortcut != Keys.None && shortcut == actionShortcut)
+            {
+                ExecuteToolbarAction(actionId);
+                return true;
+            }
         }
         if (_thumbnailMode && shortcut == Keys.Enter &&
             !_thumbnailAddressBox.ContainsFocus)
@@ -2802,12 +3334,27 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     public bool PreFilterMessage(ref Message message)
     {
         const int WmMouseWheel = 0x020A;
-        if (message.Msg != WmMouseWheel || _book is null ||
-            !IsPointOverReader(Cursor.Position)) return false;
+        if (message.Msg != WmMouseWheel || _book is null) return false;
+
+        // Fullscreen owns the monitor area but may have two top-level HWNDs
+        // (the reader and its translucent slider). Do not depend on focus or
+        // WindowFromPoint parentage here: either can briefly report the owned
+        // overlay as unrelated and silently consume every wheel message.
+        if (_fullScreen && IsPointOverFullscreenReader(Cursor.Position))
+        {
+            // Use the regular wheel message while focused. This preserves
+            // precision-touchpad deltas and works for both the reader surface
+            // and the owned fullscreen slider overlay.
+            var delta = unchecked((short)((message.WParam.ToInt64() >> 16) & 0xffff));
+            if (delta != 0) OnHoveredMouseWheel(delta);
+            return true;
+        }
+
+        if (!IsPointOverReader(Cursor.Position)) return false;
 
         // Focused input uses the standard message so precision-touchpad deltas
         // are preserved. Raw Input remains the asynchronous unfocused fallback.
-        if (ContainsFocus || Form.ActiveForm == this)
+        if (HasReaderInputFocus())
         {
             var delta = unchecked((short)((message.WParam.ToInt64() >> 16) & 0xffff));
             if (delta != 0) OnHoveredMouseWheel(delta);
@@ -2829,12 +3376,25 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     protected override void WndProc(ref Message message)
     {
+        const int wmDisplayChange = 0x007E;
+        const int wmSettingChange = 0x001A;
+        const int wmColorSpaceChange = 0x0320;
         if (message.Msg == RawMouseWheelInput.WindowMessage &&
-            !ContainsFocus && Form.ActiveForm != this &&
-            RawMouseWheelInput.TryGetWheelDelta(message.LParam, out var delta) &&
-            IsPointOverReader(Cursor.Position))
-            OnHoveredMouseWheel(delta);
+            RawMouseWheelInput.TryGetWheelDelta(message.LParam, out var delta))
+        {
+            // Standard WM_MOUSEWHEEL is authoritative while fullscreen is
+            // focused. Raw Input is only the unfocused hover fallback, which
+            // avoids processing one physical wheel movement twice.
+            if (!_fullScreen && !HasReaderInputFocus() && IsPointOverReader(Cursor.Position))
+                OnHoveredMouseWheel(delta);
+        }
         base.WndProc(ref message);
+        if (message.Msg is wmDisplayChange or wmSettingChange or wmColorSpaceChange)
+        {
+            _monitorProfileDevice = null;
+            try { BeginInvoke(new Action(() => QueueMonitorColorProfileRefresh(force: true))); }
+            catch (InvalidOperationException) { }
+        }
     }
 
     private void OnHoveredMouseWheel(int delta)
@@ -2852,9 +3412,27 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         QueueWheelDispatch();
     }
 
-    private bool IsPointOverReader(Point screenPoint) => IsHandleCreated &&
-        RectangleToScreen(ClientRectangle).Contains(screenPoint) &&
-        RawMouseWheelInput.IsWindowOrChildAtPoint(Handle, screenPoint);
+    private bool HasReaderInputFocus() => ContainsFocus || Form.ActiveForm == this ||
+        _fullscreenSliderOverlay is { IsDisposed: false } overlay &&
+        Form.ActiveForm == overlay;
+
+    private bool IsPointOverReader(Point screenPoint)
+    {
+        if (IsHandleCreated && RectangleToScreen(ClientRectangle).Contains(screenPoint) &&
+            RawMouseWheelInput.IsWindowOrChildAtPoint(Handle, screenPoint)) return true;
+        var overlay = _fullscreenSliderOverlay;
+        return _fullScreen && overlay is { IsDisposed: false, IsHandleCreated: true } &&
+            overlay.Bounds.Contains(screenPoint) &&
+            RawMouseWheelInput.IsWindowOrChildAtPoint(overlay.Handle, screenPoint);
+    }
+
+    private bool IsPointOverFullscreenReader(Point screenPoint)
+    {
+        if (!_fullScreen) return false;
+        if (Bounds.Contains(screenPoint)) return true;
+        var overlay = _fullscreenSliderOverlay;
+        return overlay is { IsDisposed: false } && overlay.Bounds.Contains(screenPoint);
+    }
 
     private void QueueWheelDispatch()
     {
@@ -2873,7 +3451,12 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     {
         var delta = Interlocked.Exchange(ref _pendingWheelDelta, 0);
         var columnDelta = Interlocked.Exchange(ref _pendingThumbnailColumnWheelDelta, 0);
-        if (_book is not null && !OwnedForms.Any(form => form.Visible))
+        // The translucent fullscreen slider is an owned form for z-order only;
+        // it must not be treated as a modal popup. Previously this condition
+        // discarded every queued wheel delta for the entire fullscreen session.
+        var hasBlockingOwnedWindow = OwnedForms.Any(form =>
+            form.Visible && !ReferenceEquals(form, _fullscreenSliderOverlay));
+        if (_book is not null && !hasBlockingOwnedWindow)
         {
             if (_thumbnailMode)
             {
@@ -2951,8 +3534,14 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
 
         var qualityChanged = _settings.LanczosQuality != dialog.LanczosQuality;
+        var nvJpegChanged = _settings.UseNvJpeg != dialog.UseNvJpeg;
+        var colorManagementChanged =
+            _settings.UseMonitorColorProfile != dialog.UseMonitorColorProfile;
         var previousPerformance = _performance;
         _settings.LanczosQuality = dialog.LanczosQuality;
+        _settings.UseNvJpeg = dialog.UseNvJpeg;
+        _settings.UseMonitorColorProfile = dialog.UseMonitorColorProfile;
+        NvJpegNativeDecoder.Configure(_settings.UseNvJpeg);
         _settings.AutoOptimizePerformance = dialog.AutoOptimizePerformance;
         if (!_settings.AutoOptimizePerformance)
         {
@@ -2981,6 +3570,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         ApplyFastPreviewSchedulerSettings();
         _settings.BackgroundArgb = dialog.ReaderBackground.ToArgb();
         _settings.AutoMoveMode = dialog.AutoMoveMode;
+        _settings.PreviousBookOpensLastPage = dialog.PreviousBookOpensLastPage;
         _settings.RandomLibraryPath = dialog.RandomLibraryPath;
         _settings.ToolbarHotkeys = dialog.ToolbarHotkeys;
         _viewer.ApplyReaderSettings(
@@ -2990,6 +3580,17 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _thumbnailGrid.SetInternalPreviewMaxSize(_settings.ThumbnailMaxPreviewSizePx);
         if (qualityChanged) _thumbnailGrid.ClearFullQualityCache();
         _settings.Save();
+        if (colorManagementChanged)
+        {
+            _monitorProfileDevice = null;
+            QueueMonitorColorProfileRefresh(force: true);
+            if (!_settings.UseMonitorColorProfile)
+                _viewer.SetPageColorProfiles(null, null);
+            else if (_book is { } colorBook)
+                _ = UpdateVisibleColorProfilesAsync(colorBook, _pageIndex,
+                    GetSecondPageIndex(ignoreAutoSingle: false),
+                    _bookCancellation?.Token ?? CancellationToken.None);
+        }
 
         if (_cache is { } cache && _book is { } book)
         {
@@ -3003,7 +3604,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             }
             ScheduleRelaxedCacheTrim(cache);
             RequestCacheWarm(_pageIndex, cache, book);
-            if (qualityChanged) _ = ShowPageAsync();
+            if (qualityChanged || nvJpegChanged) _ = ShowPageAsync();
         }
         if ((qualityChanged || performanceChanged) && _thumbnailMode)
             _ = LoadThumbnailsProgressivelyAsync();
@@ -3017,7 +3618,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private void ApplyZoomImageMagickThreadLimit() =>
         ResourceLimits.Thread = (ulong)Math.Clamp(
-            _performance.ZoomImageMagickThreadsPerImage, 1, 64);
+            _performance.ZoomImageMagickThreadsPerImage, 1, 255);
 
     private void ApplyFastPreviewSchedulerSettings() =>
         RenderWorkScheduler.Configure(

@@ -81,7 +81,7 @@ internal static class AnimatedImageRenderer
                 if (image.Width != outputSize.Width || image.Height != outputSize.Height)
                     image.Resize((uint)outputSize.Width, (uint)outputSize.Height);
                 cancellationToken.ThrowIfCancellationRequested();
-                frames.Add(ToBitmap(image));
+                frames.Add(MagickBitmapConverter.ToBitmap(image));
             }
             return new AnimationFrameSet(frames.ToArray(), delays.ToArray());
         }
@@ -177,13 +177,4 @@ internal static class AnimatedImageRenderer
         return true;
     }
 
-    private static Bitmap ToBitmap(IMagickImage<byte> image)
-    {
-        image.Format = MagickFormat.Bmp;
-        using var converted = new MemoryStream();
-        image.Write(converted);
-        converted.Position = 0;
-        using var decoded = new Bitmap(converted);
-        return new Bitmap(decoded);
-    }
 }

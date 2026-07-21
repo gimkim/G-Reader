@@ -3,6 +3,16 @@ namespace CDisplayEx.CSharp;
 internal sealed class ReaderSettingsDialog : Form
 {
     private readonly ComboBox _quality = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
+    private readonly CheckBox _useNvJpeg = new()
+    {
+        Text = "Use NVIDIA nvJPEG when available (automatic libjpeg-turbo fallback)",
+        AutoSize = true, Dock = DockStyle.Fill
+    };
+    private readonly CheckBox _useMonitorColorProfile = new()
+    {
+        Text = "Use the ICC profile assigned to the current monitor",
+        AutoSize = true, Dock = DockStyle.Fill
+    };
     private readonly NumericUpDown _ahead = CreateMemoryInput();
     private readonly NumericUpDown _behind = CreateMemoryInput();
     private readonly NumericUpDown _previewCache = CreateMemoryInput();
@@ -21,7 +31,7 @@ internal sealed class ReaderSettingsDialog : Form
     private readonly NumericUpDown _fastPreviewThreads = CreateWorkerInput();
     private readonly NumericUpDown _precacheWorkers = CreateWorkerInput();
     private readonly NumericUpDown _imageMagickThreads = CreateWorkerInput();
-    private readonly NumericUpDown _zoomImageMagickThreads = CreateWorkerInput();
+    private readonly NumericUpDown _zoomImageMagickThreads = CreateZoomThreadInput();
     private readonly CheckBox _autoOptimize = new()
     {
         Text = "Automatically optimize cache and worker threads for this computer",
@@ -34,6 +44,10 @@ internal sealed class ReaderSettingsDialog : Form
         MinimumSize = new Size(0, 76), Padding = new Padding(0, 4, 0, 4)
     };
     private readonly ComboBox _autoMove = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
+    private readonly ComboBox _previousBookPage = new()
+    {
+        DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill
+    };
     private readonly Panel _colorPreview = new() { Width = 92, Height = 28, BorderStyle = BorderStyle.FixedSingle };
     private readonly TextBox _randomLibraryPath = new() { Width = 420 };
     private readonly Dictionary<string, HotkeyTextBox> _hotkeyEditors = new(StringComparer.Ordinal);
@@ -41,6 +55,8 @@ internal sealed class ReaderSettingsDialog : Form
     private readonly PerformanceProfile _automaticPerformance;
 
     public int LanczosQuality => _quality.SelectedIndex;
+    public bool UseNvJpeg => _useNvJpeg.Checked;
+    public bool UseMonitorColorProfile => _useMonitorColorProfile.Checked;
     public int CacheAheadMB => (int)_ahead.Value;
     public int CacheBehindMB => (int)_behind.Value;
     public int PreviewCacheMB => (int)_previewCache.Value;
@@ -58,6 +74,7 @@ internal sealed class ReaderSettingsDialog : Form
     public bool AutoOptimizePerformance => _autoOptimize.Checked;
     public Color ReaderBackground { get; private set; }
     public int AutoMoveMode => _autoMove.SelectedIndex;
+    public bool PreviousBookOpensLastPage => _previousBookPage.SelectedIndex == 0;
     public string RandomLibraryPath => _randomLibraryPath.Text.Trim();
     public Dictionary<string, int> ToolbarHotkeys => _hotkeyEditors.ToDictionary(
         pair => pair.Key, pair => (int)pair.Value.Shortcut, StringComparer.Ordinal);
@@ -85,6 +102,8 @@ internal sealed class ReaderSettingsDialog : Form
             "Maximum radius — LanczosRadius"
         ]);
         _quality.SelectedIndex = Math.Clamp(settings.LanczosQuality, 0, _quality.Items.Count - 1);
+        _useNvJpeg.Checked = settings.UseNvJpeg;
+        _useMonitorColorProfile.Checked = settings.UseMonitorColorProfile;
         _ahead.Value = Math.Clamp(settings.CacheAheadMB, (int)_ahead.Minimum, (int)_ahead.Maximum);
         _behind.Value = Math.Clamp(settings.CacheBehindMB, (int)_behind.Minimum, (int)_behind.Maximum);
         _previewCache.Value = Math.Clamp(settings.PreviewCacheMB,
@@ -128,6 +147,11 @@ internal sealed class ReaderSettingsDialog : Form
             "Auto move — both folders and archives/PDFs"
         ]);
         _autoMove.SelectedIndex = Math.Clamp(settings.AutoMoveMode, 0, 3);
+        _previousBookPage.Items.AddRange([
+            "Open the last page",
+            "Open the first page"
+        ]);
+        _previousBookPage.SelectedIndex = settings.PreviousBookOpensLastPage ? 0 : 1;
         _randomLibraryPath.Text = settings.RandomLibraryPath ?? string.Empty;
         ReaderBackground = Color.FromArgb(settings.BackgroundArgb);
         _colorPreview.BackColor = ReaderBackground;
@@ -146,6 +170,50 @@ internal sealed class ReaderSettingsDialog : Form
         browsePersistentCache.Click += (_, _) => ChoosePersistentCachePath();
         var persistentCachePathRow = CreateStretchButtonRow(
             _persistentCachePath, browsePersistentCache);
+
+        var clearDiskCache = CreateSecondaryButton("Clear all disk cache");
+        clearDiskCache.MinimumSize = new Size(174, 32);
+        var clearDiskCacheStatus = new Label
+        {
+            AutoSize = true, TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = Color.FromArgb(70, 79, 94),
+            Margin = new Padding(10, 8, 0, 0)
+        };
+        clearDiskCache.Click += async (_, _) =>
+        {
+            if (MessageBox.Show(this,
+                    "Delete every full-view and thumbnail preview in the disk cache?",
+                    "Clear all disk cache", MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            clearDiskCache.Enabled = false;
+            clearDiskCacheStatus.Text = "Clearing cache...";
+            try
+            {
+                var result = await PersistentPreviewCache.ClearAllAsync(
+                    _persistentCachePath.Text);
+                if (IsDisposed) return;
+                var removed = FormatByteCount(result.Bytes);
+                clearDiskCacheStatus.Text = result.FailedCount == 0
+                    ? $"Removed {result.FileCount:N0} files ({removed})"
+                    : $"Removed {result.FileCount:N0} files ({removed}); " +
+                      $"{result.FailedCount:N0} could not be removed";
+            }
+            catch (Exception ex)
+            {
+                if (!IsDisposed)
+                    clearDiskCacheStatus.Text = $"Could not clear cache: {ex.Message}";
+            }
+            finally
+            {
+                if (!IsDisposed) clearDiskCache.Enabled = true;
+            }
+        };
+        var clearDiskCacheRow = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill, AutoSize = true, WrapContents = false,
+            Margin = Padding.Empty
+        };
+        clearDiskCacheRow.Controls.AddRange([clearDiskCache, clearDiskCacheStatus]);
 
         var chooseDefaultViewer = CreateSecondaryButton("Choose defaults…");
         chooseDefaultViewer.Click += (_, _) => ChooseDefaultImageViewer();
@@ -167,12 +235,15 @@ internal sealed class ReaderSettingsDialog : Form
 
         var readerPage = CreateSettingsPage("Reader & Library",
             CreateSection("Image rendering",
-                "Choose final resize quality and the canvas color used around fitted pages.",
+                "Choose final resize quality and JPEG decoder. nvJPEG is warmed in the background, reuses pinned buffers, and falls back automatically when CUDA or a JPEG feature is unavailable.",
                 ("Lanczos quality", _quality),
+                ("NVIDIA GPU decode", _useNvJpeg),
+                ("Monitor color management", _useMonitorColorProfile),
                 ("Background color", colorRow)),
             CreateSection("Library navigation",
                 "At a book boundary, follow the same ordered folder/archive list shown in Thumbnail view.",
                 ("Automatic move", _autoMove),
+                ("When moving to previous book", _previousBookPage),
                 ("Random library path", randomPathRow)),
             CreateSection("Windows integration",
                 "Register G Reader for supported image formats and choose which formats open with it by default.",
@@ -199,7 +270,8 @@ internal sealed class ReaderSettingsDialog : Form
                 ("Cache location", persistentCachePathRow),
                 ("Full-view preview quota (MB)", _fullViewDiskCache),
                 ("Thumbnail quota (MB)", _thumbnailDiskCache),
-                ("Total disk allowance", _diskCacheTotal)),
+                ("Total disk allowance", _diskCacheTotal),
+                ("Cache maintenance", clearDiskCacheRow)),
             CreateSection("Processing threads",
                 "These values control parallel background resizing. Higher values use more CPU and memory bandwidth.",
                 ("Fast preview workers", _fastPreviewWorkers),
@@ -446,6 +518,17 @@ internal sealed class ReaderSettingsDialog : Form
             _persistentCachePath.Text = dialog.SelectedPath;
     }
 
+    private static string FormatByteCount(long bytes)
+    {
+        if (bytes >= 1024L * 1024 * 1024)
+            return $"{bytes / (1024d * 1024 * 1024):N2} GB";
+        if (bytes >= 1024L * 1024)
+            return $"{bytes / (1024d * 1024):N1} MB";
+        if (bytes >= 1024L)
+            return $"{bytes / 1024d:N1} KB";
+        return $"{bytes:N0} bytes";
+    }
+
     private void ChooseDefaultImageViewer()
     {
         try
@@ -573,6 +656,12 @@ internal sealed class ReaderSettingsDialog : Form
     private static NumericUpDown CreateWorkerInput() => new()
     {
         Minimum = 1, Maximum = 64, Increment = 1,
+        ThousandsSeparator = false, Dock = DockStyle.Fill
+    };
+
+    private static NumericUpDown CreateZoomThreadInput() => new()
+    {
+        Minimum = 1, Maximum = 255, Increment = 1,
         ThousandsSeparator = false, Dock = DockStyle.Fill
     };
 

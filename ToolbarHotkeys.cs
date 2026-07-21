@@ -11,6 +11,8 @@ internal static class ToolbarHotkeyCatalog
     public const string OpenRandom = "open_random";
     public const string OpenInExplorer = "open_in_explorer";
     public const string MoveUp = "move_up";
+    public const string PreviousContainer = "previous_container";
+    public const string NextContainer = "next_container";
     public const string Start = "start";
     public const string Left = "left";
     public const string Right = "right";
@@ -19,6 +21,7 @@ internal static class ToolbarHotkeyCatalog
     public const string PageLayout = "page_layout";
     public const string AutoSingleLandscape = "auto_single_landscape";
     public const string ReadingDirection = "reading_direction";
+    public const string Fullscreen = "fullscreen";
     public const string Settings = "settings";
 
     public static IReadOnlyList<ToolbarHotkeyDefinition> All { get; } =
@@ -28,6 +31,8 @@ internal static class ToolbarHotkeyCatalog
         new(OpenRandom, "Open random", Keys.Control | Keys.R),
         new(OpenInExplorer, "Open in Explorer", Keys.Control | Keys.Shift | Keys.E),
         new(MoveUp, "Move up", Keys.Alt | Keys.Up),
+        new(PreviousContainer, "Previous folder / archive", Keys.Control | Keys.Up),
+        new(NextContainer, "Next folder / archive", Keys.Control | Keys.Down),
         new(Start, "Start", Keys.Home),
         new(Left, "Left", Keys.Left),
         new(Right, "Right", Keys.Right),
@@ -36,8 +41,12 @@ internal static class ToolbarHotkeyCatalog
         new(PageLayout, "Page layout", Keys.Control | Keys.D),
         new(AutoSingleLandscape, "Auto-single landscape", Keys.Control | Keys.Shift | Keys.A),
         new(ReadingDirection, "LTR / RTL", Keys.Control | Keys.J),
+        new(Fullscreen, "Toggle fullscreen", Keys.F11),
         new(Settings, "Settings", Keys.Control | Keys.Oemcomma)
     ];
+
+    public static IReadOnlyList<string> ThumbnailArrowPriorityActions { get; } =
+        [MoveUp, PreviousContainer, NextContainer];
 
     public static Dictionary<string, int> CreateDefaults() =>
         All.ToDictionary(item => item.Id, item => (int)item.DefaultShortcut, StringComparer.Ordinal);
