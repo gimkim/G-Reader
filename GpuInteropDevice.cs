@@ -11,6 +11,9 @@ internal static class GpuInteropDevice
     private static readonly object Gate = new();
     private static ID3D11Device? _device;
     private static int _initializationState;
+    private static long _generation;
+
+    public static long Generation => Volatile.Read(ref _generation);
 
     public static ID3D11Device? Device
     {
@@ -43,6 +46,21 @@ internal static class GpuInteropDevice
             finally { Volatile.Write(ref _initializationState, 1); }
             return _device is not null;
         }
+    }
+
+    public static bool RecreateAfterDeviceLoss()
+    {
+        ID3D11Device? removedDevice;
+        lock (Gate)
+        {
+            removedDevice = _device;
+            _device = null;
+            Volatile.Write(ref _initializationState, 0);
+            Interlocked.Increment(ref _generation);
+        }
+        try { removedDevice?.Dispose(); }
+        catch { }
+        return EnsureCreated();
     }
 
     public static ID3D11Texture2D? CreateTexture(

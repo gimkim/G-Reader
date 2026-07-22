@@ -129,6 +129,7 @@ internal sealed class AsyncViewerPanel : Panel
 
     public event EventHandler<bool>? RenderingStateChanged;
     public event EventHandler? ViewportRenderContextChanged;
+    public event EventHandler? RenderDeviceRecovered;
     public event EventHandler<bool>? ZoomModeChanged;
     public event EventHandler<int>? ZoomPercentChanged;
     public event Action<int, AnimationFrameSet>? AnimationReleased;
@@ -293,14 +294,15 @@ internal sealed class AsyncViewerPanel : Panel
                 {
                     foreach (var candidate in renderCandidates.Skip(offset).Take(batchSize))
                     {
-                        if (candidate.Value.ActiveReaders != 0 ||
-                            !_renderCache.Remove(candidate.Key)) continue;
+                        if (!_renderCache.Remove(candidate.Key)) continue;
                         _renderCacheBytes -= candidate.Value.Bytes;
                         SubtractRenderStats(candidate.Key, candidate.Value.Bytes);
                         _renderLookup.Remove(new RenderLookupKey(
                             candidate.Key.PageIndex, candidate.Key.PageKey,
                             candidate.Key.VisiblePageCount, candidate.Key.ContextVersion));
-                        evicted.Add(candidate.Value.Bitmap);
+                        if (candidate.Value.ActiveReaders == 0)
+                            evicted.Add(candidate.Value.Bitmap);
+                        else candidate.Value.Retired = true;
                     }
                 }
                 Thread.Yield();
@@ -314,14 +316,15 @@ internal sealed class AsyncViewerPanel : Panel
             {
                 lock (_renderCacheGate)
                 {
-                    if (candidate.Value.ActiveReaders != 0 ||
-                        !_gpuRenderCache.Remove(candidate.Key)) continue;
+                    if (!_gpuRenderCache.Remove(candidate.Key)) continue;
                     _renderCacheBytes -= candidate.Value.Bytes;
                     SubtractRenderStats(candidate.Key, candidate.Value.Bytes);
                     _gpuRenderLookup.Remove(new RenderLookupKey(
                         candidate.Key.PageIndex, candidate.Key.PageKey,
                         candidate.Key.VisiblePageCount, candidate.Key.ContextVersion));
-                    gpuEvicted.Add(candidate.Value.Image);
+                    if (candidate.Value.ActiveReaders == 0)
+                        gpuEvicted.Add(candidate.Value.Image);
+                    else candidate.Value.Retired = true;
                 }
             }
 
@@ -335,13 +338,14 @@ internal sealed class AsyncViewerPanel : Panel
                 {
                     foreach (var candidate in previewCandidates.Skip(offset).Take(batchSize))
                     {
-                        if (candidate.Value.ActiveReaders != 0 ||
-                            !_previewCache.Remove(candidate.Key)) continue;
+                        if (!_previewCache.Remove(candidate.Key)) continue;
                         _previewCacheBytes -= candidate.Value.Bytes;
                         _previewLookup.Remove(new RenderLookupKey(
                             candidate.Key.PageIndex, candidate.Key.PageKey,
                             candidate.Key.VisiblePageCount, candidate.Key.ContextVersion));
-                        evicted.Add(candidate.Value.Bitmap);
+                        if (candidate.Value.ActiveReaders == 0)
+                            evicted.Add(candidate.Value.Bitmap);
+                        else candidate.Value.Retired = true;
                     }
                 }
                 Thread.Yield();
@@ -354,13 +358,14 @@ internal sealed class AsyncViewerPanel : Panel
             {
                 lock (_previewCacheGate)
                 {
-                    if (candidate.Value.ActiveReaders != 0 ||
-                        !_gpuPreviewCache.Remove(candidate.Key)) continue;
+                    if (!_gpuPreviewCache.Remove(candidate.Key)) continue;
                     _previewCacheBytes -= candidate.Value.Bytes;
                     _gpuPreviewLookup.Remove(new RenderLookupKey(
                         candidate.Key.PageIndex, candidate.Key.PageKey,
                         candidate.Key.VisiblePageCount, candidate.Key.ContextVersion));
-                    gpuEvicted.Add(candidate.Value.Image);
+                    if (candidate.Value.ActiveReaders == 0)
+                        gpuEvicted.Add(candidate.Value.Image);
+                    else candidate.Value.Retired = true;
                 }
             }
             foreach (var bitmap in evicted) lock (bitmap) bitmap.Dispose();
@@ -557,6 +562,14 @@ internal sealed class AsyncViewerPanel : Panel
         _direct2DSurface.MouseMove += OnViewerMouseMove;
         _direct2DSurface.MouseUp += OnViewerMouseUp;
         _direct2DSurface.MouseCaptureChanged += OnViewerMouseCaptureChanged;
+        _direct2DSurface.DeviceResourcesRecovered += (_, _) =>
+        {
+            if (IsDisposed || Disposing) return;
+            _renderContextVersion++;
+            ClearRenderCache();
+            ClearPreviewCache();
+            RenderDeviceRecovered?.Invoke(this, EventArgs.Empty);
+        };
         AccessibleName = "Hardware-accelerated Direct2D comic viewer";
         Scroll += (_, _) => _direct2DSurface.UpdateLayout(_left.Bounds, _right.Bounds);
         _lastRenderControlSize = Size;

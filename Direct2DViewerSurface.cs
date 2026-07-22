@@ -45,6 +45,7 @@ internal sealed class Direct2DViewerSurface : Control
     private const long GpuCleanupHeadroomBytes = 128L * 1024 * 1024;
     private readonly ID2D1Factory1 _factory;
     private readonly System.Windows.Forms.Timer _gpuTrimTimer = new() { Interval = 650 };
+    private readonly System.Windows.Forms.Timer _deviceRecoveryTimer = new() { Interval = 50 };
     private readonly Dictionary<Bitmap, GpuCacheItem> _gpuCache =
         new(ReferenceEqualityComparer.Instance);
     private readonly LinkedList<Bitmap> _gpuLru = [];
@@ -79,7 +80,10 @@ internal sealed class Direct2DViewerSurface : Control
     private byte[]? _rightColorProfile;
     private byte[]? _zoomColorProfile;
     private long _gpuCacheBytes;
+    private int _deviceRecoveryAttempt;
     private System.Drawing.Color _backgroundColor = System.Drawing.Color.FromArgb(30, 32, 38);
+
+    public event EventHandler? DeviceResourcesRecovered;
 
     public System.Drawing.Color ViewerBackgroundColor
     {
@@ -108,6 +112,7 @@ internal sealed class Direct2DViewerSurface : Control
             _gpuTrimTimer.Stop();
             TrimGpuCache();
         };
+        _deviceRecoveryTimer.Tick += (_, _) => RecoverDeviceResources();
     }
 
     public void Present(Bitmap? left, Bitmap? right, Rectangle leftBounds, Rectangle rightBounds)
@@ -336,7 +341,14 @@ internal sealed class Direct2DViewerSurface : Control
             ClientSize.Width > 0 && ClientSize.Height > 0)
         {
             try { RecreateSwapChainTarget(resize: true); }
-            catch { DiscardDeviceResources(); }
+            catch (Exception exception)
+            {
+                ExtendedDiagnostics.LogException(
+                    "Direct2D resize failed", exception,
+                    $"size={ClientSize.Width}x{ClientSize.Height}");
+                HandleDeviceLoss("resize");
+                return;
+            }
             DrawFrame();
         }
         else if (_renderTarget is not null && ClientSize.Width > 0 && ClientSize.Height > 0)
@@ -362,6 +374,7 @@ internal sealed class Direct2DViewerSurface : Control
         {
             DiscardDeviceResources();
             _gpuTrimTimer.Dispose();
+            _deviceRecoveryTimer.Dispose();
             _factory.Dispose();
         }
         base.Dispose(disposing);
@@ -384,7 +397,14 @@ internal sealed class Direct2DViewerSurface : Control
             PixelSize = new SizeI(ClientSize.Width, ClientSize.Height),
             PresentOptions = PresentOptions.Immediately
         };
-        _renderTarget = _factory.CreateHwndRenderTarget(properties, hwndProperties);
+        try { _renderTarget = _factory.CreateHwndRenderTarget(properties, hwndProperties); }
+        catch (Exception exception)
+        {
+            ExtendedDiagnostics.LogException(
+                "Direct2D HWND target creation failed", exception);
+            _renderTarget = null;
+            ScheduleDeviceRecovery("target creation");
+        }
     }
 
     private bool TryCreateDeviceContextTarget()
@@ -578,12 +598,11 @@ internal sealed class Direct2DViewerSurface : Control
     private bool DrawFrame()
     {
         if (!IsHandleCreated || ClientSize.Width <= 0 || ClientSize.Height <= 0) return false;
-        EnsureRenderTarget();
-        var target = (ID2D1RenderTarget?)_deviceContext ?? _renderTarget;
-        if (target is null) return false;
-
         try
         {
+            EnsureRenderTarget();
+            var target = (ID2D1RenderTarget?)_deviceContext ?? _renderTarget;
+            if (target is null) return false;
             target.BeginDraw();
             target.Clear(new Color4(
                 _backgroundColor.R / 255f,
@@ -610,7 +629,7 @@ internal sealed class Direct2DViewerSurface : Control
             {
                 ExtendedDiagnostics.Breadcrumb(
                     $"Direct2D EndDraw failed: {result.Code}");
-                DiscardDeviceResources();
+                HandleDeviceLoss($"EndDraw {result.Code}");
                 return false;
             }
             else if (_swapChain is not null)
@@ -620,9 +639,64 @@ internal sealed class Direct2DViewerSurface : Control
         catch (Exception exception)
         {
             ExtendedDiagnostics.LogException("Direct2D frame presentation failed", exception);
-            DiscardDeviceResources();
-            Invalidate();
+            HandleDeviceLoss("frame exception");
             return false;
+        }
+    }
+
+    private void HandleDeviceLoss(string reason)
+    {
+        DiscardDeviceResources();
+        if (_deviceRecoveryAttempt == 0)
+        {
+            var recreated = GpuInteropDevice.RecreateAfterDeviceLoss();
+            ExtendedDiagnostics.Breadcrumb(
+                $"Shared D3D device reset after {reason}: recreated={recreated}; " +
+                $"generation={GpuInteropDevice.Generation}");
+        }
+        ScheduleDeviceRecovery(reason);
+    }
+
+    private void ScheduleDeviceRecovery(string reason)
+    {
+        if (IsDisposed || Disposing || !IsHandleCreated) return;
+        _deviceRecoveryAttempt = Math.Min(_deviceRecoveryAttempt + 1, 6);
+        _deviceRecoveryTimer.Stop();
+        _deviceRecoveryTimer.Interval = Math.Min(
+            1000, 50 << Math.Min(4, _deviceRecoveryAttempt - 1));
+        ExtendedDiagnostics.Breadcrumb(
+            $"Direct2D recovery scheduled: reason={reason}; " +
+            $"attempt={_deviceRecoveryAttempt}; delayMs={_deviceRecoveryTimer.Interval}");
+        _deviceRecoveryTimer.Start();
+    }
+
+    private void RecoverDeviceResources()
+    {
+        _deviceRecoveryTimer.Stop();
+        if (IsDisposed || Disposing || !IsHandleCreated || !Visible) return;
+        try
+        {
+            EnsureRenderTarget();
+            if (_deviceContext is null && _renderTarget is null)
+            {
+                ScheduleDeviceRecovery("target unavailable");
+                return;
+            }
+            var attempts = _deviceRecoveryAttempt;
+            _deviceRecoveryAttempt = 0;
+            ExtendedDiagnostics.Breadcrumb(
+                $"Direct2D recovery completed: attempts={attempts}; " +
+                $"generation={GpuInteropDevice.Generation}");
+            DeviceResourcesRecovered?.Invoke(this, EventArgs.Empty);
+            Invalidate();
+        }
+        catch (Exception exception)
+        {
+            ExtendedDiagnostics.LogException(
+                "Direct2D recovery failed", exception,
+                $"attempt={_deviceRecoveryAttempt}");
+            DiscardDeviceResources();
+            ScheduleDeviceRecovery("recreate exception");
         }
     }
 

@@ -347,6 +347,10 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             }
         };
         _viewer.ViewportRenderContextChanged += (_, _) => RestartPrecacheForViewport();
+        _viewer.RenderDeviceRecovered += (_, _) =>
+        {
+            if (!_thumbnailMode) _ = ShowPageAsync();
+        };
         _viewer.ZoomSourceSizeRequested = GetZoomSourceSizeAsync;
         _viewer.ZoomCropRequested = RenderZoomCropAsync;
         _viewer.ZoomModeChanged += (_, enabled) =>
@@ -2099,9 +2103,10 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             _ = OpenThumbnailBrowseEntryAsync(parent);
     }
 
-    private void RestartPrecacheForViewport()
+    private async void RestartPrecacheForViewport()
     {
         if (_cache is not { } cache || _book is not { } book) return;
+        var contextVersion = _viewer.CapturePreRenderContext().Version;
 
         lock (_warmStateGate)
         {
@@ -2111,6 +2116,22 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 CancelAndDisposeInBackground(_warmCancellation);
             _warmCancellation = null;
         }
+        try
+        {
+            // A viewport-size context can contain gigabytes of CPU/GPU pages.
+            // Retire it before warming the replacement; otherwise maximizing a
+            // window temporarily holds both complete cache generations and can
+            // exhaust VRAM, causing DXGI_ERROR_DEVICE_REMOVED and a black frame.
+            await _viewer.DiscardStaleRenderContextsAsync();
+        }
+        catch (Exception exception)
+        {
+            ExtendedDiagnostics.LogException(
+                "Viewport stale render cleanup failed", exception,
+                $"context={contextVersion}; source={book.SourcePath}");
+        }
+        if (_viewer.CapturePreRenderContext().Version != contextVersion ||
+            !ReferenceEquals(_cache, cache) || !ReferenceEquals(_book, book)) return;
         RequestCacheWarm(_pageIndex, cache, book,
             immediate: true, rebuildRenderContext: true);
     }

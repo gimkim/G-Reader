@@ -17,6 +17,7 @@ internal static class GpuContactSheetRenderer
     private static ID2D1Factory1? _factory;
     private static ID2D1Device? _device;
     private static ID2D1DeviceContext? _context;
+    private static long _deviceGeneration = -1;
 
     public static GpuRenderedImage? TryScale(
         Bitmap source, System.Drawing.Size bounds, CancellationToken cancellationToken)
@@ -202,11 +203,24 @@ internal static class GpuContactSheetRenderer
 
     private static void EnsureContext()
     {
-        if (_context is not null || GpuInteropDevice.Device is not { } d3d) return;
+        var generation = GpuInteropDevice.Generation;
+        if (_context is not null && _deviceGeneration == generation) return;
+        if (_deviceGeneration != generation)
+        {
+            if (_context is not null) _context.Target = null;
+            _context?.Dispose();
+            _device?.Dispose();
+            _factory?.Dispose();
+            _context = null;
+            _device = null;
+            _factory = null;
+        }
+        if (GpuInteropDevice.Device is not { } d3d) return;
         _factory = D2D1CreateFactory<ID2D1Factory1>(FactoryType.MultiThreaded,
             DebugLevel.None);
         using var dxgi = d3d.QueryInterface<IDXGIDevice>();
         _device = _factory.CreateDevice(dxgi);
         _context = _device.CreateDeviceContext(DeviceContextOptions.None);
+        _deviceGeneration = generation;
     }
 }
