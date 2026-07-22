@@ -269,6 +269,19 @@ dotnet publish .\CDisplayEx.CSharp.csproj `
 
 The repository contains source code and project assets. Local release output and preserved development snapshots are excluded from Git.
 
+### Microsoft Store package
+
+The reserved Store identity and MSIX assets live in `packaging/Store`. Build the
+self-contained x64 package with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\packaging\Store\build-store-msix.ps1
+```
+
+The resulting `.msix` is written under `release\store`. Packaged installations
+use Store-managed updates and manifest-owned file associations; unpackaged
+GitHub builds retain the existing updater and per-user registration behavior.
+
 ## Project structure
 
 | File | Responsibility |

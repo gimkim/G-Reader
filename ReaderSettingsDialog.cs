@@ -376,6 +376,7 @@ internal sealed class ReaderSettingsDialog : Form
             clearReadingPositions, readingPositionsStatus
         ]);
 
+        var isPackaged = AppPackageContext.IsPackaged;
         var chooseDefaultViewer = CreateSecondaryButton("Choose defaults…");
         chooseDefaultViewer.Click += (_, _) => ChooseDefaultImageViewer();
         var defaultViewerRow = new FlowLayoutPanel
@@ -540,14 +541,18 @@ internal sealed class ReaderSettingsDialog : Form
             }
         };
 
-        var checkForUpdates = CreateSecondaryButton("Check for updates");
+        var checkForUpdates = CreateSecondaryButton(
+            isPackaged ? "Managed by Microsoft Store" : "Check for updates");
         checkForUpdates.MinimumSize = new Size(160, 32);
+        checkForUpdates.Enabled = !isPackaged;
         var updateStatus = new Label
         {
             AutoSize = true, TextAlign = ContentAlignment.MiddleLeft,
             ForeColor = Color.FromArgb(70, 79, 94),
             Margin = new Padding(10, 8, 0, 0),
-            Text = $"Installed version {UpdateManager.CurrentDisplayVersion}"
+            Text = isPackaged
+                ? $"Installed version {UpdateManager.CurrentDisplayVersion} · Store package"
+                : $"Installed version {UpdateManager.CurrentDisplayVersion}"
         };
         checkForUpdates.Click += async (_, _) =>
         {
@@ -580,14 +585,18 @@ internal sealed class ReaderSettingsDialog : Form
                 ("Saved positions", clearReadingPositionsRow),
                 ("Random library path", randomPathRow)),
             CreateSection("Windows integration",
-                "Register Fast Reader/Viewer for supported image formats and choose which formats open with it by default.",
+                isPackaged
+                    ? "File associations are installed from the Microsoft Store package. Windows still lets you choose the default app for each format."
+                    : "Register Fast Reader/Viewer for supported image formats and choose which formats open with it by default.",
                 ("Default image viewer", defaultViewerRow)),
             CreateSection("Diagnostics",
                 "Extended logging records session health and errors. If the UI stops responding for eight seconds, Fast Reader/Viewer creates a diagnostic dump. Logs are retained for 30 days.",
                 ("Extended logging", _extendedLogging),
                 ("Saved diagnostics", openDiagnosticsFolder)),
             CreateSection("Updates",
-                "Fast Reader/Viewer checks the latest published GitHub release. A newer semantic version is downloaded only after confirmation, verified with GitHub's SHA-256 digest, then installed and relaunched.",
+                isPackaged
+                    ? "Microsoft Store downloads, verifies, and installs updates for this package. The GitHub self-updater is disabled."
+                    : "Fast Reader/Viewer checks the latest published GitHub release. A newer semantic version is downloaded only after confirmation, verified with GitHub's SHA-256 digest, then installed and relaunched.",
                 ("Current release", updateRow)));
 
         var renderingPage = CreateSettingsPage("Rendering",

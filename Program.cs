@@ -12,7 +12,11 @@ internal static class Program
         ApplicationConfiguration.Initialize();
         var startupSettings = UserSettings.Load();
         ExtendedDiagnostics.Initialize(startupSettings.ExtendedLoggingEnabled, args);
-        try { WindowsFileAssociations.EnsureRegistered(); }
+        try
+        {
+            if (!AppPackageContext.IsPackaged)
+                WindowsFileAssociations.EnsureRegistered();
+        }
         catch { /* File associations are optional and must never prevent startup. */ }
         // Keep the WinForms message pump ahead of CPU-heavy native image workers.
         // ImageMagick may create its own threads that do not inherit the priority

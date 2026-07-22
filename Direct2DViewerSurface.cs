@@ -46,6 +46,8 @@ internal sealed class Direct2DViewerSurface : Control
     private readonly ID2D1Factory1 _factory;
     private readonly System.Windows.Forms.Timer _gpuTrimTimer = new() { Interval = 650 };
     private readonly System.Windows.Forms.Timer _deviceRecoveryTimer = new() { Interval = 50 };
+    private readonly System.Windows.Forms.Timer _resizeRenderTimer = new() { Interval = 90 };
+    private readonly System.Windows.Forms.Timer _presentRetryTimer = new() { Interval = 16 };
     private readonly Dictionary<Bitmap, GpuCacheItem> _gpuCache =
         new(ReferenceEqualityComparer.Instance);
     private readonly LinkedList<Bitmap> _gpuLru = [];
@@ -81,6 +83,7 @@ internal sealed class Direct2DViewerSurface : Control
     private byte[]? _zoomColorProfile;
     private long _gpuCacheBytes;
     private int _deviceRecoveryAttempt;
+    private bool _renderTargetResizePending;
     private System.Drawing.Color _backgroundColor = System.Drawing.Color.FromArgb(30, 32, 38);
 
     public event EventHandler? DeviceResourcesRecovered;
@@ -113,6 +116,12 @@ internal sealed class Direct2DViewerSurface : Control
             TrimGpuCache();
         };
         _deviceRecoveryTimer.Tick += (_, _) => RecoverDeviceResources();
+        _resizeRenderTimer.Tick += (_, _) => ApplyPendingRenderTargetResize();
+        _presentRetryTimer.Tick += (_, _) =>
+        {
+            _presentRetryTimer.Stop();
+            if (!_renderTargetResizePending) DrawFrame();
+        };
     }
 
     public void Present(Bitmap? left, Bitmap? right, Rectangle leftBounds, Rectangle rightBounds)
@@ -330,6 +339,9 @@ internal sealed class Direct2DViewerSurface : Control
 
     protected override void OnHandleDestroyed(EventArgs e)
     {
+        _resizeRenderTimer.Stop();
+        _presentRetryTimer.Stop();
+        _renderTargetResizePending = false;
         DiscardDeviceResources();
         base.OnHandleDestroyed(e);
     }
@@ -337,24 +349,50 @@ internal sealed class Direct2DViewerSurface : Control
     protected override void OnResize(EventArgs e)
     {
         base.OnResize(e);
-        if (_deviceContext is not null && _swapChain is not null &&
-            ClientSize.Width > 0 && ClientSize.Height > 0)
+        if ((_deviceContext is null || _swapChain is null) && _renderTarget is null) return;
+        if (ClientSize.Width <= 0 || ClientSize.Height <= 0)
         {
-            try { RecreateSwapChainTarget(resize: true); }
-            catch (Exception exception)
-            {
-                ExtendedDiagnostics.LogException(
-                    "Direct2D resize failed", exception,
-                    $"size={ClientSize.Width}x{ClientSize.Height}");
-                HandleDeviceLoss("resize");
-                return;
-            }
+            _resizeRenderTimer.Stop();
+            _renderTargetResizePending = false;
+            return;
+        }
+
+        // WM_SIZE can arrive for every pixel while the user drags a window edge.
+        // ResizeBuffers and Present both enter the display driver and can block the
+        // UI thread behind queued background GPU work. Keep the last swap-chain
+        // frame visible (DXGI Scaling.Stretch scales it with the HWND) and resize
+        // the actual target once the viewport has been stable briefly.
+        _renderTargetResizePending = true;
+        _presentRetryTimer.Stop();
+        _resizeRenderTimer.Stop();
+        _resizeRenderTimer.Start();
+    }
+
+    private void ApplyPendingRenderTargetResize()
+    {
+        _resizeRenderTimer.Stop();
+        if (!_renderTargetResizePending || IsDisposed || Disposing ||
+            !IsHandleCreated || ClientSize.Width <= 0 || ClientSize.Height <= 0)
+            return;
+
+        try
+        {
+            if (_deviceContext is not null && _swapChain is not null)
+                RecreateSwapChainTarget(resize: true);
+            else
+                _renderTarget?.Resize(new SizeI(ClientSize.Width, ClientSize.Height));
+            _renderTargetResizePending = false;
+            ExtendedDiagnostics.Breadcrumb(
+                $"Direct2D deferred resize applied: size={ClientSize.Width}x{ClientSize.Height}");
             DrawFrame();
         }
-        else if (_renderTarget is not null && ClientSize.Width > 0 && ClientSize.Height > 0)
+        catch (Exception exception)
         {
-            _renderTarget.Resize(new SizeI(ClientSize.Width, ClientSize.Height));
-            DrawFrame();
+            _renderTargetResizePending = false;
+            ExtendedDiagnostics.LogException(
+                "Direct2D deferred resize failed", exception,
+                $"size={ClientSize.Width}x{ClientSize.Height}");
+            HandleDeviceLoss("deferred resize");
         }
     }
 
@@ -375,6 +413,8 @@ internal sealed class Direct2DViewerSurface : Control
             DiscardDeviceResources();
             _gpuTrimTimer.Dispose();
             _deviceRecoveryTimer.Dispose();
+            _resizeRenderTimer.Dispose();
+            _presentRetryTimer.Dispose();
             _factory.Dispose();
         }
         base.Dispose(disposing);
@@ -597,7 +637,8 @@ internal sealed class Direct2DViewerSurface : Control
 
     private bool DrawFrame()
     {
-        if (!IsHandleCreated || ClientSize.Width <= 0 || ClientSize.Height <= 0) return false;
+        if (!IsHandleCreated || ClientSize.Width <= 0 || ClientSize.Height <= 0 ||
+            _renderTargetResizePending) return false;
         try
         {
             EnsureRenderTarget();
@@ -633,7 +674,25 @@ internal sealed class Direct2DViewerSurface : Control
                 return false;
             }
             else if (_swapChain is not null)
-                _swapChain.Present(0, PresentFlags.None);
+            {
+                // Never let a saturated GPU queue turn painting or resizing into
+                // an unbounded UI-thread wait. Retry the newest frame on the next
+                // message-loop turn if DXGI is still drawing the previous one.
+                var presentResult = _swapChain.Present(0, PresentFlags.DoNotWait);
+                if (presentResult == Vortice.DXGI.ResultCode.WasStillDrawing)
+                {
+                    _presentRetryTimer.Stop();
+                    _presentRetryTimer.Start();
+                    return false;
+                }
+                if (presentResult.Failure)
+                {
+                    ExtendedDiagnostics.Breadcrumb(
+                        $"DXGI Present failed: {presentResult.Code}");
+                    HandleDeviceLoss($"Present {presentResult.Code}");
+                    return false;
+                }
+            }
             return true;
         }
         catch (Exception exception)

@@ -9,6 +9,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <!-- Keep the matching Win32 manifest declaration so Store static validation
+         sees DPI awareness before managed startup configures it. -->
+    <NoWarn>$(NoWarn);WFAC010</NoWarn>
     <AssemblyName>Fast Reader Viewer</AssemblyName>
     <RootNamespace>CDisplayEx.CSharp</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
@@ -16,9 +19,9 @@
     <AssemblyTitle>Fast Reader/Viewer</AssemblyTitle>
     <Product>Fast Reader/Viewer</Product>
     <Description>Hardware-accelerated comic and image reader</Description>
-    <Version>1.4.0</Version>
-    <AssemblyVersion>1.4.0.0</AssemblyVersion>
-    <FileVersion>1.4.0.0</FileVersion>
+    <Version>1.5.0</Version>
+    <AssemblyVersion>1.5.0.0</AssemblyVersion>
+    <FileVersion>1.5.0.0</FileVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>

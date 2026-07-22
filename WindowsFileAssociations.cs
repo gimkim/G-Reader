@@ -16,7 +16,7 @@ internal static class WindowsFileAssociations
 
     public static void EnsureRegistered()
     {
-        if (!OperatingSystem.IsWindows()) return;
+        if (!OperatingSystem.IsWindows() || AppPackageContext.IsPackaged) return;
 
         var executablePath = Environment.ProcessPath ?? Application.ExecutablePath;
         if (string.IsNullOrWhiteSpace(executablePath)) return;
@@ -76,9 +76,11 @@ internal static class WindowsFileAssociations
 
     public static void OpenDefaultAppsSettings()
     {
-        EnsureRegistered();
-        var target = "ms-settings:defaultapps?registeredAppUser=" +
-                     Uri.EscapeDataString(ApplicationName);
+        if (!AppPackageContext.IsPackaged) EnsureRegistered();
+        var target = AppPackageContext.IsPackaged
+            ? "ms-settings:defaultapps"
+            : "ms-settings:defaultapps?registeredAppUser=" +
+              Uri.EscapeDataString(ApplicationName);
         Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
     }
 }

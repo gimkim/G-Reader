@@ -496,7 +496,9 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         var help = Menu("&Help", Item("&Website", (_, _) => OpenWebsite()),
             Item("Check for &Updates...", async (_, _) =>
                 await CheckForUpdatesAsync(manual: true)),
-            Item("&About", (_, _) => MessageBox.Show(this, "CDisplayEx C#\nAsync loading, Lanczos rendering and page cache.", "About")));
+            Item("&About", (_, _) => MessageBox.Show(this,
+                "Fast Reader/Viewer\nHardware-accelerated image, comic, archive, and PDF reader.",
+                "About Fast Reader/Viewer")));
         _menu.Items.AddRange([file, read, options, help]);
     }
 
@@ -4462,11 +4464,17 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private static void OpenWebsite()
     {
-        try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("https://www.cdisplayex.com") { UseShellExecute = true }); } catch { }
+        try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("https://github.com/gimkim/G-Reader") { UseShellExecute = true }); } catch { }
     }
 
     private async Task CheckForUpdatesAsync(bool manual)
     {
+        if (AppPackageContext.IsPackaged)
+        {
+            if (manual)
+                await UpdateManager.CheckAndPromptAsync(this, showUpToDate: true);
+            return;
+        }
         if (!manual)
         {
             if (_settings.LastUpdateCheckUtc is { } last &&

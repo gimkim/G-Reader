@@ -27,6 +27,15 @@ internal static class UpdateManager
     public static async Task<bool> CheckAndPromptAsync(
         IWin32Window owner, bool showUpToDate, CancellationToken cancellationToken = default)
     {
+        if (AppPackageContext.IsPackaged)
+        {
+            if (showUpToDate)
+                MessageBox.Show(owner,
+                    "Updates for this installation are managed by Microsoft Store.",
+                    "Microsoft Store updates", MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            return false;
+        }
         if (Interlocked.Exchange(ref _checkRunning, 1) != 0) return false;
         try
         {

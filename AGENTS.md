@@ -14,9 +14,11 @@
 ```powershell
 dotnet build -c Release --no-restore
 dotnet publish -c Release -o release --no-restore
+powershell -ExecutionPolicy Bypass -File .\packaging\Store\build-store-msix.ps1
 ```
 
 The current executable is `release\Fast Reader Viewer.exe`.
+The Microsoft Store package is written under `release\store`.
 
 For setting up another development machine, follow `MIGRATION.md`. Runtime
 settings and preview caches live outside the repository and should never be
