@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 namespace CDisplayEx.CSharp;
 
 /// <summary>
-/// Optional nvJPEG decoder. CUDA/nvJPEG/NPP are loaded dynamically so G Reader
+/// Optional nvJPEG decoder. CUDA/nvJPEG/NPP are loaded dynamically so Fast Reader/Viewer
 /// remains portable and always falls back to libjpeg-turbo when unavailable.
 /// A shared nvJPEG handle and a small pool of decoder states, CUDA streams,
 /// device buffers and pinned host buffers stay warm for the process lifetime.

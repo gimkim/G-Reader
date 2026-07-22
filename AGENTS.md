@@ -1,4 +1,4 @@
-# G Reader agent notes
+# Fast Reader/Viewer agent notes
 
 ## Project
 
@@ -16,7 +16,7 @@ dotnet build -c Release --no-restore
 dotnet publish -c Release -o release --no-restore
 ```
 
-The current executable is `release\G Reader.exe`.
+The current executable is `release\Fast Reader Viewer.exe`.
 
 For setting up another development machine, follow `MIGRATION.md`. Runtime
 settings and preview caches live outside the repository and should never be

@@ -183,7 +183,7 @@ internal static class EncodedJpegRenderer
             }
         }
 
-        // G Reader is always fit-to-screen. Ask libjpeg for a decoder-scaled
+        // Fast Reader/Viewer is always fit-to-screen. Ask libjpeg for a decoder-scaled
         // source near the useful output resolution instead of expanding a 45MP
         // photograph only to discard almost all pixels. The quality pass keeps
         // roughly 2x linear oversampling before its final Lanczos resize.

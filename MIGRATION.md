@@ -1,4 +1,4 @@
-# Moving G Reader to another Windows PC
+# Moving Fast Reader/Viewer to another Windows PC
 
 This repository contains the complete source, project assets, dependency
 declarations, license notices, and Codex project notes needed to continue work
@@ -25,11 +25,11 @@ managed and packaged native dependencies declared in
 ```powershell
 New-Item -ItemType Directory -Force "$env:USERPROFILE\source"
 Set-Location "$env:USERPROFILE\source"
-git clone https://github.com/gimkim/G-Reader.git "G Reader"
-Set-Location "G Reader"
+git clone https://github.com/gimkim/G-Reader.git "Fast Reader Viewer"
+Set-Location "Fast Reader Viewer"
 ```
 
-Open that `G Reader` directory as the workspace in Codex. `AGENTS.md` contains
+Open that `Fast Reader Viewer` directory as the workspace in Codex. `AGENTS.md` contains
 the project map, validation commands, responsiveness requirements, and rules
 for preserved versions.
 
@@ -47,27 +47,29 @@ dotnet publish .\CDisplayEx.CSharp.csproj `
   -o .\release
 ```
 
-Run `release\G Reader.exe`. This is a framework-dependent publish, so the .NET
+Run `release\Fast Reader Viewer.exe`. This is a framework-dependent publish, so the .NET
 8 Desktop Runtime must remain installed on machines that only run the published
 application. A development machine with the .NET 8 SDK already satisfies this.
 
 ## 4. Move optional local state
 
 To retain hotkeys, performance tuning, cache limits, window state, and saved
-reading positions, close G Reader and copy:
+reading positions, close Fast Reader/Viewer and copy:
 
 ```text
-%APPDATA%\G Reader\settings.json
+%APPDATA%\Fast Reader Viewer\settings.json
 ```
 
 The persistent preview cache defaults to:
 
 ```text
-%LOCALAPPDATA%\G Reader\PreviewCache
+%LOCALAPPDATA%\Fast Reader Viewer\PreviewCache
 ```
 
-Copying the cache is optional and can be very large. It is safe to omit it; G
-Reader regenerates previews as needed. If a custom cache path was configured,
+Copying the cache is optional and can be very large. It is safe to omit it;
+Fast Reader/Viewer regenerates previews as needed. Existing G Reader settings
+and the default preview cache are detected automatically during migration. If a
+custom cache path was configured,
 either copy that directory too or change the path after the first launch.
 
 ## Repository boundaries

@@ -166,7 +166,7 @@ internal sealed class ReaderSettingsDialog : Form
         _sourceSettings = settings;
         _manualInitialValues = AutomaticInitialValueProfile.FromSettings(settings);
         _automaticInitialValues = AutomaticInitialValueProfile.Detect();
-        Text = "G Reader Settings";
+        Text = "Fast Reader/Viewer Settings";
         FormBorderStyle = FormBorderStyle.Sizable;
         StartPosition = FormStartPosition.CenterParent;
         MaximizeBox = false;
@@ -580,14 +580,14 @@ internal sealed class ReaderSettingsDialog : Form
                 ("Saved positions", clearReadingPositionsRow),
                 ("Random library path", randomPathRow)),
             CreateSection("Windows integration",
-                "Register G Reader for supported image formats and choose which formats open with it by default.",
+                "Register Fast Reader/Viewer for supported image formats and choose which formats open with it by default.",
                 ("Default image viewer", defaultViewerRow)),
             CreateSection("Diagnostics",
-                "Extended logging records session health and errors. If the UI stops responding for eight seconds, G Reader creates a diagnostic dump. Logs are retained for 30 days.",
+                "Extended logging records session health and errors. If the UI stops responding for eight seconds, Fast Reader/Viewer creates a diagnostic dump. Logs are retained for 30 days.",
                 ("Extended logging", _extendedLogging),
                 ("Saved diagnostics", openDiagnosticsFolder)),
             CreateSection("Updates",
-                "G Reader checks the latest published GitHub release. A newer semantic version is downloaded only after confirmation, verified with GitHub's SHA-256 digest, then installed and relaunched.",
+                "Fast Reader/Viewer checks the latest published GitHub release. A newer semantic version is downloaded only after confirmation, verified with GitHub's SHA-256 digest, then installed and relaunched.",
                 ("Current release", updateRow)));
 
         var renderingPage = CreateSettingsPage("Rendering",
@@ -1294,7 +1294,7 @@ internal sealed class ReaderSettingsDialog : Form
     {
         using var dialog = new FolderBrowserDialog
         {
-            Description = "Choose where G Reader stores persistent previews",
+            Description = "Choose where Fast Reader/Viewer stores persistent previews",
             UseDescriptionForTitle = true,
             SelectedPath = Directory.Exists(_persistentCachePath.Text)
                 ? _persistentCachePath.Text

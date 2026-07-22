@@ -5,7 +5,7 @@ namespace CDisplayEx.CSharp;
 
 internal static class WindowsFileAssociations
 {
-    private const string ApplicationName = "G Reader";
+    private const string ApplicationName = "Fast Reader/Viewer";
     private const string ProgId = "GReader.Image";
     private const string CapabilitiesPath = @"Software\GReader\Capabilities";
 
@@ -26,7 +26,10 @@ internal static class WindowsFileAssociations
 
         using (var registeredApplications = Registry.CurrentUser.CreateSubKey(
                    @"Software\RegisteredApplications"))
+        {
             registeredApplications?.SetValue(ApplicationName, CapabilitiesPath);
+            registeredApplications?.DeleteValue("G Reader", throwOnMissingValue: false);
+        }
 
         using (var capabilities = Registry.CurrentUser.CreateSubKey(CapabilitiesPath))
         {
@@ -45,8 +48,8 @@ internal static class WindowsFileAssociations
 
         using (var progId = Registry.CurrentUser.CreateSubKey($@"Software\Classes\{ProgId}"))
         {
-            progId?.SetValue(null, "G Reader image");
-            progId?.SetValue("FriendlyTypeName", "G Reader image");
+            progId?.SetValue(null, "Fast Reader/Viewer image");
+            progId?.SetValue("FriendlyTypeName", "Fast Reader/Viewer image");
         }
         using (var defaultIcon = Registry.CurrentUser.CreateSubKey(
                    $@"Software\Classes\{ProgId}\DefaultIcon"))

@@ -4,9 +4,18 @@ namespace CDisplayEx.CSharp;
 
 internal sealed class UserSettings
 {
-    public static string DefaultPersistentCachePath => Path.Combine(
+    private static string NewPersistentCachePath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "Fast Reader Viewer", "PreviewCache");
+
+    private static string PreviousPersistentCachePath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "G Reader", "PreviewCache");
+
+    public static string DefaultPersistentCachePath =>
+        Directory.Exists(NewPersistentCachePath) || !Directory.Exists(PreviousPersistentCachePath)
+            ? NewPersistentCachePath
+            : PreviousPersistentCachePath;
     public static int DefaultImageMagickThreadsPerImage =>
         Math.Clamp(Environment.ProcessorCount / 4, 2, 8);
     public static int DefaultZoomImageMagickThreadsPerImage =>
@@ -99,6 +108,10 @@ internal sealed class UserSettings
 
     private static string FilePath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "Fast Reader Viewer", "settings.json");
+
+    private static string PreviousFilePath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
         "G Reader", "settings.json");
 
     private static string LegacyFilePath => Path.Combine(
@@ -109,7 +122,9 @@ internal sealed class UserSettings
     {
         try
         {
-            var path = File.Exists(FilePath) ? FilePath : LegacyFilePath;
+            var path = File.Exists(FilePath) ? FilePath
+                : File.Exists(PreviousFilePath) ? PreviousFilePath
+                : LegacyFilePath;
             var settings = File.Exists(path)
                 ? JsonSerializer.Deserialize<UserSettings>(File.ReadAllText(path)) ?? new()
                 : CreateFirstRunDefaults();

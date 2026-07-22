@@ -9,4 +9,5 @@ obj/
 # Local build outputs and preserved binary snapshots
 /release/
 /release-g-reader/
+/release-fast-reader-viewer/
 /versions/

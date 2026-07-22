@@ -37,7 +37,7 @@ internal sealed record PerformanceProfile(
         if (availableBytes <= 0) availableBytes = 8L * 1024 * 1024 * 1024;
         var availableMB = Math.Max(2048L, availableBytes / (1024 * 1024));
 
-        // Keep most RAM outside G Reader for the OS, compressed source data,
+        // Keep most RAM outside Fast Reader/Viewer for the OS, compressed source data,
         // ImageMagick working buffers and transient relaxed-cache headroom.
         var pageCacheMB = RoundDown(Math.Clamp(availableMB / 4, 1024, 16384), 256);
         var aheadMB = RoundDown(pageCacheMB * 3 / 4, 128);

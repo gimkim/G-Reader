@@ -35,18 +35,18 @@ internal static class UpdateManager
             {
                 if (showUpToDate)
                     MessageBox.Show(owner,
-                        $"G Reader {CurrentDisplayVersion} is the latest version.",
+                        $"Fast Reader/Viewer {CurrentDisplayVersion} is the latest version.",
                         "Check for updates", MessageBoxButtons.OK,
                         MessageBoxIcon.Information);
                 return false;
             }
 
             var answer = MessageBox.Show(owner,
-                $"G Reader {update.DisplayVersion} is available and will replace " +
+                $"Fast Reader/Viewer {update.DisplayVersion} is available and will replace " +
                 $"the current version {CurrentDisplayVersion}.\n\n" +
                 $"Download {FormatBytes(update.Size)} and install it now?\n\n" +
-                "G Reader will close and relaunch automatically after the file is replaced.",
-                "G Reader update available", MessageBoxButtons.YesNo,
+                "Fast Reader/Viewer will close and relaunch automatically after the file is replaced.",
+                "Fast Reader/Viewer update available", MessageBoxButtons.YesNo,
                 MessageBoxIcon.Information, MessageBoxDefaultButton.Button1);
             if (answer != DialogResult.Yes) return true;
 
@@ -105,9 +105,11 @@ internal static class UpdateManager
         var version = ParseTagVersion(release.TagName);
         if (version <= CurrentVersion) return null;
         var asset = release.Assets.FirstOrDefault(candidate =>
-            candidate.Name.Equals("G.Reader.exe", StringComparison.OrdinalIgnoreCase))
+            candidate.Name.Equals("Fast.Reader.Viewer.exe", StringComparison.OrdinalIgnoreCase))
+            ?? release.Assets.FirstOrDefault(candidate =>
+                candidate.Name.Equals("G.Reader.exe", StringComparison.OrdinalIgnoreCase))
             ?? throw new InvalidDataException(
-                $"Release {release.TagName} does not contain G.Reader.exe.");
+                $"Release {release.TagName} does not contain Fast.Reader.Viewer.exe.");
         var digest = asset.Digest?.StartsWith("sha256:",
             StringComparison.OrdinalIgnoreCase) == true
             ? asset.Digest[7..].Trim() : null;
@@ -123,10 +125,10 @@ internal static class UpdateManager
         AvailableUpdate update, IProgress<int> progress,
         CancellationToken cancellationToken)
     {
-        var folder = Path.Combine(Path.GetTempPath(), "G Reader Updates",
+        var folder = Path.Combine(Path.GetTempPath(), "Fast Reader Viewer Updates",
             "v" + update.DisplayVersion);
         Directory.CreateDirectory(folder);
-        var path = Path.Combine(folder, "G.Reader.exe.download");
+        var path = Path.Combine(folder, "Fast.Reader.Viewer.exe.download");
         using var response = await Client.GetAsync(update.DownloadUrl,
             HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
@@ -178,9 +180,9 @@ internal static class UpdateManager
         var staged = Path.Combine(Path.GetDirectoryName(target)!,
             "." + Path.GetFileName(target) + ".update");
         var backup = target + ".previous";
-        var log = Path.Combine(Path.GetTempPath(), "G Reader Updates", "update-error.log");
+        var log = Path.Combine(Path.GetTempPath(), "Fast Reader Viewer Updates", "update-error.log");
         // Stage while this process is still alive. This verifies write access to
-        // the installation directory before G Reader closes.
+        // the installation directory before Fast Reader/Viewer closes.
         File.Copy(downloadedPath, staged, overwrite: true);
         static string Quote(string value) => "'" + value.Replace("'", "''") + "'";
         var script = $$"""
@@ -230,7 +232,7 @@ internal static class UpdateManager
     private static HttpClient CreateClient()
     {
         var client = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
-        client.DefaultRequestHeaders.UserAgent.ParseAdd("G-Reader/" + CurrentDisplayVersion);
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("Fast-Reader-Viewer/" + CurrentDisplayVersion);
         client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
         return client;
     }
@@ -289,7 +291,7 @@ internal sealed class UpdateDownloadDialog : Form
 
     public UpdateDownloadDialog(string current, string latest)
     {
-        Text = "Updating G Reader";
+        Text = "Updating Fast Reader/Viewer";
         StartPosition = FormStartPosition.CenterParent;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         ControlBox = false;

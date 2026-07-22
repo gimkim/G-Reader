@@ -9,12 +9,12 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
-    <AssemblyName>G Reader</AssemblyName>
+    <AssemblyName>Fast Reader Viewer</AssemblyName>
     <RootNamespace>CDisplayEx.CSharp</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <ApplicationIcon>assets\g-reader.ico</ApplicationIcon>
-    <AssemblyTitle>G Reader</AssemblyTitle>
-    <Product>G Reader</Product>
+    <ApplicationIcon>assets\fast-reader-viewer.ico</ApplicationIcon>
+    <AssemblyTitle>Fast Reader/Viewer</AssemblyTitle>
+    <Product>Fast Reader/Viewer</Product>
     <Description>Hardware-accelerated comic and image reader</Description>
     <Version>1.4.0</Version>
     <AssemblyVersion>1.4.0.0</AssemblyVersion>

@@ -87,7 +87,7 @@ internal sealed class DeletePdfPageDialog : Form
             Height = 42,
             Padding = new Padding(20, 7, 20, 4),
             ForeColor = Color.FromArgb(255, 205, 120),
-            Text = "This changes the original PDF file. The operation cannot be undone in G Reader."
+            Text = "This changes the original PDF file. The operation cannot be undone in Fast Reader/Viewer."
         };
         var buttons = new FlowLayoutPanel
         {

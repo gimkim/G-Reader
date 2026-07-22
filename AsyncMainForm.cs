@@ -268,7 +268,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         ApplyImageMagickThreadLimit();
         ApplyFastPreviewSchedulerSettings();
         _activePrecacheWorkerCount = PrecacheWorkerCount;
-        Text = "G Reader";
+        Text = "Fast Reader/Viewer";
         Width = 1100;
         Height = 760;
         MinimumSize = new Size(640, 420);
@@ -305,7 +305,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _thumbnailMode = _settings.ThumbnailMode && !_forceInitialFullPage;
         _viewer.JapaneseMode = _settings.JapaneseMode;
         _viewer.ShowShadow = _settings.Shadow;
-        // G Reader always opens and renders pages fitted to the current viewport.
+        // Fast Reader/Viewer always opens and renders pages fitted to the current viewport.
         _viewer.FitToScreen = true;
         _viewer.ApplyReaderSettings(_settings.LanczosQuality,
             Color.FromArgb(_settings.BackgroundArgb), PreviewCacheLimitBytes);
@@ -866,7 +866,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             _suppressPositionEvent = false;
             _bottomPanel.Visible = true;
             if (_sliderItem is not null) _sliderItem.Checked = true;
-            Text = $"{Path.GetFileName(book.SourcePath)} - G Reader";
+            Text = $"{Path.GetFileName(book.SourcePath)} - Fast Reader/Viewer";
             BuildThumbnailPlaceholders(pdfReloadCache?.PageMap);
             var browseEntrySelected = !string.IsNullOrWhiteSpace(preferredBrowsePath) &&
                 _thumbnailGrid.SelectBrowsePath(preferredBrowsePath);
@@ -3598,7 +3598,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             reloadCache = null;
             if (_book is not { } reopened || !PathsEqual(reopened.SourcePath, sourcePath) ||
                 reopened.Pages.Count != newPageCount)
-                throw new InvalidDataException("G Reader could not verify the edited PDF after reloading it.");
+                throw new InvalidDataException("Fast Reader/Viewer could not verify the edited PDF after reloading it.");
 
             // The new PDF is open and verified; backup cleanup must never turn a
             // successful edit into a rollback.
@@ -3782,7 +3782,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         var stem = Path.GetFileNameWithoutExtension(originalName);
         if (string.IsNullOrWhiteSpace(stem)) stem = $"page-{page + 1}";
         foreach (var invalid in Path.GetInvalidFileNameChars()) stem = stem.Replace(invalid, '_');
-        var folder = Path.Combine(Path.GetTempPath(), "G Reader", "Clipboard");
+        var folder = Path.Combine(Path.GetTempPath(), "Fast Reader Viewer", "Clipboard");
         Directory.CreateDirectory(folder);
         var path = Path.Combine(folder, $"{stem}-{Guid.NewGuid():N}{extension}");
         using var source = entry.Open();

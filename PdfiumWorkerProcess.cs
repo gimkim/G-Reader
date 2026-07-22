@@ -426,7 +426,7 @@ internal sealed class PdfiumWorkerClient : IDisposable
     private void Start()
     {
         var executable = Environment.ProcessPath
-            ?? throw new InvalidOperationException("Cannot locate the G Reader executable.");
+            ?? throw new InvalidOperationException("Cannot locate the Fast Reader/Viewer executable.");
         var start = new ProcessStartInfo
         {
             FileName = executable,
@@ -438,12 +438,12 @@ internal sealed class PdfiumWorkerClient : IDisposable
                 "dotnet", StringComparison.OrdinalIgnoreCase))
         {
             var entryAssemblyName = Assembly.GetEntryAssembly()?.GetName().Name
-                ?? throw new InvalidOperationException("Cannot identify G Reader.dll.");
+                ?? throw new InvalidOperationException("Cannot identify Fast Reader Viewer.dll.");
             var entryAssemblyPath = Path.Combine(
                 AppContext.BaseDirectory, $"{entryAssemblyName}.dll");
             if (!File.Exists(entryAssemblyPath))
                 throw new InvalidOperationException(
-                    $"Cannot locate G Reader.dll at '{entryAssemblyPath}'.");
+                    $"Cannot locate Fast Reader Viewer.dll at '{entryAssemblyPath}'.");
             start.ArgumentList.Add(entryAssemblyPath);
         }
         start.ArgumentList.Add(_workerArgument);

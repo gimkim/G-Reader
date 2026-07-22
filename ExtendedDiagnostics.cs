@@ -28,7 +28,7 @@ internal static class ExtendedDiagnostics
     private static readonly ConcurrentDictionary<string, long> RecentErrors = new();
     private static readonly string DiagnosticsFolder = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "G Reader", "Diagnostics");
+        "Fast Reader Viewer", "Diagnostics");
     private static volatile bool _enabled;
     private static int _initialized;
     private static int _dumpInProgress;
@@ -57,7 +57,7 @@ internal static class ExtendedDiagnostics
             var watchdog = new Thread(WatchdogLoop)
             {
                 IsBackground = true,
-                Name = "G Reader diagnostic watchdog",
+                Name = "Fast Reader/Viewer diagnostic watchdog",
                 Priority = ThreadPriority.BelowNormal
             };
             watchdog.Start();
@@ -87,8 +87,9 @@ internal static class ExtendedDiagnostics
 
     private static void ConfigureWindowsErrorReporting(bool enabled)
     {
-        const string relativePath =
-            @"Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\G Reader.exe";
+        var executableName = Path.GetFileName(Application.ExecutablePath);
+        var relativePath =
+            $@"Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\{executableName}";
         try
         {
             if (enabled)
