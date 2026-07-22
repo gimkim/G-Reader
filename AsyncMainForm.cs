@@ -963,6 +963,10 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private async Task ShowPageAsync()
     {
         if (_book is null || _cache is null || _book.Pages.Count == 0) return;
+        ExtendedDiagnostics.Breadcrumb(
+            $"Full-view request started: page={_pageIndex}; source={_book.SourcePath}; " +
+            $"gpuRetirements={GpuInteropDevice.PendingRetirements}; " +
+            $"gpuRetirementBytes={GpuInteropDevice.PendingRetirementBytes}");
         if (_viewer.IsZoomMode) _viewer.ReturnToFit();
         _viewer.StopAnimations();
         CancelAndDisposeInBackground(_displayCancellation);
@@ -2912,6 +2916,11 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private void SetThumbnailMode(bool enabled)
     {
         var layoutVersion = unchecked(++_viewModeLayoutVersion);
+        ExtendedDiagnostics.Breadcrumb(
+            $"View mode transition: from={(_thumbnailMode ? "thumbnail" : "full")}; " +
+            $"to={(enabled ? "thumbnail" : "full")}; page={_pageIndex}; " +
+            $"gpuRetirements={GpuInteropDevice.PendingRetirements}; " +
+            $"gpuRetirementBytes={GpuInteropDevice.PendingRetirementBytes}");
         CancelAndDisposeInBackground(_displayCancellation);
         _displayCancellation = null;
         _viewModeChangedAfterStartup = true;

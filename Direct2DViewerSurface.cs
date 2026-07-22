@@ -34,11 +34,17 @@ internal sealed class Direct2DViewerSurface : Control
     }
 
     private sealed class NativeGpuCacheItem(
-        ID2D1Bitmap bitmap, long bytes, LinkedListNode<GpuRenderedImage> lruNode)
+        ID2D1Bitmap bitmap, GpuRenderedImage.UsageLease usage,
+        long bytes, LinkedListNode<GpuRenderedImage> lruNode) : IDisposable
     {
         public ID2D1Bitmap Bitmap { get; } = bitmap;
         public long Bytes { get; } = bytes;
         public LinkedListNode<GpuRenderedImage> LruNode { get; } = lruNode;
+        public void Dispose()
+        {
+            try { Bitmap.Dispose(); }
+            finally { usage.Dispose(); }
+        }
     }
 
     private const long GpuCacheLimitBytes = 512L * 1024 * 1024;
@@ -556,17 +562,27 @@ internal sealed class Direct2DViewerSurface : Control
             return cached.Bitmap;
         }
 
-        using var surface = source.Texture.QueryInterface<IDXGISurface>();
-        var properties = new BitmapProperties1(
-            new Vortice.DCommon.PixelFormat(
-                Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Ignore),
-            96f, 96f, BitmapOptions.None);
-        var bitmap = _deviceContext.CreateBitmapFromDxgiSurface(surface, properties);
-        var node = _nativeGpuLru.AddLast(source);
-        var item = new NativeGpuCacheItem(bitmap, source.Bytes, node);
-        _nativeGpuCache[source] = item;
-        _gpuCacheBytes += item.Bytes;
-        return bitmap;
+        var usage = source.AcquireUsage();
+        if (usage is null) return null;
+        try
+        {
+            using var surface = source.Texture.QueryInterface<IDXGISurface>();
+            var properties = new BitmapProperties1(
+                new Vortice.DCommon.PixelFormat(
+                    Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Ignore),
+                96f, 96f, BitmapOptions.None);
+            var bitmap = _deviceContext.CreateBitmapFromDxgiSurface(surface, properties);
+            var node = _nativeGpuLru.AddLast(source);
+            var item = new NativeGpuCacheItem(bitmap, usage, source.Bytes, node);
+            _nativeGpuCache[source] = item;
+            _gpuCacheBytes += item.Bytes;
+            return bitmap;
+        }
+        catch
+        {
+            usage.Dispose();
+            throw;
+        }
     }
 
     private void TrimGpuCache()
@@ -629,7 +645,7 @@ internal sealed class Direct2DViewerSurface : Control
             _gpuCacheBytes -= item.Bytes;
             disposedItems++;
             releasedBytes += item.Bytes;
-            item.Bitmap.Dispose();
+            item.Dispose();
         }
         if (_gpuCacheBytes > GpuCacheLimitBytes)
             _gpuTrimTimer.Start();
@@ -914,7 +930,7 @@ internal sealed class Direct2DViewerSurface : Control
         _zoomBaseBitmap = null;
         _zoomDetailLayers.Clear();
         foreach (var item in _gpuCache.Values) item.Bitmap.Dispose();
-        foreach (var item in _nativeGpuCache.Values) item.Bitmap.Dispose();
+        foreach (var item in _nativeGpuCache.Values) item.Dispose();
         _gpuCache.Clear();
         _gpuLru.Clear();
         _nativeGpuCache.Clear();

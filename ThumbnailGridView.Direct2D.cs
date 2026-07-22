@@ -23,11 +23,17 @@ internal sealed partial class ThumbnailGridView
         public LinkedListNode<Bitmap> LruNode { get; } = lruNode;
     }
     private sealed class NativeThumbnailGpuCacheItem(
-        ID2D1Bitmap texture, long bytes, LinkedListNode<GpuRenderedImage> lruNode)
+        ID2D1Bitmap texture, GpuRenderedImage.UsageLease usage,
+        long bytes, LinkedListNode<GpuRenderedImage> lruNode) : IDisposable
     {
         public ID2D1Bitmap Texture { get; } = texture;
         public long Bytes { get; } = bytes;
         public LinkedListNode<GpuRenderedImage> LruNode { get; } = lruNode;
+        public void Dispose()
+        {
+            try { Texture.Dispose(); }
+            finally { usage.Dispose(); }
+        }
     }
     private sealed class RetiredThumbnailGpuBatch(
         Queue<(IDisposable Resource, long Bytes)> resources,
@@ -754,6 +760,7 @@ internal sealed partial class ThumbnailGridView
             ScheduleGpuSourceRecovery();
             return null;
         }
+        GpuRenderedImage.UsageLease? usage = null;
         try
         {
             if (_nativeThumbnailGpuCache.TryGetValue(source, out var cached))
@@ -762,6 +769,8 @@ internal sealed partial class ThumbnailGridView
                 _nativeThumbnailGpuLru.AddLast(cached.LruNode);
                 return cached.Texture;
             }
+            usage = source.AcquireUsage();
+            if (usage is null) return null;
             using var surface = source.Texture.QueryInterface<IDXGISurface>();
             var properties = new BitmapProperties1(
                 new Vortice.DCommon.PixelFormat(
@@ -769,13 +778,15 @@ internal sealed partial class ThumbnailGridView
                 96f, 96f, BitmapOptions.None);
             var texture = _thumbnailDeviceContext.CreateBitmapFromDxgiSurface(surface, properties);
             var node = _nativeThumbnailGpuLru.AddLast(source);
-            var item = new NativeThumbnailGpuCacheItem(texture, source.Bytes, node);
+            var item = new NativeThumbnailGpuCacheItem(texture, usage, source.Bytes, node);
+            usage = null;
             _nativeThumbnailGpuCache[source] = item;
             _thumbnailGpuCacheBytes += item.Bytes;
             return texture;
         }
         catch (Exception exception)
         {
+            usage?.Dispose();
             ExtendedDiagnostics.LogException(
                 "Native GPU thumbnail import failed", exception,
                 $"source={source.Width}x{source.Height}; bytes={source.Bytes}");
@@ -912,7 +923,7 @@ internal sealed partial class ThumbnailGridView
             _thumbnailGpuCacheBytes -= item.Bytes;
             bytes += item.Bytes;
             items++;
-            item.Texture.Dispose();
+            item.Dispose();
         }
         if (_thumbnailGpuCacheBytes > _thumbnailGpuCacheLimitBytes)
             _thumbnailGpuTrimTimer.Start();
@@ -929,13 +940,17 @@ internal sealed partial class ThumbnailGridView
         foreach (var item in _thumbnailGpuCache.Values)
             resources.Enqueue((item.Texture, item.Bytes));
         foreach (var item in _nativeThumbnailGpuCache.Values)
-            resources.Enqueue((item.Texture, item.Bytes));
+            resources.Enqueue((item, item.Bytes));
         _thumbnailGpuCache.Clear();
         _thumbnailGpuLru.Clear();
         _nativeThumbnailGpuCache.Clear();
         _nativeThumbnailGpuLru.Clear();
         _thumbnailGpuCacheBytes = 0;
         if (resources.Count == 0) return Task.CompletedTask;
+
+        ExtendedDiagnostics.Breadcrumb(
+            $"Thumbnail D2D retirement batch queued: resources={resources.Count}; " +
+            $"batches={_retiredThumbnailGpuBatches.Count + 1}");
 
         var completion = new TaskCompletionSource(
             TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1006,7 +1021,7 @@ internal sealed partial class ThumbnailGridView
         _thumbnailGpuUploadTimer.Stop();
         _thumbnailGpuTrimTimer.Stop();
         foreach (var item in _thumbnailGpuCache.Values) item.Texture.Dispose();
-        foreach (var item in _nativeThumbnailGpuCache.Values) item.Texture.Dispose();
+        foreach (var item in _nativeThumbnailGpuCache.Values) item.Dispose();
         _thumbnailGpuCache.Clear();
         _thumbnailGpuLru.Clear();
         _nativeThumbnailGpuCache.Clear();

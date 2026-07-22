@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
@@ -8,12 +9,84 @@ namespace CDisplayEx.CSharp;
 /// <summary>One process-wide D3D11 device shared by Direct2D and CUDA.</summary>
 internal static class GpuInteropDevice
 {
+    private sealed record Retirement(Action Release, long Bytes, string Kind);
+
     private static readonly object Gate = new();
+    private static readonly ConcurrentQueue<Retirement> RetirementQueue = new();
+    private static readonly SemaphoreSlim RetirementSignal = new(0);
     private static ID3D11Device? _device;
     private static int _initializationState;
     private static long _generation;
+    private static int _retirementWorkerStarted;
+    private static int _pendingRetirements;
+    private static long _pendingRetirementBytes;
 
     public static long Generation => Volatile.Read(ref _generation);
+    public static int PendingRetirements => Volatile.Read(ref _pendingRetirements);
+    public static long PendingRetirementBytes => Volatile.Read(ref _pendingRetirementBytes);
+
+    internal static void QueueRetirement(Action release, Task? barrier,
+        long bytes, string kind)
+    {
+        ArgumentNullException.ThrowIfNull(release);
+        barrier ??= Task.CompletedTask;
+        var count = Interlocked.Increment(ref _pendingRetirements);
+        var queuedBytes = Interlocked.Add(ref _pendingRetirementBytes, Math.Max(0, bytes));
+        EnsureRetirementWorker();
+        var retirement = new Retirement(release, Math.Max(0, bytes), kind);
+        if (barrier.IsCompleted)
+        {
+            EnqueueReadyRetirement(retirement);
+        }
+        else
+        {
+            _ = barrier.ContinueWith(static (_, state) =>
+                EnqueueReadyRetirement((Retirement)state!), retirement,
+                CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+        if (count == 1 || count % 64 == 0)
+            ExtendedDiagnostics.Breadcrumb(
+                $"GPU retirement queued: pending={count}; bytes={queuedBytes}; kind={kind}");
+    }
+
+    private static void EnsureRetirementWorker()
+    {
+        if (Interlocked.Exchange(ref _retirementWorkerStarted, 1) != 0) return;
+        _ = Task.Run(ProcessRetirementsAsync);
+    }
+
+    private static void EnqueueReadyRetirement(Retirement retirement)
+    {
+        RetirementQueue.Enqueue(retirement);
+        RetirementSignal.Release();
+    }
+
+    private static async Task ProcessRetirementsAsync()
+    {
+        while (true)
+        {
+            await RetirementSignal.WaitAsync().ConfigureAwait(false);
+            if (!RetirementQueue.TryDequeue(out var item)) continue;
+            try
+            {
+                item.Release();
+            }
+            catch (Exception exception)
+            {
+                ExtendedDiagnostics.LogException(
+                    "GPU resource retirement failed", exception, $"kind={item.Kind}");
+            }
+            finally
+            {
+                var bytes = Interlocked.Add(ref _pendingRetirementBytes, -item.Bytes);
+                var count = Interlocked.Decrement(ref _pendingRetirements);
+                if (count == 0)
+                    ExtendedDiagnostics.Breadcrumb(
+                        $"GPU retirement queue drained: bytes={Math.Max(0, bytes)}");
+            }
+        }
+    }
 
     public static ID3D11Device? Device
     {
@@ -127,9 +200,20 @@ internal static class GpuInteropDevice
 
 internal sealed class GpuRenderedImage : IDisposable
 {
+    internal sealed class UsageLease : IDisposable
+    {
+        private GpuRenderedImage? _owner;
+        internal UsageLease(GpuRenderedImage owner) => _owner = owner;
+        public void Dispose() => Interlocked.Exchange(ref _owner, null)?.ReleaseUsage();
+    }
+
+    private readonly object _lifetimeGate = new();
     private readonly Action<IntPtr> _unregister;
     private IntPtr _cudaResource;
-    private int _disposed;
+    private int _usageCount;
+    private bool _retirementRequested;
+    private bool _retirementQueued;
+    private Task _retirementBarrier = Task.CompletedTask;
     private byte[]? _encodedJpeg;
 
     public ID3D11Texture2D Texture { get; }
@@ -149,18 +233,69 @@ internal sealed class GpuRenderedImage : IDisposable
         _encodedJpeg = encodedJpeg;
     }
 
-    public void Dispose()
+    /// <summary>
+    /// Keeps the source D3D texture alive while a Direct2D bitmap imports its
+    /// DXGI surface. The source owner can retire concurrently; final native
+    /// release waits until every imported view has gone away.
+    /// </summary>
+    public UsageLease? AcquireUsage()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        var resource = Interlocked.Exchange(ref _cudaResource, IntPtr.Zero);
-        if (resource != IntPtr.Zero)
+        lock (_lifetimeGate)
         {
-            try { _unregister(resource); }
-            catch { }
+            if (_retirementRequested) return null;
+            _usageCount++;
+            return new UsageLease(this);
         }
-        Texture.Dispose();
+    }
+
+    public void Dispose() => RetireAfter(Task.CompletedTask);
+
+    public void RetireAfter(Task? barrier)
+    {
+        var queue = false;
+        lock (_lifetimeGate)
+        {
+            if (_retirementRequested) return;
+            _retirementRequested = true;
+            _retirementBarrier = barrier ?? Task.CompletedTask;
+            if (_usageCount == 0)
+            {
+                _retirementQueued = true;
+                queue = true;
+            }
+        }
+        if (queue) QueueNativeRetirement();
         GC.SuppressFinalize(this);
     }
 
-    ~GpuRenderedImage() => Dispose();
+    private void ReleaseUsage()
+    {
+        var queue = false;
+        lock (_lifetimeGate)
+        {
+            if (_usageCount > 0) _usageCount--;
+            if (_usageCount == 0 && _retirementRequested && !_retirementQueued)
+            {
+                _retirementQueued = true;
+                queue = true;
+            }
+        }
+        if (queue) QueueNativeRetirement();
+    }
+
+    private void QueueNativeRetirement()
+    {
+        GpuInteropDevice.QueueRetirement(() =>
+        {
+            var resource = Interlocked.Exchange(ref _cudaResource, IntPtr.Zero);
+            if (resource != IntPtr.Zero)
+            {
+                try { _unregister(resource); }
+                catch { }
+            }
+            Texture.Dispose();
+        }, _retirementBarrier, Bytes, "GpuRenderedImage");
+    }
+
+    ~GpuRenderedImage() => RetireAfter(Task.CompletedTask);
 }

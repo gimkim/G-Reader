@@ -173,11 +173,7 @@ internal sealed class GpuThumbnailRenderCache : IDisposable
     {
         var pending = images.ToArray();
         if (pending.Length == 0) return;
-        _ = Task.Run(async () =>
-        {
-            if (retirementBarrier is not null)
-                await retirementBarrier.ConfigureAwait(false);
-            foreach (var image in pending) image.Dispose();
-        });
+        var barrier = retirementBarrier ?? Task.CompletedTask;
+        foreach (var image in pending) image.RetireAfter(barrier);
     }
 }
