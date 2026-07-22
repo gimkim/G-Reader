@@ -10,15 +10,44 @@ internal sealed class PageCache : IDisposable
     }
 
     private readonly object _gate = new();
-    private readonly Func<int, Bitmap> _loader;
+    private Func<int, CancellationToken, Bitmap> _loader;
     private readonly Dictionary<int, CacheItem> _items = [];
     private readonly System.Collections.Concurrent.ConcurrentDictionary<int, long> _pageBytes = [];
-    private readonly CancellationTokenSource _lifetime = new();
+    private CancellationTokenSource _lifetime = new();
     private long _cachedBytes;
 
-    public PageCache(Func<int, Bitmap> loader)
+    public PageCache(Func<int, CancellationToken, Bitmap> loader)
     {
         _loader = loader;
+    }
+
+    public void RebindLoader(Func<int, CancellationToken, Bitmap> loader)
+    {
+        ArgumentNullException.ThrowIfNull(loader);
+        CancellationTokenSource? retired = null;
+        lock (_gate)
+        {
+            _loader = loader;
+            if (_lifetime.IsCancellationRequested)
+            {
+                retired = _lifetime;
+                _lifetime = new CancellationTokenSource();
+            }
+        }
+        retired?.Dispose();
+    }
+
+    public void SuspendLoader(Func<int, CancellationToken, Bitmap> loader)
+    {
+        ArgumentNullException.ThrowIfNull(loader);
+        CancellationTokenSource lifetime;
+        lock (_gate)
+        {
+            _loader = loader;
+            lifetime = _lifetime;
+        }
+        try { lifetime.Cancel(); }
+        catch (ObjectDisposedException) { }
     }
 
     public long CachedBytes
@@ -27,7 +56,8 @@ internal sealed class PageCache : IDisposable
     }
 
     public PageCache CreateRemapped(
-        Func<int, Bitmap> loader, IReadOnlyDictionary<int, int> oldToNewPage)
+        Func<int, CancellationToken, Bitmap> loader,
+        IReadOnlyDictionary<int, int> oldToNewPage)
     {
         var remapped = new PageCache(loader);
         lock (_gate)
@@ -159,15 +189,18 @@ internal sealed class PageCache : IDisposable
 
     public void Dispose()
     {
-        _lifetime.Cancel();
+        CancellationTokenSource lifetime;
         CacheItem[] items;
         lock (_gate)
         {
+            lifetime = _lifetime;
             items = _items.Values.ToArray();
             _items.Clear();
             _pageBytes.Clear();
             _cachedBytes = 0;
         }
+        try { lifetime.Cancel(); }
+        catch (ObjectDisposedException) { }
 
         var completed = items.Where(item => item.Task.IsCompletedSuccessfully).ToArray();
         foreach (var item in items.Where(item => !item.Task.IsCompletedSuccessfully))
@@ -182,7 +215,7 @@ internal sealed class PageCache : IDisposable
             {
                 foreach (var item in completed) DisposeBitmap(item.Task.Result);
             });
-        _lifetime.Dispose();
+        lifetime.Dispose();
     }
 
     private CacheItem GetOrCreate(int index, bool acquire = false)
@@ -197,11 +230,12 @@ internal sealed class PageCache : IDisposable
             }
 
             _items.Remove(index);
+            var lifetimeToken = _lifetime.Token;
             var task = Task.Run(() =>
             {
-                _lifetime.Token.ThrowIfCancellationRequested();
-                return _loader(index);
-            }, _lifetime.Token);
+                lifetimeToken.ThrowIfCancellationRequested();
+                return Volatile.Read(ref _loader)(index, lifetimeToken);
+            }, lifetimeToken);
             var item = new CacheItem(task);
             if (acquire) item.ActiveReaders++;
             _items[index] = item;

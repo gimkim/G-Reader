@@ -20,7 +20,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
         public void Attach(PageCache? cache) => _sourceCache = cache;
 
-        public PageCache CreatePageCache(Func<int, Bitmap> loader)
+        public PageCache CreatePageCache(
+            Func<int, CancellationToken, Bitmap> loader)
         {
             var source = _sourceCache;
             _sourceCache = null;
@@ -838,16 +839,27 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                     _rotations[pair.Key] = pair.Value;
                 foreach (var pair in pdfReloadCache.LandscapePages)
                     _landscapePages[pair.Key] = pair.Value;
-                _cache = pdfReloadCache.CreatePageCache(index => DecodePage(book, index));
+                _cache = pdfReloadCache.CreatePageCache(
+                    (index, token) => DecodePage(book, index, token));
                 await PersistentPreviewCache.ApplyPdfRemapAsync(
                     pdfReloadCache.PersistentPlan, book);
             }
             else
             {
-                _cache = (!forceFreshPageCache
+                var retained = !forceFreshPageCache
                     ? TakeRetainedPageCache(book.SourcePath)
-                    : null) ??
-                    new PageCache(index => DecodePage(book, index));
+                    : null;
+                if (retained is not null)
+                {
+                    retained.RebindLoader(
+                        (index, token) => DecodePage(book, index, token));
+                    _cache = retained;
+                }
+                else
+                {
+                    _cache = new PageCache(
+                        (index, token) => DecodePage(book, index, token));
+                }
             }
             _viewer.ActivateBookCache(book.SourcePath);
             _bookPrecacheStarted = false;
@@ -1879,12 +1891,14 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     }
 
 
-    private Bitmap DecodePage(Book book, int index)
+    private Bitmap DecodePage(Book book, int index,
+        CancellationToken cancellationToken = default)
     {
         var page = book.Pages[index];
-        if (page.Decode is not null) return page.Decode();
+        cancellationToken.ThrowIfCancellationRequested();
+        if (page.Decode is not null) return page.Decode(cancellationToken);
         using var formatLease = ImagePipelineTuning.EnterFormat(
-            page.Name, _bookCancellation?.Token ?? CancellationToken.None);
+            page.Name, cancellationToken);
         if (Path.GetExtension(page.Name).Equals(".webp", StringComparison.OrdinalIgnoreCase))
         {
             try
@@ -1892,7 +1906,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 // Static preview/cache work intentionally decodes only frame 1.
                 // Animation frames are requested lazily only by the visible-page path.
                 return AnimatedImageRenderer.DecodeWebPPoster(
-                    page, _bookCancellation?.Token ?? CancellationToken.None);
+                    page, cancellationToken);
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception exception)
@@ -2602,8 +2616,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 ? new Size(targetSize.Height, targetSize.Width)
                 : targetSize;
             var bitmap = entry.DecodeThumbnail is { } decodeThumbnail
-                ? decodeThumbnail(decodeTarget, oversample)
-                : DecodePage(book, page);
+                ? decodeThumbnail(decodeTarget, oversample, cancellationToken)
+                : DecodePage(book, page, cancellationToken);
             try
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -3300,11 +3314,18 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         if (cache is not null)
         {
             if (retainPageCache && _book is { } book)
+            {
+                // A retained cache needs its completed bitmaps, not the old Book.
+                // Drop the loader closure before disposing the PDF renderer so
+                // worker documents do not accumulate across navigation.
+                cache.SuspendLoader((_, _) => throw new OperationCanceledException(
+                    "The retained page cache is inactive."));
                 RetainPageCache(book.SourcePath, cache);
+            }
             else
                 _ = Task.Run(cache.Dispose);
         }
-        if (!retainPageCache) _book?.Dispose();
+        _book?.Dispose();
     }
 
     private string GetPageCachePoolKey(string sourcePath) => string.Join("|",
@@ -3499,7 +3520,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 try
                 {
                     return await Task.Run(() =>
-                        entry.DecodeThumbnail?.Invoke(previewSize, 1f) ?? entry.Decode?.Invoke(),
+                        entry.DecodeThumbnail?.Invoke(previewSize, 1f, previewToken) ??
+                            entry.Decode?.Invoke(previewToken),
                         previewToken);
                 }
                 finally { previewSlots.Release(); }

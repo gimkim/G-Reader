@@ -256,7 +256,8 @@ internal static class BrowsePreviewRenderer
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        using var document = PdfRendering.Open(path, background: true);
+        using var document = PdfRendering.Open(
+            path, background: true, cancellationToken);
         Bitmap?[] previews = [];
         try
         {
@@ -292,7 +293,8 @@ internal static class BrowsePreviewRenderer
         // the selected PDF engine for 2x detail, then applies Lanczos
         // filter once. Pixel data never takes an encoded stream round-trip.
         using var raster = document.RenderPageToFit(
-            index, targetSize, fastPreview ? 1f : 2f, background: true);
+            index, targetSize, fastPreview ? 1f : 2f, background: true,
+            cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
         if (!fastPreview)
             return AsyncViewerPanel.CreateLanczosThumbnail(

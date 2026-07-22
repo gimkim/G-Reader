@@ -3,10 +3,12 @@ namespace CDisplayEx.CSharp;
 internal interface IPdfDocumentRenderer : IDisposable
 {
     int PageCount { get; }
-    Bitmap RenderPage(int pageIndex, float scale = 1.5f, bool background = false);
+    Bitmap RenderPage(int pageIndex, float scale = 1.5f, bool background = false,
+        CancellationToken cancellationToken = default);
     Bitmap RenderPageToFit(int pageIndex, Size targetSize, float oversample = 1f,
-        bool background = false);
-    Stream RenderPageStream(int pageIndex, bool background = false);
+        bool background = false, CancellationToken cancellationToken = default);
+    Stream RenderPageStream(int pageIndex, bool background = false,
+        CancellationToken cancellationToken = default);
 }
 
 internal static class PdfRendering
@@ -21,8 +23,9 @@ internal static class PdfRendering
         set => PdfiumProcessPoolManager.ConfiguredCount = value;
     }
 
-    public static IPdfDocumentRenderer Open(string path, bool background = false) =>
-        new PdfiumDocumentRenderer(path, background);
+    public static IPdfDocumentRenderer Open(string path, bool background = false,
+        CancellationToken cancellationToken = default) =>
+        new PdfiumDocumentRenderer(path, background, cancellationToken);
 
     internal static bool TryGetCachedPageCount(string path, out int pageCount)
     {

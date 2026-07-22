@@ -15,7 +15,10 @@ internal static unsafe class PdfiumWorkerServer
     private const int PageObjectImage = 3;
     private const int RenderAnnotations = 0x01;
     private const int RenderLcdText = 0x02;
-    private const int MaximumOpenDocumentsPerWorker = 8;
+    // A pool worker only needs the actively opened book and at most one cover
+    // document. Keeping eight large PDFs per process retained hundreds of MB
+    // after long folder-browsing sessions.
+    private const int MaximumOpenDocumentsPerWorker = 2;
     private const ulong MaximumExtractedJpegBytes = 1024UL * 1024 * 1024;
 
     private enum Command : byte
@@ -525,6 +528,11 @@ internal sealed class PdfiumProcessPool : IDisposable
     private readonly PdfiumWorkerClient[] _workers;
     private readonly SemaphoreSlim _slots;
     private readonly SemaphoreSlim _backgroundSlots;
+    private readonly SemaphoreSlim _documentCloseGate = new(1, 1);
+    private readonly ConcurrentDictionary<string, int> _documentReferences =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> _pendingDocumentCloses =
+        new(StringComparer.OrdinalIgnoreCase);
     private int _referenceCount;
     private int _retired;
     private int _disposed;
@@ -556,6 +564,29 @@ internal sealed class PdfiumProcessPool : IDisposable
 
     public void AddReference() => Interlocked.Increment(ref _referenceCount);
 
+    public void AddDocumentReference(string path)
+    {
+        path = Path.GetFullPath(path);
+        _documentReferences.AddOrUpdate(path, 1, static (_, count) => count + 1);
+    }
+
+    public void ReleaseDocumentReference(string path)
+    {
+        path = Path.GetFullPath(path);
+        while (_documentReferences.TryGetValue(path, out var count))
+        {
+            if (count > 1)
+            {
+                if (_documentReferences.TryUpdate(path, count - 1, count)) return;
+                continue;
+            }
+            if (!_documentReferences.TryRemove(
+                    new KeyValuePair<string, int>(path, count))) continue;
+            QueueDocumentClose(path);
+            return;
+        }
+    }
+
     public void ReleaseReference()
     {
         if (Interlocked.Decrement(ref _referenceCount) == 0 &&
@@ -569,13 +600,14 @@ internal sealed class PdfiumProcessPool : IDisposable
     }
 
     public T Execute<T>(Func<PdfiumWorkerClient, T> operation,
-        bool background = false)
+        bool background = false, CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-        if (background) _backgroundSlots.Wait();
+        cancellationToken.ThrowIfCancellationRequested();
+        if (background) _backgroundSlots.Wait(cancellationToken);
         try
         {
-            _slots.Wait();
+            _slots.Wait(cancellationToken);
             if (!_available.TryDequeue(out var worker))
             {
                 _slots.Release();
@@ -594,6 +626,48 @@ internal sealed class PdfiumProcessPool : IDisposable
     public void CloseDocument(string path)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        _documentCloseGate.Wait();
+        try { CloseDocumentCore(path); }
+        finally { _documentCloseGate.Release(); }
+    }
+
+    private void QueueDocumentClose(string path)
+    {
+        if (!_pendingDocumentCloses.TryAdd(path, 0)) return;
+        // Keep a retired pool alive until its queued native handles are closed.
+        AddReference();
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                _documentCloseGate.Wait();
+                try
+                {
+                    // A new renderer may have acquired the same path while this
+                    // cleanup waited behind active page renders.
+                    if (!_documentReferences.ContainsKey(path) &&
+                        Volatile.Read(ref _disposed) == 0)
+                        CloseDocumentCore(path);
+                }
+                finally { _documentCloseGate.Release(); }
+            }
+            catch (ObjectDisposedException) { }
+            catch (Exception exception)
+            {
+                ExtendedDiagnostics.LogException(
+                    "PDFium idle document cleanup failed", exception,
+                    $"path={path}");
+            }
+            finally
+            {
+                _pendingDocumentCloses.TryRemove(path, out _);
+                ReleaseReference();
+            }
+        });
+    }
+
+    private void CloseDocumentCore(string path)
+    {
         var acquired = 0;
         var workers = new List<PdfiumWorkerClient>(_workers.Length);
         try
@@ -620,6 +694,7 @@ internal sealed class PdfiumProcessPool : IDisposable
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         foreach (var worker in _workers) worker.Dispose();
+        _documentCloseGate.Dispose();
         _backgroundSlots.Dispose();
         _slots.Dispose();
     }
