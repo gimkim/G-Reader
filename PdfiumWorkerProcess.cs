@@ -33,7 +33,12 @@ internal static unsafe class PdfiumWorkerServer
                 args[0], WorkerArgument, StringComparison.OrdinalIgnoreCase)) return false;
         using var input = new AnonymousPipeClientStream(PipeDirection.In, args[1]);
         using var output = new AnonymousPipeClientStream(PipeDirection.Out, args[2]);
-        Run(input, output);
+        try { Run(input, output); }
+        catch (IOException)
+        {
+            // BinaryWriter.Dispose may flush after Run's loop has already left
+            // its pipe-error guard. A vanished parent is a normal worker exit.
+        }
         return true;
     }
 

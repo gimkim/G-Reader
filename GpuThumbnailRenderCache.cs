@@ -23,6 +23,7 @@ internal sealed class GpuThumbnailRenderCache : IDisposable
         public long Bytes { get; } = image.Bytes;
         public long Sequence { get; set; } = sequence;
         public int Readers { get; set; }
+        public bool Retired { get; set; }
     }
     private readonly object _gate = new();
     private readonly Dictionary<Key, Entry> _items = [];
@@ -69,15 +70,33 @@ internal sealed class GpuThumbnailRenderCache : IDisposable
     }
     public void Clear()
     {
-        GpuRenderedImage[] images;
+        List<GpuRenderedImage> images = [];
         lock (_gate)
-        { images = _items.Values.Select(x => x.Image).ToArray(); _items.Clear(); _keysByPage.Clear(); _bytes = 0; }
-        if (images.Length > 0) _ = Task.Run(() => { foreach (var image in images) image.Dispose(); });
+        {
+            foreach (var entry in _items.Values)
+            {
+                entry.Retired = true;
+                if (entry.Readers == 0) images.Add(entry.Image);
+            }
+            _items.Clear();
+            _keysByPage.Clear();
+            _bytes = 0;
+        }
+        DisposeInBackground(images);
     }
     public void Dispose() => Clear();
     private Lease Acquire(Entry entry, bool exact)
     { entry.Readers++; entry.Sequence = ++_sequence; return new(this, entry, exact); }
-    private void Release(Entry entry) { lock (_gate) entry.Readers--; }
+    private void Release(Entry entry)
+    {
+        GpuRenderedImage? retired = null;
+        lock (_gate)
+        {
+            entry.Readers--;
+            if (entry.Readers == 0 && entry.Retired) retired = entry.Image;
+        }
+        if (retired is not null) DisposeInBackground([retired]);
+    }
     private void ScheduleTrim(bool force)
     {
         var limit = Volatile.Read(ref _limit);
@@ -107,6 +126,16 @@ internal sealed class GpuThumbnailRenderCache : IDisposable
                 evicted.Add(candidate.Value.Image);
             }
         }
-        foreach (var image in evicted) image.Dispose();
+        DisposeInBackground(evicted);
+    }
+
+    private static void DisposeInBackground(IEnumerable<GpuRenderedImage> images)
+    {
+        var pending = images.ToArray();
+        if (pending.Length == 0) return;
+        _ = Task.Run(() =>
+        {
+            foreach (var image in pending) image.Dispose();
+        });
     }
 }

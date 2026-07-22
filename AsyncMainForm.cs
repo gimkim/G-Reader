@@ -2586,34 +2586,17 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         Bitmap result;
         if (EncodedJpegRenderer.Supports(entry))
         {
-            var gpuRendered = fastPreview
-                ? await RenderWorkScheduler.RunFastCodecAsync(
-                    () => EncodedJpegRenderer.RenderThumbnailGpu(
-                        entry, targetSize, rotation, fastPreview: true, jpegQuality: 82,
-                        cancellationToken), cancellationToken).ConfigureAwait(false)
-                : await RenderWorkScheduler.RunFullAsync(
-                    () => EncodedJpegRenderer.RenderThumbnailGpu(
-                        entry, targetSize, rotation, fastPreview: false, jpegQuality: 92,
-                        cancellationToken), cancellationToken).ConfigureAwait(false);
-            if (gpuRendered is { } direct)
-            {
-                if (direct.Image.TakeEncodedJpeg() is { Length: > 0 } encoded)
-                    PersistentPreviewCache.StoreEncodedInBackground(
-                        persistentKind, book, page, targetSize, rotation,
-                        persistentQuality, encoded);
-                return new GeneratedThumbnail(null, direct.Image);
-            }
             var rendered = fastPreview
                 ? await RenderWorkScheduler.RunFastCodecAsync(
-                    () => EncodedJpegRenderer.RenderThumbnail(
+                    () => EncodedJpegRenderer.RenderThumbnailStagedGpu(
                         entry, targetSize, rotation, _settings.LanczosQuality,
-                        fastPreview: true, cancellationToken), cancellationToken)
-                    .ConfigureAwait(false)
+                        fastPreview: true,
+                        cancellationToken), cancellationToken).ConfigureAwait(false)
                 : await RenderWorkScheduler.RunFullAsync(
-                    () => EncodedJpegRenderer.RenderThumbnail(
+                    () => EncodedJpegRenderer.RenderThumbnailStagedGpu(
                         entry, targetSize, rotation, _settings.LanczosQuality,
-                        fastPreview: false, cancellationToken), cancellationToken)
-                    .ConfigureAwait(false);
+                        fastPreview: false,
+                        cancellationToken), cancellationToken).ConfigureAwait(false);
             result = rendered.Bitmap;
         }
         else
@@ -2629,7 +2612,13 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 book, page, targetSize, fastPreview ? 1f : 2f,
                 cancellationToken).ConfigureAwait(false);
             var sourceBytes = (long)image.Width * image.Height * 4;
-            if (fastPreview && ImagePipelineTuning.UseGenericGpuFastPreview &&
+            // PDF pages already arrive at thumbnail size from the PDF renderer.
+            // Do not create their D3D textures on background D2D contexts while
+            // the thumbnail UI is presenting; the NVIDIA driver can AV under
+            // that cross-context resource churn. The UI still uploads and draws
+            // these previews as paced Direct2D GPU textures.
+            if (entry.DecodeThumbnail is null && fastPreview &&
+                ImagePipelineTuning.UseGenericGpuFastPreview &&
                 sourceBytes <= ImagePipelineTuning.GenericGpuFastMaximumSourceBytes)
             {
                 var gpu = await RenderWorkScheduler.RunFastCodecAsync(() =>
@@ -2649,9 +2638,9 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                     return new GeneratedThumbnail(null, gpu);
                 }
             }
-            if (!fastPreview && ImagePipelineTuning.UseGenericGpuLanczos &&
-                (entry.DecodeThumbnail is not null ||
-                 sourceBytes >= ImagePipelineTuning.GenericGpuMinimumSourceBytes))
+            if (entry.DecodeThumbnail is null && !fastPreview &&
+                ImagePipelineTuning.UseGenericGpuLanczos &&
+                sourceBytes >= ImagePipelineTuning.GenericGpuMinimumSourceBytes)
             {
                 var gpu = await RenderWorkScheduler.RunFullAsync(() =>
                 {

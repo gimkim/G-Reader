@@ -33,6 +33,10 @@ internal static unsafe class NvJpegNativeDecoder
     // This is only a safety ceiling. Actual background concurrency is admitted
     // by available VRAM and each image's estimated working set below.
     private static readonly SemaphoreSlim BackgroundGpuSlots = new(MaximumGpuWorkers - 1);
+    // NVIDIA's CUDA-D3D registration path is much less tolerant of concurrent
+    // resource churn than nvJPEG/NPP compute. Keep decode and resize parallel,
+    // but serialize only the short handoff that exposes a finished texture to D3D.
+    private static readonly SemaphoreSlim DirectTextureInteropGate = new(1, 1);
     private static SemaphoreSlim _configuredGpuSlots = new(MaximumGpuWorkers);
     private static SemaphoreSlim _configuredBackgroundSlots = new(8);
     private static int _vramHeadroomPercent = 15;
@@ -41,6 +45,23 @@ internal static unsafe class NvJpegNativeDecoder
     private static readonly SemaphoreSlim VramReleased = new(0, int.MaxValue);
     private static long _remainingBatchVram;
     private static int _activeVramLeases;
+
+    private sealed class DirectTextureInteropLease : IDisposable
+    {
+        private int _held = 1;
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _held, 0) != 0)
+                DirectTextureInteropGate.Release();
+        }
+    }
+
+    private static DirectTextureInteropLease EnterDirectTextureInterop(
+        CancellationToken cancellationToken)
+    {
+        DirectTextureInteropGate.Wait(cancellationToken);
+        return new DirectTextureInteropLease();
+    }
 
     private sealed class VramLease(long bytes) : IDisposable
     {
@@ -515,7 +536,7 @@ internal static unsafe class NvJpegNativeDecoder
                 var outputRoi = new NppiRect(0, 0, target.Width, target.Height);
                 var interpolation = fastPreview
                     ? NppiInterpolationLinear
-                    : NppiInterpolationCubic;
+                    : NppiInterpolationLanczos;
                 if (_api.NppiResize!(_decodedDevice, sourcePitch, sourceSize, sourceRoi,
                         _resizedDevice, resizedPitch, outputSize, outputRoi,
                         interpolation, _nppContext!.Value) != 0)
@@ -690,6 +711,7 @@ internal static unsafe class NvJpegNativeDecoder
                     bgraPitch, outputSize, order, 255, _nppContext.Value) != 0)
                 return false;
 
+            using var interopLease = EnterDirectTextureInterop(cancellationToken);
             var texture = GpuInteropDevice.CreateTexture(target.Width, target.Height);
             if (texture is null) return false;
             IntPtr resource = IntPtr.Zero;
@@ -721,13 +743,19 @@ internal static unsafe class NvJpegNativeDecoder
                 // until CUDA has completely handed ownership back to D3D11.
                 if (unmapResult != 0 || _api.CudaStreamSynchronize(_stream) != 0)
                     return false;
+                // CUDA will not touch this completed thumbnail again. Keeping
+                // every D3D texture registered for the lifetime of a large
+                // thumbnail cache accumulates hundreds of interop registrations
+                // and can destabilize the display driver under cold-cache scroll.
+                if (_api.CudaGraphicsUnregisterResource(resource) != 0) return false;
+                resource = IntPtr.Zero;
+                interopLease.Dispose();
                 cancellationToken.ThrowIfCancellationRequested();
                 var encoded = captureEncoded
                     ? TryEncodeBgr(colorSource, colorPitch, target, jpegQuality) : null;
-                image = new GpuRenderedImage(texture, resource,
+                image = new GpuRenderedImage(texture, IntPtr.Zero,
                     target.Width, target.Height,
                     value => _api.CudaGraphicsUnregisterResource(value), encoded);
-                resource = IntPtr.Zero;
                 texture = null;
                 return true;
             }
@@ -886,6 +914,7 @@ internal static unsafe class NvJpegNativeDecoder
             if (_api.NppiSwapChannels!(source, sourcePitch, _bgraDevice, bgraPitch,
                     new NppiSize(target.Width, target.Height), order, 255,
                     _nppContext!.Value) != 0) return false;
+            using var interopLease = EnterDirectTextureInterop(cancellationToken);
             var texture = GpuInteropDevice.CreateTexture(target.Width, target.Height);
             if (texture is null) return false;
             IntPtr resource = IntPtr.Zero;
@@ -915,10 +944,13 @@ internal static unsafe class NvJpegNativeDecoder
                 // otherwise Direct2D can intermittently sample an empty surface.
                 if (unmapResult != 0 || _api.CudaStreamSynchronize(_stream) != 0)
                     return false;
+                if (_api.CudaGraphicsUnregisterResource(resource) != 0) return false;
+                resource = IntPtr.Zero;
+                interopLease.Dispose();
                 cancellationToken.ThrowIfCancellationRequested();
-                image = new GpuRenderedImage(texture, resource, target.Width, target.Height,
+                image = new GpuRenderedImage(texture, IntPtr.Zero, target.Width, target.Height,
                     value => _api.CudaGraphicsUnregisterResource(value));
-                resource = IntPtr.Zero; texture = null; return true;
+                texture = null; return true;
             }
             finally
             {
@@ -931,6 +963,7 @@ internal static unsafe class NvJpegNativeDecoder
             CancellationToken cancellationToken, out GpuRenderedImage? image)
         {
             image = null;
+            using var interopLease = EnterDirectTextureInterop(cancellationToken);
             var texture = GpuInteropDevice.CreateTexture(target.Width, target.Height);
             if (texture is null) return false;
             IntPtr resource = IntPtr.Zero;
@@ -959,10 +992,12 @@ internal static unsafe class NvJpegNativeDecoder
                 // unmap operation has completed on this worker's CUDA stream.
                 if (unmapResult != 0 || _api.CudaStreamSynchronize(_stream) != 0)
                     return false;
-                cancellationToken.ThrowIfCancellationRequested();
-                image = new GpuRenderedImage(texture, resource, target.Width, target.Height,
-                    value => _api.CudaGraphicsUnregisterResource(value));
+                if (_api.CudaGraphicsUnregisterResource(resource) != 0) return false;
                 resource = IntPtr.Zero;
+                interopLease.Dispose();
+                cancellationToken.ThrowIfCancellationRequested();
+                image = new GpuRenderedImage(texture, IntPtr.Zero, target.Width, target.Height,
+                    value => _api.CudaGraphicsUnregisterResource(value));
                 texture = null;
                 return true;
             }

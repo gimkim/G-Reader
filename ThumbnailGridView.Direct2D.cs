@@ -114,6 +114,7 @@ internal sealed partial class ThumbnailGridView
 
     private long _thumbnailGpuCacheBytes;
     private long _thumbnailGpuCacheLimitBytes = 256L * 1024 * 1024;
+    private int _gpuSourceRecoveryPending;
     private double _measuredUploadBytesPerSecond = 2.0 * 1024 * 1024 * 1024;
     private long _lastScrollingPresentTick;
 
@@ -351,6 +352,7 @@ internal sealed partial class ThumbnailGridView
             var result = target.EndDraw();
             if (result.Failure)
             {
+                ScheduleGpuSourceRecovery();
                 DiscardThumbnailDeviceResources();
                 Invalidate();
                 return;
@@ -360,6 +362,7 @@ internal sealed partial class ThumbnailGridView
         }
         catch
         {
+            ScheduleGpuSourceRecovery();
             DiscardThumbnailDeviceResources();
             Invalidate();
             return;
@@ -419,9 +422,9 @@ internal sealed partial class ThumbnailGridView
             // remain hidden behind an earlier GPU fast preview.
             var gpuPreview = browseGpuFull ??
                 (browseFull is null ? browseGpuFast : null);
-            var preview = browseFull ??
-                (browseGpuFull is null && browseGpuFast is null ? browseFast : null);
+            var preview = browseFull ?? browseFast;
             var iconArea = imageArea;
+            var previewDrawn = false;
             if (gpuPreview is not null)
             {
                 var texture = GetOrCreateNativeGpuTexture(gpuPreview.Image);
@@ -432,9 +435,10 @@ internal sealed partial class ThumbnailGridView
                     iconArea = new Rectangle(imageArea.Left + imageArea.Width / 18,
                         imageArea.Top + imageArea.Height * 5 / 9,
                         imageArea.Width * 4 / 9, imageArea.Height * 4 / 9);
+                    previewDrawn = true;
                 }
             }
-            else if (preview is not null)
+            if (!previewDrawn && preview is not null)
             {
                 var texture = GetOrCreateGpuTexture(
                     preview.Bitmap, ref uploadBudget, ref pendingUploads);
@@ -447,6 +451,7 @@ internal sealed partial class ThumbnailGridView
                         imageArea.Top + imageArea.Height * 5 / 9,
                         imageArea.Width * 4 / 9,
                         imageArea.Height * 4 / 9);
+                    previewDrawn = true;
                 }
             }
             DrawDirect2DBrowseIcon(iconArea, _folders[item]);
@@ -476,6 +481,7 @@ internal sealed partial class ThumbnailGridView
         }
         try
         {
+            var thumbnailDrawn = false;
             if (selectedGpu is not null)
             {
                 var image = selectedGpu.Image;
@@ -491,9 +497,10 @@ internal sealed partial class ThumbnailGridView
                         imageArea.Y + (imageArea.Height - height) / 2, width, height);
                     DrawManagedThumbnail(texture, destination,
                         _pageColorProfiles.GetValueOrDefault(page));
+                    thumbnailDrawn = true;
                 }
             }
-            else if (selectedThumbnail is not null)
+            if (!thumbnailDrawn && selectedThumbnail is not null)
             {
                 var bitmap = selectedThumbnail.Bitmap;
                 var texture = GetOrCreateGpuTexture(
@@ -510,14 +517,15 @@ internal sealed partial class ThumbnailGridView
                         width, height);
                     DrawManagedThumbnail(texture, destination,
                         _pageColorProfiles.GetValueOrDefault(page));
+                    thumbnailDrawn = true;
                 }
-                else
-                    DrawDirect2DPlaceholder(imageArea, "Uploading to GPU…");
             }
-            else
+            if (!thumbnailDrawn)
             {
-                var state = _generationStates.GetValueOrDefault(
-                    page, "Waiting for preview…");
+                var state = selectedThumbnail is not null
+                    ? "Uploading to GPU…"
+                    : _generationStates.GetValueOrDefault(
+                        page, "Waiting for preview…");
                 DrawDirect2DPlaceholder(imageArea, state);
             }
         }
@@ -724,24 +732,36 @@ internal sealed partial class ThumbnailGridView
 
     private ID2D1Bitmap? GetOrCreateNativeGpuTexture(GpuRenderedImage source)
     {
-        if (_thumbnailDeviceContext is null) return null;
-        if (_nativeThumbnailGpuCache.TryGetValue(source, out var cached))
+        if (_thumbnailDeviceContext is null)
         {
-            _nativeThumbnailGpuLru.Remove(cached.LruNode);
-            _nativeThumbnailGpuLru.AddLast(cached.LruNode);
-            return cached.Texture;
+            ScheduleGpuSourceRecovery();
+            return null;
         }
-        using var surface = source.Texture.QueryInterface<IDXGISurface>();
-        var properties = new BitmapProperties1(
-            new Vortice.DCommon.PixelFormat(
-                Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Ignore),
-            96f, 96f, BitmapOptions.None);
-        var texture = _thumbnailDeviceContext.CreateBitmapFromDxgiSurface(surface, properties);
-        var node = _nativeThumbnailGpuLru.AddLast(source);
-        var item = new NativeThumbnailGpuCacheItem(texture, source.Bytes, node);
-        _nativeThumbnailGpuCache[source] = item;
-        _thumbnailGpuCacheBytes += item.Bytes;
-        return texture;
+        try
+        {
+            if (_nativeThumbnailGpuCache.TryGetValue(source, out var cached))
+            {
+                _nativeThumbnailGpuLru.Remove(cached.LruNode);
+                _nativeThumbnailGpuLru.AddLast(cached.LruNode);
+                return cached.Texture;
+            }
+            using var surface = source.Texture.QueryInterface<IDXGISurface>();
+            var properties = new BitmapProperties1(
+                new Vortice.DCommon.PixelFormat(
+                    Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Ignore),
+                96f, 96f, BitmapOptions.None);
+            var texture = _thumbnailDeviceContext.CreateBitmapFromDxgiSurface(surface, properties);
+            var node = _nativeThumbnailGpuLru.AddLast(source);
+            var item = new NativeThumbnailGpuCacheItem(texture, source.Bytes, node);
+            _nativeThumbnailGpuCache[source] = item;
+            _thumbnailGpuCacheBytes += item.Bytes;
+            return texture;
+        }
+        catch
+        {
+            ScheduleGpuSourceRecovery();
+            return null;
+        }
     }
 
     private void DrawManagedThumbnail(
@@ -890,6 +910,44 @@ internal sealed partial class ThumbnailGridView
         _nativeThumbnailGpuCache.Clear();
         _nativeThumbnailGpuLru.Clear();
         _thumbnailGpuCacheBytes = 0;
+    }
+
+    private void ScheduleGpuSourceRecovery()
+    {
+        if (Interlocked.Exchange(ref _gpuSourceRecoveryPending, 1) != 0) return;
+        if (IsDisposed || Disposing || !IsHandleCreated)
+        {
+            Interlocked.Exchange(ref _gpuSourceRecoveryPending, 0);
+            return;
+        }
+        try
+        {
+            BeginInvoke(() =>
+            {
+                try
+                {
+                    // A native D2D import or EndDraw failure can leave every cached
+                    // CUDA/D3D image tied to a lost device. Drop those GPU sources
+                    // after the active paint has released its leases, then request
+                    // fresh GPU renders. CPU previews remain available meanwhile.
+                    ClearGpuTextureCache();
+                    _gpuFullCache.Clear();
+                    _gpuFastPreviewCache.Clear();
+                    _gpuBrowseFullPreviewCache.Clear();
+                    _gpuBrowseFastPreviewCache.Clear();
+                    Invalidate();
+                    ThumbnailRefreshRequested?.Invoke(this, EventArgs.Empty);
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _gpuSourceRecoveryPending, 0);
+                }
+            });
+        }
+        catch (InvalidOperationException)
+        {
+            Interlocked.Exchange(ref _gpuSourceRecoveryPending, 0);
+        }
     }
 
     private void DiscardThumbnailDeviceResources()

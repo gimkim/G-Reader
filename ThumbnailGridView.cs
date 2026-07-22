@@ -202,27 +202,31 @@ internal sealed partial class ThumbnailGridView : Panel
 
     public void ClearFullQualityCache()
     {
+        // Release D2D views before retiring their underlying D3D textures.
+        ClearGpuTextureCache();
         _fullCache.Clear();
         _gpuFullCache.Clear();
         _browseFullPreviewCache.Clear();
         _gpuBrowseFullPreviewCache.Clear();
-        ClearGpuTextureCache();
         Invalidate();
     }
 
     public void ClearBrowsePreviewCache()
     {
+        // Release D2D views before retiring their underlying D3D textures.
+        ClearGpuTextureCache();
         _browseFullPreviewCache.Clear();
         _browseFastPreviewCache.Clear();
         _gpuBrowseFullPreviewCache.Clear();
         _gpuBrowseFastPreviewCache.Clear();
-        ClearGpuTextureCache();
         Invalidate();
     }
 
     public void ResetPages(IEnumerable<string> pageNames,
         IEnumerable<ThumbnailFolderEntry>? folders = null)
     {
+        // Release D2D views before retiring their underlying D3D textures.
+        ClearGpuTextureCache();
         _fullCache.Clear();
         _fastPreviewCache.Clear();
         _browseFullPreviewCache.Clear();
@@ -231,7 +235,6 @@ internal sealed partial class ThumbnailGridView : Panel
         _gpuFastPreviewCache.Clear();
         _gpuBrowseFullPreviewCache.Clear();
         _gpuBrowseFastPreviewCache.Clear();
-        ClearGpuTextureCache();
         _pageNames = pageNames.Select(GetDisplayFileName).ToArray();
         _folders = folders?.ToArray() ?? [];
         _pageCount = _pageNames.Length;

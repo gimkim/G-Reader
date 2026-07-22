@@ -123,6 +123,24 @@ internal static class EncodedJpegRenderer
         bool fastPreview, CancellationToken cancellationToken) =>
         Render(page, bounds, rotation, quality, fastPreview, cancellationToken);
 
+    public static Result RenderThumbnailStagedGpu(
+        PageEntry page, Size bounds, int rotation, int quality,
+        bool fastPreview, CancellationToken cancellationToken)
+    {
+        // Cold-cache PDF scrolling creates hundreds of short-lived thumbnails.
+        // Keep nvJPEG and NPP on the GPU, but stage the completed small BGRA image
+        // through pinned host memory before Direct2D uploads it. This avoids the
+        // NVIDIA CUDA-D3D registration API which can AV inside nvwgf2umx.dll under
+        // rapid resource churn, without moving decode or resize work to the CPU.
+        var target = new Size(Math.Max(32, bounds.Width), Math.Max(32, bounds.Height));
+        if (NvJpegNativeDecoder.TryDecode(
+                page, target, rotation, oversample: 1, fastPreview,
+                cancellationToken, out var decoded, out var landscape) &&
+            decoded is not null)
+            return new Result(decoded, landscape);
+        return Render(page, bounds, rotation, quality, fastPreview, cancellationToken);
+    }
+
     private static Result Render(
         PageEntry page, Size bounds, int rotation, int quality,
         bool fastPreview, CancellationToken cancellationToken)
