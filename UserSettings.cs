@@ -54,6 +54,7 @@ internal sealed class UserSettings
     public int ThumbnailUploadsPerFrame { get; set; } = 128;
     public bool UseMonitorColorProfile { get; set; } = true;
     public bool ExtendedLoggingEnabled { get; set; }
+    public DateTime? LastUpdateCheckUtc { get; set; }
     public bool AutoOptimizePerformance { get; set; }
     public bool UseBenchmarkProfile { get; set; }
     // 0 = generated temporary comprehensive dataset, 1 = custom folder.

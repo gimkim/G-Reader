@@ -421,6 +421,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         {
             QueueMonitorColorProfileRefresh(force: true);
             if (!string.IsNullOrWhiteSpace(_initialPath)) BeginInvoke(new Action(() => _ = TryOpenAsync(_initialPath)));
+            _ = CheckForUpdatesAsync(manual: false);
         };
     }
 
@@ -489,6 +490,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         var options = Menu("&Options", doubleMenu, zoom, rotate, fit, Sep(), _directionItem, _scrollbarsItem, _toolbarItem,
             Item("&Configure...", (_, _) => ShowConfiguration()));
         var help = Menu("&Help", Item("&Website", (_, _) => OpenWebsite()),
+            Item("Check for &Updates...", async (_, _) =>
+                await CheckForUpdatesAsync(manual: true)),
             Item("&About", (_, _) => MessageBox.Show(this, "CDisplayEx C#\nAsync loading, Lanczos rendering and page cache.", "About")));
         _menu.Items.AddRange([file, read, options, help]);
     }
@@ -2385,9 +2388,15 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                     try
                     {
                         workerToken.ThrowIfCancellationRequested();
-                        if (!_thumbnailGrid.HasBrowseFullPreview(work.Index, targetSize))
+                        var entry = browseEntries[work.Index];
+                        // The PDF fast pass already rasterized and composed all
+                        // four cover pages. Do not reopen the same document and
+                        // render those four pages again for a second folder tile.
+                        var pdfCoverReady = entry.IsPdf &&
+                            _thumbnailGrid.HasBrowseFastPreview(work.Index, targetSize);
+                        if (!_thumbnailGrid.HasBrowseFullPreview(work.Index, targetSize) &&
+                            !pdfCoverReady)
                         {
-                            var entry = browseEntries[work.Index];
                             var preview = await CreateBrowseThumbnailAsync(
                                 entry.Path, targetSize, fastPreview: false,
                                 priority, workerToken)
@@ -2597,6 +2606,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         var completionTransferred = false;
         try
         {
+            var isPdf = Path.GetExtension(path).Equals(
+                ".pdf", StringComparison.OrdinalIgnoreCase);
             var result = await BrowsePreviewWorkScheduler.RunAsync(priority, async () =>
             {
                 var cached = await Task.Run(() =>
@@ -2608,7 +2619,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 }, cancellationToken).ConfigureAwait(false);
                 if (cached is not null) return new GeneratedThumbnail(cached, null);
 
-                if (fastPreview)
+                if (fastPreview && !isPdf)
                 {
                     var gpu = await RenderWorkScheduler.RunFastCodecAsync(
                         () => BrowsePreviewRenderer.CreateGpu(
@@ -4431,6 +4442,23 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private static void OpenWebsite()
     {
         try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("https://www.cdisplayex.com") { UseShellExecute = true }); } catch { }
+    }
+
+    private async Task CheckForUpdatesAsync(bool manual)
+    {
+        if (!manual)
+        {
+            if (_settings.LastUpdateCheckUtc is { } last &&
+                DateTime.UtcNow - last < TimeSpan.FromHours(12)) return;
+            // Let initial file/folder presentation win startup. Network I/O is
+            // asynchronous, but a prompt should not appear over the loading view.
+            try { await Task.Delay(1800); }
+            catch { return; }
+            if (IsDisposed || Disposing) return;
+        }
+        _settings.LastUpdateCheckUtc = DateTime.UtcNow;
+        try { _settings.Save(); } catch { }
+        await UpdateManager.CheckAndPromptAsync(this, showUpToDate: manual);
     }
 
     private void SaveSettings()

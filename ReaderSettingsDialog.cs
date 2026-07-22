@@ -96,6 +96,8 @@ internal sealed class ReaderSettingsDialog : Form
     private readonly Panel _colorPreview = new() { Width = 92, Height = 28, BorderStyle = BorderStyle.FixedSingle };
     private readonly TextBox _randomLibraryPath = new() { Width = 420 };
     private readonly Dictionary<string, HotkeyTextBox> _hotkeyEditors = new(StringComparer.Ordinal);
+    private readonly Dictionary<Control, Label> _settingEffectLabels =
+        new(ReferenceEqualityComparer.Instance);
     private AutomaticInitialValueProfile _manualInitialValues = null!;
     private readonly AutomaticInitialValueProfile _automaticInitialValues;
     private readonly UserSettings _sourceSettings;
@@ -535,6 +537,34 @@ internal sealed class ReaderSettingsDialog : Form
             }
         };
 
+        var checkForUpdates = CreateSecondaryButton("Check for updates");
+        checkForUpdates.MinimumSize = new Size(160, 32);
+        var updateStatus = new Label
+        {
+            AutoSize = true, TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = Color.FromArgb(70, 79, 94),
+            Margin = new Padding(10, 8, 0, 0),
+            Text = $"Installed version {UpdateManager.CurrentDisplayVersion}"
+        };
+        checkForUpdates.Click += async (_, _) =>
+        {
+            checkForUpdates.Enabled = false;
+            updateStatus.Text = "Checking GitHub releases...";
+            try
+            {
+                await UpdateManager.CheckAndPromptAsync(this, showUpToDate: true);
+                if (!IsDisposed)
+                    updateStatus.Text = $"Installed version {UpdateManager.CurrentDisplayVersion}";
+            }
+            finally { if (!IsDisposed) checkForUpdates.Enabled = true; }
+        };
+        var updateRow = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill, AutoSize = true, WrapContents = false,
+            Margin = Padding.Empty
+        };
+        updateRow.Controls.AddRange([checkForUpdates, updateStatus]);
+
         var generalPage = CreateSettingsPage("General",
             CreateSection("Reader appearance",
                 "Control the canvas appearance and color correction used on the active monitor.",
@@ -552,7 +582,10 @@ internal sealed class ReaderSettingsDialog : Form
             CreateSection("Diagnostics",
                 "Extended logging records session health and errors. If the UI stops responding for eight seconds, G Reader creates a diagnostic dump. Logs are retained for 30 days.",
                 ("Extended logging", _extendedLogging),
-                ("Saved diagnostics", openDiagnosticsFolder)));
+                ("Saved diagnostics", openDiagnosticsFolder)),
+            CreateSection("Updates",
+                "G Reader checks the latest published GitHub release. A newer semantic version is downloaded only after confirmation, verified with GitHub's SHA-256 digest, then installed and relaunched.",
+                ("Current release", updateRow)));
 
         var renderingPage = CreateSettingsPage("Rendering",
             CreateSection("Image quality",
@@ -596,48 +629,67 @@ internal sealed class ReaderSettingsDialog : Form
                 ("Benchmark", benchmarkCommandRow)),
             CreateSection("Processing threads",
                 "The global limit controls fast-pass scheduling. Non-JPEG resize jobs may each split their output rows across several CPU threads; JPEG decoding has separate image-level limits.",
-                ("Global fast-preview concurrency", _globalFastPreviewConcurrency),
-                ("Non-JPEG resize images in parallel", _fastPreviewWorkers),
-                ("CPU threads per non-JPEG resize", _fastPreviewThreads),
+                ("Global fast-preview concurrency", Explain(_globalFastPreviewConcurrency,
+                    "Shared ceiling for fast JPEG, WIC and format work; never exceeds this computer's logical-core count.")),
+                ("Non-JPEG resize images in parallel", Explain(_fastPreviewWorkers,
+                    "Image-level slots for fast non-JPEG resizing. Effective slots are limited by Global fast-preview concurrency.")),
+                ("CPU threads per non-JPEG resize", Explain(_fastPreviewThreads,
+                    "Threads used inside each non-JPEG resize. Total demand is effective image slots multiplied by this value.")),
                 ("Effective fast paths", _effectiveFastParallelism),
-                ("Full-quality pre-cache images", _precacheWorkers),
-                ("CPU threads per Lanczos image", _imageMagickThreads),
-                ("Zoom Lanczos threads", _zoomImageMagickThreads)));
+                ("Full-quality pre-cache images", Explain(_precacheWorkers,
+                    "Number of final-quality pages allowed at once. It multiplies CPU threads per Lanczos image.")),
+                ("CPU threads per Lanczos image", Explain(_imageMagickThreads,
+                    "ImageMagick thread allowance for each final resize. Combined pre-cache demand is workers multiplied by threads.")),
+                ("Zoom Lanczos threads", Explain(_zoomImageMagickThreads,
+                    "Thread allowance for the single latency-sensitive zoom-detail job; independent of pre-cache worker count."))));
 
         var codecsPage = CreateSettingsPage("Codecs & GPU",
             CreateSection("JPEG on CPU",
                 "JPEG decoding is single-threaded per image. These limits are numbers of images decoded simultaneously, not threads inside one image.",
-                ("Fast CPU JPEG images in parallel", _jpegCpuFastWorkers),
-                ("Background CPU JPEG images in parallel", _jpegCpuBackgroundWorkers)),
+                ("Fast CPU JPEG images in parallel", Explain(_jpegCpuFastWorkers,
+                    "Fast JPEG decode slots. Effective foreground throughput is also capped by Global fast-preview concurrency.")),
+                ("Background CPU JPEG images in parallel", Explain(_jpegCpuBackgroundWorkers,
+                    "Background JPEG slots. The pre-cache producer count may impose a lower practical limit."))),
             CreateSection("NVIDIA nvJPEG",
                 "Urgent pages are submitted immediately. Only background thumbnail work may wait briefly to form a batch; VRAM admission remains adaptive.",
-                ("GPU JPEG images in parallel", _nvJpegWorkers),
-                ("Background batch size", _nvJpegBatchSize),
-                ("Maximum batch wait (ms)", _nvJpegBatchDelay),
-                ("VRAM headroom (%)", _nvJpegVramHeadroom)),
+                ("GPU JPEG images in parallel", Explain(_nvJpegWorkers,
+                    "Shared CUDA slot ceiling for nvJPEG and generic GPU resize; hard-limited to 16 jobs.")),
+                ("Background batch size", Explain(_nvJpegBatchSize,
+                    "Background GPU admission slots. Effective batch is min(batch size, GPU JPEG workers, 15 safety slots).")),
+                ("Maximum batch wait (ms)", Explain(_nvJpegBatchDelay,
+                    "Only background thumbnails wait this long to form a batch. Visible pages never wait for batching.")),
+                ("VRAM headroom (%)", Explain(_nvJpegVramHeadroom,
+                    "Percentage of total VRAM reserved, with at least 1 GB always kept free. VRAM can reduce actual concurrency further."))),
             CreateSection("Format decode parallelism",
                 "Independent limits prevent a slow codec from occupying every preview worker.",
                 ("WIC first-frame previews", _useWicFastPreview),
-                ("WIC preview workers", _wicWorkers),
-                ("PNG workers", _pngWorkers),
-                ("WebP workers", _webpWorkers),
-                ("GIF workers", _gifWorkers),
-                ("TIFF workers", _tiffWorkers),
-                ("BMP workers", _bmpWorkers),
-                ("Other/fallback workers", _genericWorkers)),
+                ("WIC preview workers", ExplainCodecGate(_wicWorkers, "WIC")),
+                ("PNG workers", ExplainCodecGate(_pngWorkers, "PNG")),
+                ("WebP workers", ExplainCodecGate(_webpWorkers, "WebP")),
+                ("GIF workers", ExplainCodecGate(_gifWorkers, "GIF")),
+                ("TIFF workers", ExplainCodecGate(_tiffWorkers, "TIFF")),
+                ("BMP workers", ExplainCodecGate(_bmpWorkers, "BMP")),
+                ("Other/fallback workers", ExplainCodecGate(_genericWorkers, "fallback"))),
             CreateSection("Generic GPU scaling",
                 "Direct2D supplies a low-latency preview. The final GPU path is used only when its size threshold makes transfer worthwhile.",
                 ("GPU fast preview", _useGenericGpuFast),
                 ("GPU final resize", _useGenericGpuLanczos),
-                ("GPU resize workers", _genericGpuWorkers),
-                ("Final GPU minimum source (MB)", _genericGpuMinimumSource),
-                ("Fast GPU maximum source (MB)", _genericGpuFastMaximumSource)),
+                ("GPU resize workers", Explain(_genericGpuWorkers,
+                    "Generic GPU gate. Effective jobs are min(this value, GPU JPEG workers, 16 shared CUDA slots).")),
+                ("Final GPU minimum source (MB)", Explain(_genericGpuMinimumSource,
+                    "Only sources at or above this decoded BGRA size use final GPU scaling; smaller images avoid transfer overhead.")),
+                ("Fast GPU maximum source (MB)", Explain(_genericGpuFastMaximumSource,
+                    "Fast GPU preview is allowed only at or below this decoded BGRA size to bound temporary VRAM and RAM use."))),
             CreateSection("Thumbnail GPU upload",
                 "Adaptive frame budgets keep scrolling responsive while allowing textures to appear continuously.",
-                ("Idle time budget (ms)", _thumbnailIdleUploadBudget),
-                ("Scrolling time budget (ms)", _thumbnailScrollUploadBudget),
-                ("Maximum upload per frame (MB)", _thumbnailUploadBudget),
-                ("Maximum textures per frame", _thumbnailUploadsPerFrame)));
+                ("Idle time budget (ms)", Explain(_thumbnailIdleUploadBudget,
+                    "GPU upload work allowed in an idle frame. Upload stops when this, the MB budget, or texture-count budget is reached first.")),
+                ("Scrolling time budget (ms)", Explain(_thumbnailScrollUploadBudget,
+                    "Smaller interactive budget protects scroll frame time; it combines with the same MB and texture-count limits.")),
+                ("Maximum upload per frame (MB)", Explain(_thumbnailUploadBudget,
+                    "Byte ceiling per frame. Effective work is min(time budget, this byte budget, texture-count budget).")),
+                ("Maximum textures per frame", Explain(_thumbnailUploadsPerFrame,
+                    "Count ceiling per frame. Large textures may hit the MB/time limit before this count is reached."))));
 
         var hotkeyTable = new TableLayoutPanel
         {
@@ -646,22 +698,38 @@ internal sealed class ReaderSettingsDialog : Form
         };
         hotkeyTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 55));
         hotkeyTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 45));
-        foreach (var definition in ToolbarHotkeyCatalog.All)
+        foreach (var category in ToolbarHotkeyCatalog.All.GroupBy(item => item.Category))
         {
-            var editor = new HotkeyTextBox
+            var categoryRow = hotkeyTable.RowCount++;
+            hotkeyTable.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+            var categoryHeader = new Label
             {
-                Shortcut = ToolbarHotkeyCatalog.GetShortcut(settings.ToolbarHotkeys, definition.Id),
-                Margin = new Padding(4, 5, 4, 5)
+                Text = category.Key, Dock = DockStyle.Fill,
+                Font = new Font("Segoe UI Semibold", 10f),
+                ForeColor = Color.FromArgb(45, 108, 180),
+                TextAlign = ContentAlignment.BottomLeft,
+                Padding = new Padding(4, 0, 0, 5), Margin = Padding.Empty
             };
-            _hotkeyEditors[definition.Id] = editor;
-            var row = hotkeyTable.RowCount++;
-            hotkeyTable.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
-            hotkeyTable.Controls.Add(new Label
+            hotkeyTable.Controls.Add(categoryHeader, 0, categoryRow);
+            hotkeyTable.SetColumnSpan(categoryHeader, 2);
+            foreach (var definition in category)
             {
-                Text = definition.Label, Dock = DockStyle.Fill,
-                TextAlign = ContentAlignment.MiddleLeft, Margin = new Padding(4)
-            }, 0, row);
-            hotkeyTable.Controls.Add(editor, 1, row);
+                var editor = new HotkeyTextBox
+                {
+                    Shortcut = ToolbarHotkeyCatalog.GetShortcut(
+                        settings.ToolbarHotkeys, definition.Id),
+                    Margin = new Padding(4, 5, 4, 5)
+                };
+                _hotkeyEditors[definition.Id] = editor;
+                var row = hotkeyTable.RowCount++;
+                hotkeyTable.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+                hotkeyTable.Controls.Add(new Label
+                {
+                    Text = definition.Label, Dock = DockStyle.Fill,
+                    TextAlign = ContentAlignment.MiddleLeft, Margin = new Padding(18, 4, 4, 4)
+                }, 0, row);
+                hotkeyTable.Controls.Add(editor, 1, row);
+            }
         }
 
         var hotkeyHint = new Label
@@ -722,6 +790,8 @@ internal sealed class ReaderSettingsDialog : Form
         Controls.Add(buttons);
         AcceptButton = ok;
         CancelButton = cancel;
+        WireDetailedEffectUpdates();
+        UpdateDetailedEffectLabels();
     }
 
     private void ApplyPerformanceMode(bool captureManual)
@@ -752,6 +822,181 @@ internal sealed class ReaderSettingsDialog : Form
                 : "Manual cache and worker values are active.";
         }
         SetSuggestedInputsEnabled(!_autoOptimize.Checked);
+        UpdateEffectiveFastParallelism();
+    }
+
+    private Control Explain(Control input, string description)
+    {
+        var detail = new Label
+        {
+            Text = description, Dock = DockStyle.Fill,
+            ForeColor = Color.FromArgb(91, 99, 112),
+            TextAlign = ContentAlignment.TopLeft, AutoEllipsis = false,
+            UseCompatibleTextRendering = true,
+            Padding = new Padding(1, 3, 1, 0), Margin = Padding.Empty
+        };
+        _settingEffectLabels[input] = detail;
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2,
+            MinimumSize = new Size(0, 78), Margin = Padding.Empty,
+            Padding = Padding.Empty
+        };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        input.Dock = DockStyle.Fill;
+        input.Margin = new Padding(0, 1, 0, 1);
+        layout.Controls.Add(input, 0, 0);
+        layout.Controls.Add(detail, 0, 1);
+        return layout;
+    }
+
+    private Control ExplainCodecGate(NumericUpDown input, string codec) =>
+        Explain(input,
+            $"Maximum simultaneous {codec} decodes. Fast-preview use is also limited by Global fast-preview concurrency.");
+
+    private void WireDetailedEffectUpdates()
+    {
+        foreach (var input in new NumericUpDown[]
+                 {
+                     _globalFastPreviewConcurrency, _fastPreviewWorkers,
+                     _fastPreviewThreads, _precacheWorkers, _imageMagickThreads,
+                     _zoomImageMagickThreads, _jpegCpuFastWorkers,
+                     _jpegCpuBackgroundWorkers, _nvJpegWorkers, _nvJpegBatchSize,
+                     _nvJpegBatchDelay, _nvJpegVramHeadroom, _wicWorkers,
+                     _pngWorkers, _webpWorkers, _gifWorkers, _tiffWorkers,
+                     _bmpWorkers, _genericWorkers, _genericGpuWorkers,
+                     _genericGpuMinimumSource, _genericGpuFastMaximumSource,
+                     _thumbnailIdleUploadBudget, _thumbnailScrollUploadBudget,
+                     _thumbnailUploadBudget, _thumbnailUploadsPerFrame,
+                     _thumbnailMaxPreviewSize
+                 })
+            input.ValueChanged += (_, _) => UpdateEffectiveFastParallelism();
+        foreach (var option in new[]
+                 {
+                     _useNvJpeg, _useWicFastPreview,
+                     _useGenericGpuFast, _useGenericGpuLanczos
+                 })
+            option.CheckedChanged += (_, _) => UpdateEffectiveFastParallelism();
+    }
+
+    private void SetEffect(Control input, string text, bool warning = false)
+    {
+        if (!_settingEffectLabels.TryGetValue(input, out var label)) return;
+        label.Text = text;
+        label.ForeColor = warning
+            ? Color.FromArgb(184, 91, 22)
+            : Color.FromArgb(91, 99, 112);
+    }
+
+    private void UpdateDetailedEffectLabels()
+    {
+        if (_settingEffectLabels.Count == 0) return;
+        var logical = Math.Clamp(Environment.ProcessorCount, 1, 64);
+        var globalConfigured = (int)_globalFastPreviewConcurrency.Value;
+        var global = Math.Min(logical, globalConfigured);
+        SetEffect(_globalFastPreviewConcurrency,
+            $"Effective = min({globalConfigured}, {logical} logical cores) = {global} concurrent images." +
+            (globalConfigured > global ? " Warning: the configured excess cannot be used." : string.Empty),
+            globalConfigured > global);
+
+        var resizeWorkers = (int)_fastPreviewWorkers.Value;
+        var effectiveResizeWorkers = Math.Min(global, resizeWorkers);
+        SetEffect(_fastPreviewWorkers,
+            $"Effective image slots = min({resizeWorkers}, global {global}) = {effectiveResizeWorkers}." +
+            (resizeWorkers > effectiveResizeWorkers ? " Limited by the global setting." : string.Empty),
+            resizeWorkers > effectiveResizeWorkers);
+        var resizeThreads = (int)_fastPreviewThreads.Value;
+        var resizeDemand = effectiveResizeWorkers * resizeThreads;
+        SetEffect(_fastPreviewThreads,
+            $"CPU demand = {effectiveResizeWorkers} images × {resizeThreads} threads = {resizeDemand}; " +
+            $"the OS schedules them over {logical} logical cores.", resizeDemand > logical);
+
+        var precache = (int)_precacheWorkers.Value;
+        var lanczosThreads = (int)_imageMagickThreads.Value;
+        var batchDemand = precache * lanczosThreads;
+        var schedulerBatchCap = Math.Min(logical, batchDemand);
+        SetEffect(_precacheWorkers,
+            $"{precache} final pages × {lanczosThreads} Lanczos threads = {batchDemand} configured CPU threads.",
+            batchDemand > logical);
+        SetEffect(_imageMagickThreads,
+            $"Pre-cache product = {precache} × {lanczosThreads} = {batchDemand}; " +
+            $"scheduler cap = min({batchDemand}, {logical}) = {schedulerBatchCap}.",
+            batchDemand > logical);
+        SetEffect(_zoomImageMagickThreads,
+            $"One visible zoom-detail job may use {(int)_zoomImageMagickThreads.Value} threads; it does not multiply by pre-cache workers.");
+
+        var cpuJpeg = (int)_jpegCpuFastWorkers.Value;
+        var effectiveCpuJpeg = Math.Min(global, cpuJpeg);
+        SetEffect(_jpegCpuFastWorkers,
+            $"Effective = min({cpuJpeg}, global {global}) = {effectiveCpuJpeg} JPEG images, one decode thread each.",
+            cpuJpeg > effectiveCpuJpeg);
+        var backgroundJpeg = (int)_jpegCpuBackgroundWorkers.Value;
+        var practicalBackgroundJpeg = Math.Min(backgroundJpeg, precache);
+        SetEffect(_jpegCpuBackgroundWorkers,
+            $"Gate = {backgroundJpeg}; pre-cache currently produces {precache} jobs, so normal pre-cache can feed about {practicalBackgroundJpeg}.",
+            backgroundJpeg > practicalBackgroundJpeg);
+
+        var gpuWorkers = Math.Min(16, (int)_nvJpegWorkers.Value);
+        SetEffect(_nvJpegWorkers,
+            $"Shared CUDA ceiling = {gpuWorkers}. " + (_useNvJpeg.Checked
+                ? "nvJPEG is enabled."
+                : "nvJPEG is off, but this still limits generic GPU resize."));
+        var batch = (int)_nvJpegBatchSize.Value;
+        var effectiveBatch = Math.Min(Math.Min(batch, gpuWorkers), 15);
+        SetEffect(_nvJpegBatchSize,
+            $"Effective background batch = min({batch}, GPU workers {gpuWorkers}, safety 15) = {effectiveBatch}." +
+            (batch > effectiveBatch ? " The configured excess is limited." : string.Empty),
+            batch > effectiveBatch);
+        SetEffect(_nvJpegBatchDelay,
+            $"Background thumbnails may wait {(int)_nvJpegBatchDelay.Value} ms; visible pages bypass batching.");
+        SetEffect(_nvJpegVramHeadroom,
+            $"Reserves {(int)_nvJpegVramHeadroom.Value}% of VRAM and at least 1 GB. VRAM admission can lower concurrency further.");
+
+        foreach (var pair in new (NumericUpDown Input, string Name, bool Enabled)[]
+                 {
+                     (_wicWorkers, "WIC", _useWicFastPreview.Checked),
+                     (_pngWorkers, "PNG", true), (_webpWorkers, "WebP", true),
+                     (_gifWorkers, "GIF", true), (_tiffWorkers, "TIFF", true),
+                     (_bmpWorkers, "BMP", true), (_genericWorkers, "fallback", true)
+                 })
+        {
+            var configured = (int)pair.Input.Value;
+            var effective = pair.Enabled ? Math.Min(configured, global) : 0;
+            SetEffect(pair.Input, pair.Enabled
+                    ? $"Effective fast {pair.Name} slots = min({configured}, global {global}) = {effective}."
+                    : $"{pair.Name} fast preview is disabled; value {configured} is retained.",
+                pair.Enabled && configured > effective);
+        }
+
+        var genericGpu = (int)_genericGpuWorkers.Value;
+        var effectiveGenericGpu = Math.Min(genericGpu, gpuWorkers);
+        SetEffect(_genericGpuWorkers,
+            $"Effective = min({genericGpu}, shared CUDA ceiling {gpuWorkers}) = {effectiveGenericGpu}." +
+            (genericGpu > effectiveGenericGpu
+                ? $" Warning: {genericGpu} is limited by GPU JPEG workers set to {gpuWorkers}."
+                : string.Empty), genericGpu > effectiveGenericGpu);
+        SetEffect(_genericGpuMinimumSource,
+            $"Final GPU resize is {(_useGenericGpuLanczos.Checked ? "on" : "off")}; source must be at least {(int)_genericGpuMinimumSource.Value} MB.");
+        SetEffect(_genericGpuFastMaximumSource,
+            $"Fast GPU preview is {(_useGenericGpuFast.Checked ? "on" : "off")}; source must be no larger than {(int)_genericGpuFastMaximumSource.Value} MB.");
+
+        var uploadMB = (int)_thumbnailUploadBudget.Value;
+        var uploadCount = (int)_thumbnailUploadsPerFrame.Value;
+        var edge = (int)_thumbnailMaxPreviewSize.Value;
+        var textureBytes = Math.Max(1L, (long)edge * edge * 4);
+        var byteLimitedCount = Math.Max(1L, uploadMB * 1024L * 1024 / textureBytes);
+        var estimatedCount = Math.Min(uploadCount, byteLimitedCount);
+        SetEffect(_thumbnailIdleUploadBudget,
+            $"Idle frame stops at {(double)_thumbnailIdleUploadBudget.Value:0.0} ms, {uploadMB} MB, or {uploadCount} textures—first limit wins.");
+        SetEffect(_thumbnailScrollUploadBudget,
+            $"Scroll frame stops at {(double)_thumbnailScrollUploadBudget.Value:0.0} ms, {uploadMB} MB, or {uploadCount} textures—first limit wins.");
+        SetEffect(_thumbnailUploadBudget,
+            $"At {edge}px, {uploadMB} MB fits about {byteLimitedCount:N0} square textures; effective count is about {estimatedCount:N0} before time limits.");
+        SetEffect(_thumbnailUploadsPerFrame,
+            $"Count ceiling {uploadCount}; current byte/size settings reduce the estimate to {estimatedCount:N0} before time limits.",
+            uploadCount > estimatedCount);
     }
 
     private void UpdateEffectiveFastParallelism()
@@ -771,6 +1016,7 @@ internal sealed class ReaderSettingsDialog : Form
             $"Non-JPEG resize: {nonJpegImages} images × up to {threadsPerResize} threads " +
             $"(up to {nonJpegThreads} CPU threads)\n" +
             $"GPU JPEG: {gpuJpeg}";
+        UpdateDetailedEffectLabels();
     }
 
     private void CopyAutomaticToManual()

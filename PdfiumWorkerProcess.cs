@@ -524,6 +524,7 @@ internal sealed class PdfiumProcessPool : IDisposable
     private readonly ConcurrentQueue<PdfiumWorkerClient> _available = [];
     private readonly PdfiumWorkerClient[] _workers;
     private readonly SemaphoreSlim _slots;
+    private readonly SemaphoreSlim _backgroundSlots;
     private int _referenceCount;
     private int _retired;
     private int _disposed;
@@ -546,6 +547,11 @@ internal sealed class PdfiumProcessPool : IDisposable
         _workers = workers.ToArray();
         foreach (var worker in _workers) _available.Enqueue(worker);
         _slots = new SemaphoreSlim(count, count);
+        // Keep one process free for opening/reading the file the user selected.
+        // Folder contact sheets and PDF thumbnail renders must not occupy the
+        // complete pool and make navigation look hung.
+        var backgroundCount = count == 1 ? 1 : count - 1;
+        _backgroundSlots = new SemaphoreSlim(backgroundCount, backgroundCount);
     }
 
     public void AddReference() => Interlocked.Increment(ref _referenceCount);
@@ -562,21 +568,27 @@ internal sealed class PdfiumProcessPool : IDisposable
         if (Volatile.Read(ref _referenceCount) == 0) Dispose();
     }
 
-    public T Execute<T>(Func<PdfiumWorkerClient, T> operation)
+    public T Execute<T>(Func<PdfiumWorkerClient, T> operation,
+        bool background = false)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-        _slots.Wait();
-        if (!_available.TryDequeue(out var worker))
+        if (background) _backgroundSlots.Wait();
+        try
         {
-            _slots.Release();
-            throw new InvalidOperationException("PDFium process pool lost a worker.");
+            _slots.Wait();
+            if (!_available.TryDequeue(out var worker))
+            {
+                _slots.Release();
+                throw new InvalidOperationException("PDFium process pool lost a worker.");
+            }
+            try { return operation(worker); }
+            finally
+            {
+                _available.Enqueue(worker);
+                _slots.Release();
+            }
         }
-        try { return operation(worker); }
-        finally
-        {
-            _available.Enqueue(worker);
-            _slots.Release();
-        }
+        finally { if (background) _backgroundSlots.Release(); }
     }
 
     public void CloseDocument(string path)
@@ -608,6 +620,7 @@ internal sealed class PdfiumProcessPool : IDisposable
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         foreach (var worker in _workers) worker.Dispose();
+        _backgroundSlots.Dispose();
         _slots.Dispose();
     }
 }

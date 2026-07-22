@@ -18,19 +18,27 @@ internal sealed class PdfiumDocumentRenderer : IPdfDocumentRenderer
 
     private readonly string _path;
     private readonly PdfiumProcessPool _pool;
+    private readonly bool _backgroundDocument;
     private readonly ConcurrentDictionary<int, Lazy<byte[]?>> _imageOnlyJpegsInFlight = [];
     private readonly ConcurrentDictionary<int, SizeF> _pageSizes = [];
     private int _disposed;
 
     public int PageCount { get; }
 
-    public PdfiumDocumentRenderer(string path)
+    public PdfiumDocumentRenderer(string path, bool backgroundDocument = false)
     {
         _path = Path.GetFullPath(path);
+        _backgroundDocument = backgroundDocument;
         _pool = PdfiumProcessPoolManager.Acquire();
         try
         {
-            PageCount = Execute(PageCountCommand, null, reader => reader.ReadInt32());
+            if (!PdfRendering.TryGetCachedPageCount(_path, out var pageCount))
+            {
+                pageCount = Execute(PageCountCommand, null,
+                    reader => reader.ReadInt32(), backgroundDocument);
+                PdfRendering.RememberPageCount(_path, pageCount);
+            }
+            PageCount = pageCount;
             if (PageCount <= 0)
                 throw new InvalidDataException("PDFium found no pages in the PDF.");
         }
@@ -41,48 +49,53 @@ internal sealed class PdfiumDocumentRenderer : IPdfDocumentRenderer
         }
     }
 
-    public Bitmap RenderPage(int pageIndex, float scale = 1.5f)
+    public Bitmap RenderPage(int pageIndex, float scale = 1.5f,
+        bool background = false)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         ValidatePageIndex(pageIndex);
         scale = Math.Max(0.05f, scale);
-        var pageSize = GetPageSize(pageIndex);
+        background |= _backgroundDocument;
+        var pageSize = GetPageSize(pageIndex, background);
         var outputSize = new Size(
             Math.Max(1, (int)Math.Ceiling(pageSize.Width * scale)),
             Math.Max(1, (int)Math.Ceiling(pageSize.Height * scale)));
 
-        if (TryRenderImageOnlyJpeg(pageIndex, outputSize, out var accelerated))
+        if (TryRenderImageOnlyJpeg(
+                pageIndex, outputSize, background, out var accelerated))
             return accelerated;
-        return RenderPdfium(pageIndex, outputSize);
+        return RenderPdfium(pageIndex, outputSize, background);
     }
 
-    public Bitmap RenderPageToFit(int pageIndex, Size targetSize, float oversample = 1f)
+    public Bitmap RenderPageToFit(int pageIndex, Size targetSize,
+        float oversample = 1f, bool background = false)
     {
-        var pageSize = GetPageSize(pageIndex);
+        background |= _backgroundDocument;
+        var pageSize = GetPageSize(pageIndex, background);
         var scale = Math.Min(
             targetSize.Width / Math.Max(1f, pageSize.Width),
             targetSize.Height / Math.Max(1f, pageSize.Height));
         return RenderPage(pageIndex,
-            Math.Max(0.05f, scale * Math.Max(1f, oversample)));
+            Math.Max(0.05f, scale * Math.Max(1f, oversample)), background);
     }
 
-    public Stream RenderPageStream(int pageIndex)
+    public Stream RenderPageStream(int pageIndex, bool background = false)
     {
-        using var bitmap = RenderPage(pageIndex);
+        using var bitmap = RenderPage(pageIndex, background: background);
         var memory = new MemoryStream();
         bitmap.Save(memory, ImageFormat.Bmp);
         memory.Position = 0;
         return memory;
     }
 
-    private Bitmap RenderPdfium(int pageIndex, Size outputSize)
+    private Bitmap RenderPdfium(int pageIndex, Size outputSize, bool background)
     {
         var pixels = Execute(RenderBgraCommand, writer =>
         {
             writer.Write(pageIndex);
             writer.Write(outputSize.Width);
             writer.Write(outputSize.Height);
-        }, ReadByteArray);
+        }, ReadByteArray, background);
         var expected = checked(outputSize.Width * outputSize.Height * 4);
         if (pixels.Length != expected)
             throw new InvalidDataException("PDFium worker returned an incomplete BGRA bitmap.");
@@ -113,12 +126,12 @@ internal sealed class PdfiumDocumentRenderer : IPdfDocumentRenderer
     }
 
     private bool TryRenderImageOnlyJpeg(
-        int pageIndex, Size outputSize, out Bitmap bitmap)
+        int pageIndex, Size outputSize, bool background, out Bitmap bitmap)
     {
         bitmap = null!;
         var pending = _imageOnlyJpegsInFlight.GetOrAdd(pageIndex, index =>
             new Lazy<byte[]?>(() => Execute(ExtractImageOnlyJpegCommand,
-                    writer => writer.Write(index), ReadOptionalByteArray),
+                    writer => writer.Write(index), ReadOptionalByteArray, background),
                 LazyThreadSafetyMode.ExecutionAndPublication));
         byte[]? encoded;
         try { encoded = pending.Value; }
@@ -134,24 +147,31 @@ internal sealed class PdfiumDocumentRenderer : IPdfDocumentRenderer
         return true;
     }
 
-    private SizeF GetPageSize(int pageIndex)
+    private SizeF GetPageSize(int pageIndex, bool background)
     {
         ValidatePageIndex(pageIndex);
         return _pageSizes.GetOrAdd(pageIndex, index =>
             Execute(PageSizeCommand, writer => writer.Write(index), reader =>
-                new SizeF(reader.ReadSingle(), reader.ReadSingle())));
+                new SizeF(reader.ReadSingle(), reader.ReadSingle()), background));
     }
 
     private T Execute<T>(byte command, Action<BinaryWriter>? payload,
-        Func<BinaryReader, T> response)
+        Func<BinaryReader, T> response, bool background = false)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-        return _pool.Execute(worker => worker.Execute(writer =>
+        var started = Environment.TickCount64;
+        var result = _pool.Execute(worker => worker.Execute(writer =>
         {
             writer.Write(command);
             writer.Write(_path);
             payload?.Invoke(writer);
-        }, response));
+        }, response), background);
+        var elapsed = Environment.TickCount64 - started;
+        if (elapsed >= 750)
+            ExtendedDiagnostics.Breadcrumb(
+                $"Slow PDFium command: command={command}; elapsedMs={elapsed}; " +
+                $"background={background}; path={_path}");
+        return result;
     }
 
     private static byte[] ReadByteArray(BinaryReader reader)

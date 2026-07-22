@@ -235,7 +235,7 @@ internal sealed class Book : IDisposable
                     () => renderer.RenderPageStream(index),
                     () => renderer.RenderPage(index),
                     (targetSize, oversample) => renderer.RenderPageToFit(
-                        index, targetSize, oversample)))
+                        index, targetSize, oversample, background: true)))
                 .ToArray();
             if (pages.Length == 0) throw new InvalidDataException("The PDF contains no pages.");
             return new Book(pdfPath, pages,
