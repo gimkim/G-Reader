@@ -26,6 +26,33 @@ internal sealed class PageCache : IDisposable
         get => Volatile.Read(ref _cachedBytes);
     }
 
+    public PageCache CreateRemapped(
+        Func<int, Bitmap> loader, IReadOnlyDictionary<int, int> oldToNewPage)
+    {
+        var remapped = new PageCache(loader);
+        lock (_gate)
+        {
+            foreach (var pair in _items.ToArray())
+            {
+                if (!oldToNewPage.TryGetValue(pair.Key, out var newPage) ||
+                    !pair.Value.Task.IsCompletedSuccessfully ||
+                    pair.Value.ActiveReaders != 0 ||
+                    remapped._items.ContainsKey(newPage)) continue;
+                _items.Remove(pair.Key);
+                _pageBytes.TryRemove(pair.Key, out _);
+                _cachedBytes -= pair.Value.Bytes;
+                remapped._items[newPage] = pair.Value;
+                if (pair.Value.Bytes > 0)
+                {
+                    remapped._pageBytes[newPage] = pair.Value.Bytes;
+                    remapped._cachedBytes += pair.Value.Bytes;
+                }
+            }
+        }
+        Dispose();
+        return remapped;
+    }
+
     public async Task<Bitmap> GetCloneAsync(int index, CancellationToken cancellationToken)
     {
         var item = GetOrCreate(index, acquire: true);

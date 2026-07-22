@@ -149,7 +149,7 @@ internal sealed class Direct2DViewerSurface : Control
         if (IsHandleCreated) DrawFrame();
     }
 
-    public void PresentGpu(
+    public bool PresentGpu(
         GpuRenderedImage? left, GpuRenderedImage? right,
         Rectangle leftBounds, Rectangle rightBounds)
     {
@@ -159,12 +159,13 @@ internal sealed class Direct2DViewerSurface : Control
         _rightBitmap = GetOrCreateGpuBitmap(right);
         _leftBounds = leftBounds;
         _rightBounds = rightBounds;
-        DrawFrame();
+        var presented = DrawFrame();
         if (_gpuCacheBytes > GpuCacheLimitBytes + GpuCleanupHeadroomBytes)
         {
             _gpuTrimTimer.Stop();
             _gpuTrimTimer.Start();
         }
+        return presented;
     }
 
     public void UpdateLayout(Rectangle leftBounds, Rectangle rightBounds)
@@ -413,8 +414,10 @@ internal sealed class Direct2DViewerSurface : Control
             RecreateSwapChainTarget(resize: false);
             return _swapChainTarget is not null;
         }
-        catch
+        catch (Exception exception)
         {
+            ExtendedDiagnostics.LogException(
+                "Direct2D device-context creation failed", exception);
             DisposeDeviceContextTarget();
             return false;
         }
@@ -572,12 +575,12 @@ internal sealed class Direct2DViewerSurface : Control
             _gpuTrimTimer.Start();
     }
 
-    private void DrawFrame()
+    private bool DrawFrame()
     {
-        if (!IsHandleCreated || ClientSize.Width <= 0 || ClientSize.Height <= 0) return;
+        if (!IsHandleCreated || ClientSize.Width <= 0 || ClientSize.Height <= 0) return false;
         EnsureRenderTarget();
         var target = (ID2D1RenderTarget?)_deviceContext ?? _renderTarget;
-        if (target is null) return;
+        if (target is null) return false;
 
         try
         {
@@ -603,14 +606,23 @@ internal sealed class Direct2DViewerSurface : Control
                         ? _rightAnimationRotation : 0);
             }
             var result = target.EndDraw();
-            if (result.Failure) DiscardDeviceResources();
+            if (result.Failure)
+            {
+                ExtendedDiagnostics.Breadcrumb(
+                    $"Direct2D EndDraw failed: {result.Code}");
+                DiscardDeviceResources();
+                return false;
+            }
             else if (_swapChain is not null)
                 _swapChain.Present(0, PresentFlags.None);
+            return true;
         }
-        catch
+        catch (Exception exception)
         {
+            ExtendedDiagnostics.LogException("Direct2D frame presentation failed", exception);
             DiscardDeviceResources();
             Invalidate();
+            return false;
         }
     }
 

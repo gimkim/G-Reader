@@ -91,6 +91,8 @@ internal sealed class ReaderSettingsDialog : Form
         Text = "Remember the last page separately for each folder, archive, and PDF",
         AutoSize = true, Dock = DockStyle.Fill
     };
+    private readonly CheckBox _extendedLogging = CreateOption(
+        "Collect detailed error, crash, and UI-hang diagnostics (creates dump files)");
     private readonly Panel _colorPreview = new() { Width = 92, Height = 28, BorderStyle = BorderStyle.FixedSingle };
     private readonly TextBox _randomLibraryPath = new() { Width = 420 };
     private readonly Dictionary<string, HotkeyTextBox> _hotkeyEditors = new(StringComparer.Ordinal);
@@ -151,6 +153,7 @@ internal sealed class ReaderSettingsDialog : Form
     public Color ReaderBackground { get; private set; }
     public int AutoMoveMode => _autoMove.SelectedIndex;
     public bool RememberReadingPosition => _rememberReadingPosition.Checked;
+    public bool ExtendedLoggingEnabled => _extendedLogging.Checked;
     public bool ClearRememberedReadingPositionsRequested { get; private set; }
     public string RandomLibraryPath => _randomLibraryPath.Text.Trim();
     public Dictionary<string, int> ToolbarHotkeys => _hotkeyEditors.ToDictionary(
@@ -277,6 +280,7 @@ internal sealed class ReaderSettingsDialog : Form
         ]);
         _autoMove.SelectedIndex = Math.Clamp(settings.AutoMoveMode, 0, 3);
         _rememberReadingPosition.Checked = settings.RememberReadingPosition;
+        _extendedLogging.Checked = settings.ExtendedLoggingEnabled;
         _randomLibraryPath.Text = settings.RandomLibraryPath ?? string.Empty;
         ReaderBackground = Color.FromArgb(settings.BackgroundArgb);
         _colorPreview.BackColor = ReaderBackground;
@@ -512,6 +516,25 @@ internal sealed class ReaderSettingsDialog : Form
         benchmarkCommandRow.Controls.Add(benchmarkButtons, 0, 0);
         benchmarkCommandRow.Controls.Add(benchmarkStatus, 0, 1);
 
+        var openDiagnosticsFolder = CreateSecondaryButton("Open diagnostics folder");
+        openDiagnosticsFolder.MinimumSize = new Size(190, 32);
+        openDiagnosticsFolder.Click += (_, _) =>
+        {
+            try
+            {
+                Directory.CreateDirectory(ExtendedDiagnostics.FolderPath);
+                var startInfo = new System.Diagnostics.ProcessStartInfo("explorer.exe")
+                    { UseShellExecute = true };
+                startInfo.ArgumentList.Add(ExtendedDiagnostics.FolderPath);
+                System.Diagnostics.Process.Start(startInfo);
+            }
+            catch (Exception exception)
+            {
+                MessageBox.Show(this, exception.Message, "Cannot open diagnostics folder",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        };
+
         var generalPage = CreateSettingsPage("General",
             CreateSection("Reader appearance",
                 "Control the canvas appearance and color correction used on the active monitor.",
@@ -525,7 +548,11 @@ internal sealed class ReaderSettingsDialog : Form
                 ("Random library path", randomPathRow)),
             CreateSection("Windows integration",
                 "Register G Reader for supported image formats and choose which formats open with it by default.",
-                ("Default image viewer", defaultViewerRow)));
+                ("Default image viewer", defaultViewerRow)),
+            CreateSection("Diagnostics",
+                "Extended logging records session health and errors. If the UI stops responding for eight seconds, G Reader creates a diagnostic dump. Logs are retained for 30 days.",
+                ("Extended logging", _extendedLogging),
+                ("Saved diagnostics", openDiagnosticsFolder)));
 
         var renderingPage = CreateSettingsPage("Rendering",
             CreateSection("Image quality",

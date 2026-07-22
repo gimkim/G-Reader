@@ -10,6 +10,8 @@ internal static class Program
         // and the redirected binary stdout stream remains uncontaminated.
         if (PdfiumWorkerServer.TryRun(args)) return;
         ApplicationConfiguration.Initialize();
+        var startupSettings = UserSettings.Load();
+        ExtendedDiagnostics.Initialize(startupSettings.ExtendedLoggingEnabled, args);
         try { WindowsFileAssociations.EnsureRegistered(); }
         catch { /* File associations are optional and must never prevent startup. */ }
         // Keep the WinForms message pump ahead of CPU-heavy native image workers.
@@ -23,6 +25,15 @@ internal static class Program
         var explorerOrder = request.ForceFullPage
             ? ExplorerViewOrder.TryCaptureFor(request.Path)
             : null;
-        Application.Run(new AsyncMainForm(request.Path, request.ForceFullPage, explorerOrder));
+        try
+        {
+            Application.Run(new AsyncMainForm(
+                request.Path, request.ForceFullPage, explorerOrder));
+        }
+        catch (Exception exception)
+        {
+            ExtendedDiagnostics.RecordFatal("Application.Run terminated", exception);
+            throw;
+        }
     }
 }

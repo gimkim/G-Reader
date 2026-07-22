@@ -15,7 +15,7 @@ internal sealed record SortablePage(
 internal sealed record SortableBrowsePath(
     string Path, long Size, DateTime Modified, DateTime? Taken);
 
-internal sealed class Book
+internal sealed class Book : IDisposable
 {
     private static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -27,16 +27,19 @@ internal sealed class Book
     public IReadOnlyList<string> Subfolders { get; }
     public IReadOnlyList<string> Containers { get; }
     public string? ParentFolder { get; }
+    private readonly IDisposable? _ownedResource;
+    private int _disposed;
 
     private Book(string sourcePath, IReadOnlyList<PageEntry> pages,
         IReadOnlyList<string>? subfolders = null, string? parentFolder = null,
-        IReadOnlyList<string>? containers = null)
+        IReadOnlyList<string>? containers = null, IDisposable? ownedResource = null)
     {
         SourcePath = sourcePath;
         Pages = pages;
         Subfolders = subfolders ?? [];
         Containers = containers ?? [];
         ParentFolder = parentFolder;
+        _ownedResource = ownedResource;
     }
 
     public static bool IsSupportedImage(string path) => ImageExtensions.Contains(Path.GetExtension(path));
@@ -224,21 +227,35 @@ internal sealed class Book
     private static Book OpenPdf(string pdfPath)
     {
         var renderer = PdfRendering.Open(pdfPath);
-        var pages = Enumerable.Range(0, renderer.PageCount)
-            .Select(index => new PageEntry(
-                $"Page {index + 1}",
-                () => renderer.RenderPageStream(index),
-                () => renderer.RenderPage(index),
-                (targetSize, oversample) => renderer.RenderPageToFit(
-                    index, targetSize, oversample)))
-            .ToArray();
-        if (pages.Length == 0) throw new InvalidDataException("The PDF contains no pages.");
-        return new Book(pdfPath, pages,
-            parentFolder: Path.GetDirectoryName(pdfPath));
+        try
+        {
+            var pages = Enumerable.Range(0, renderer.PageCount)
+                .Select(index => new PageEntry(
+                    $"Page {index + 1}",
+                    () => renderer.RenderPageStream(index),
+                    () => renderer.RenderPage(index),
+                    (targetSize, oversample) => renderer.RenderPageToFit(
+                        index, targetSize, oversample)))
+                .ToArray();
+            if (pages.Length == 0) throw new InvalidDataException("The PDF contains no pages.");
+            return new Book(pdfPath, pages,
+                parentFolder: Path.GetDirectoryName(pdfPath), ownedResource: renderer);
+        }
+        catch
+        {
+            renderer.Dispose();
+            throw;
+        }
     }
 
     public static bool IsSupportedArchive(string path) => Path.GetExtension(path).ToLowerInvariant() is
         ".zip" or ".cbz" or ".rar" or ".cbr" or ".7z" or ".cb7";
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        _ownedResource?.Dispose();
+    }
 
     private static Book OpenArchive(
         string archivePath, PageSortMode sortMode, bool descending)

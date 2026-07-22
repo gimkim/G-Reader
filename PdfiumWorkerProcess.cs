@@ -24,6 +24,8 @@ internal static unsafe class PdfiumWorkerServer
         PageSize = 2,
         RenderBgra = 3,
         ExtractImageOnlyJpeg = 4,
+        CloseDocument = 5,
+        DeletePageCopy = 6,
         Shutdown = 255
     }
 
@@ -86,6 +88,27 @@ internal static unsafe class PdfiumWorkerServer
         BinaryWriter writer, Dictionary<string, FpdfDocumentT> documents)
     {
         var path = reader.ReadString();
+        if (command == Command.CloseDocument)
+        {
+            path = Path.GetFullPath(path);
+            if (documents.Remove(path, out var openDocument))
+                fpdfview.FPDF_CloseDocument(openDocument);
+            writer.Write(true);
+            return;
+        }
+        if (command == Command.DeletePageCopy)
+        {
+            var pageCount = reader.ReadInt32();
+            if (pageCount <= 0 || pageCount > 1_000_000)
+                throw new InvalidDataException("Invalid PDF page deletion count.");
+            var pageIndices = new int[pageCount];
+            for (var i = 0; i < pageIndices.Length; i++)
+                pageIndices[i] = reader.ReadInt32();
+            var outputPath = reader.ReadString();
+            DeletePageCopy(path, pageIndices, outputPath);
+            writer.Write(true);
+            return;
+        }
         var document = GetDocument(path, documents);
         switch (command)
         {
@@ -133,6 +156,79 @@ internal static unsafe class PdfiumWorkerServer
             default:
                 throw new InvalidDataException("Unknown PDFium worker command.");
         }
+    }
+
+    private static void DeletePageCopy(
+        string sourcePath, IReadOnlyCollection<int> requestedPageIndices, string outputPath)
+    {
+        sourcePath = Path.GetFullPath(sourcePath);
+        outputPath = Path.GetFullPath(outputPath);
+        var document = fpdfview.FPDF_LoadDocument(sourcePath, null!)
+            ?? throw CreatePdfiumException("open document for editing");
+        var expectedPageCount = 0;
+        try
+        {
+            var pageCount = fpdfview.FPDF_GetPageCount(document);
+            var pageIndices = requestedPageIndices.Distinct().OrderDescending().ToArray();
+            if (pageIndices.Length == 0)
+                throw new InvalidOperationException("Select at least one PDF page to delete.");
+            if (pageIndices.Length >= pageCount)
+                throw new InvalidOperationException("A PDF must keep at least one page.");
+            if (pageIndices.Any(index => (uint)index >= (uint)pageCount))
+                throw new ArgumentOutOfRangeException(nameof(requestedPageIndices));
+            expectedPageCount = pageCount - pageIndices.Length;
+
+            // Delete backwards so earlier indices remain stable.
+            foreach (var pageIndex in pageIndices)
+                fpdf_edit.FPDFPageDelete(document, pageIndex);
+            using var output = new FileStream(outputPath, FileMode.CreateNew,
+                FileAccess.Write, FileShare.None, 1024 * 1024,
+                FileOptions.SequentialScan);
+            Exception? writeFailure = null;
+            PDFiumCore.Delegates.Func_int___IntPtr___IntPtr_ulong writeBlock =
+                (_, data, size) =>
+                {
+                    try
+                    {
+                        var remaining = size;
+                        var address = data;
+                        while (remaining > 0)
+                        {
+                            var length = (int)Math.Min(remaining, (ulong)int.MaxValue);
+                            output.Write(new ReadOnlySpan<byte>(address.ToPointer(), length));
+                            address += length;
+                            remaining -= (ulong)length;
+                        }
+                        return 1;
+                    }
+                    catch (Exception exception)
+                    {
+                        writeFailure = exception;
+                        return 0;
+                    }
+                };
+            using var writer = new FPDF_FILEWRITE_
+            {
+                Version = 1,
+                WriteBlock = writeBlock
+            };
+            // FPDF_NO_INCREMENTAL produces a self-contained replacement file.
+            if (fpdf_save.FPDF_SaveAsCopy(document, writer, 2) == 0)
+                throw new IOException("PDFium could not save the edited PDF.", writeFailure);
+            output.Flush(flushToDisk: true);
+            GC.KeepAlive(writeBlock);
+        }
+        finally { fpdfview.FPDF_CloseDocument(document); }
+
+        var verification = fpdfview.FPDF_LoadDocument(outputPath, null!)
+            ?? throw CreatePdfiumException("open the edited PDF for verification");
+        try
+        {
+            if (fpdfview.FPDF_GetPageCount(verification) != expectedPageCount)
+                throw new InvalidDataException(
+                    "The edited PDF did not contain the expected number of pages.");
+        }
+        finally { fpdfview.FPDF_CloseDocument(verification); }
     }
 
     private static FpdfDocumentT GetDocument(
@@ -483,6 +579,31 @@ internal sealed class PdfiumProcessPool : IDisposable
         }
     }
 
+    public void CloseDocument(string path)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        var acquired = 0;
+        var workers = new List<PdfiumWorkerClient>(_workers.Length);
+        try
+        {
+            for (; acquired < _workers.Length; acquired++) _slots.Wait();
+            while (_available.TryDequeue(out var worker)) workers.Add(worker);
+            if (workers.Count != _workers.Length)
+                throw new InvalidOperationException("PDFium process pool lost a worker.");
+            foreach (var worker in workers)
+                worker.Execute(writer =>
+                {
+                    writer.Write((byte)5);
+                    writer.Write(Path.GetFullPath(path));
+                }, _ => true);
+        }
+        finally
+        {
+            foreach (var worker in workers) _available.Enqueue(worker);
+            for (var i = 0; i < acquired; i++) _slots.Release();
+        }
+    }
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
@@ -523,5 +644,12 @@ internal static class PdfiumProcessPoolManager
             _current.AddReference();
             return _current;
         }
+    }
+
+    public static void CloseDocument(string path)
+    {
+        PdfiumProcessPool? pool;
+        lock (Gate) pool = _current;
+        pool?.CloseDocument(path);
     }
 }

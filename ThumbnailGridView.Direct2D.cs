@@ -29,6 +29,13 @@ internal sealed partial class ThumbnailGridView
         public long Bytes { get; } = bytes;
         public LinkedListNode<GpuRenderedImage> LruNode { get; } = lruNode;
     }
+    private sealed class RetiredThumbnailGpuBatch(
+        Queue<(IDisposable Resource, long Bytes)> resources,
+        TaskCompletionSource completion)
+    {
+        public Queue<(IDisposable Resource, long Bytes)> Resources { get; } = resources;
+        public TaskCompletionSource Completion { get; } = completion;
+    }
 
     private const long MinimumGpuCacheBytes = 64L * 1024 * 1024;
     private const long MaximumGpuCacheBytes = 512L * 1024 * 1024;
@@ -67,6 +74,8 @@ internal sealed partial class ThumbnailGridView
     private readonly LinkedList<GpuRenderedImage> _nativeThumbnailGpuLru = [];
     private readonly System.Windows.Forms.Timer _thumbnailGpuUploadTimer = new() { Interval = 16 };
     private readonly System.Windows.Forms.Timer _thumbnailGpuTrimTimer = new() { Interval = 650 };
+    private readonly System.Windows.Forms.Timer _thumbnailGpuRetireTimer = new() { Interval = 30 };
+    private readonly Queue<RetiredThumbnailGpuBatch> _retiredThumbnailGpuBatches = [];
     private readonly Dictionary<string, ID2D1ColorContext> _thumbnailColorContexts = [];
     private readonly Dictionary<ID2D1Bitmap, ID2D1Effect> _thumbnailColorEffects =
         new(ReferenceEqualityComparer.Instance);
@@ -114,6 +123,7 @@ internal sealed partial class ThumbnailGridView
 
     private long _thumbnailGpuCacheBytes;
     private long _thumbnailGpuCacheLimitBytes = 256L * 1024 * 1024;
+    private long _retiredGpuNotBeforeTick;
     private int _gpuSourceRecoveryPending;
     private double _measuredUploadBytesPerSecond = 2.0 * 1024 * 1024 * 1024;
     private long _lastScrollingPresentTick;
@@ -139,6 +149,7 @@ internal sealed partial class ThumbnailGridView
             _thumbnailGpuTrimTimer.Stop();
             TrimGpuTextureCache();
         };
+        _thumbnailGpuRetireTimer.Tick += (_, _) => DrainRetiredGpuResources();
     }
 
     public void ConfigureColorManagement(bool enabled, byte[]? monitorProfile)
@@ -352,6 +363,8 @@ internal sealed partial class ThumbnailGridView
             var result = target.EndDraw();
             if (result.Failure)
             {
+                ExtendedDiagnostics.Breadcrumb(
+                    $"Thumbnail Direct2D EndDraw failed: {result}");
                 ScheduleGpuSourceRecovery();
                 DiscardThumbnailDeviceResources();
                 Invalidate();
@@ -360,8 +373,10 @@ internal sealed partial class ThumbnailGridView
             if (_thumbnailSwapChain is not null)
                 _thumbnailSwapChain.Present(0, PresentFlags.None);
         }
-        catch
+        catch (Exception exception)
         {
+            ExtendedDiagnostics.LogException(
+                "Thumbnail Direct2D frame failed", exception);
             ScheduleGpuSourceRecovery();
             DiscardThumbnailDeviceResources();
             Invalidate();
@@ -396,10 +411,11 @@ internal sealed partial class ThumbnailGridView
         ref bool pendingUploads)
     {
         var target = ThumbnailTarget!;
-        var selected = item == _selectedItem;
+        var selected = IsItemSelected(item);
+        var active = item == _selectedItem;
         target.FillRectangle(ToRect(bounds), selected ? _selectedTileBrush! : _normalTileBrush!);
         target.DrawRectangle(ToRect(bounds), selected ? _selectedBorderBrush! : _tileBorderBrush!,
-            selected ? 2f : 1f);
+            active ? 3f : selected ? 2f : 1f);
 
         var browseItem = item < _folders.Length;
         // Browse entries still allow several wrapped filename lines, but avoid
@@ -757,8 +773,11 @@ internal sealed partial class ThumbnailGridView
             _thumbnailGpuCacheBytes += item.Bytes;
             return texture;
         }
-        catch
+        catch (Exception exception)
         {
+            ExtendedDiagnostics.LogException(
+                "Native GPU thumbnail import failed", exception,
+                $"source={source.Width}x{source.Height}; bytes={source.Bytes}");
             ScheduleGpuSourceRecovery();
             return null;
         }
@@ -898,8 +917,90 @@ internal sealed partial class ThumbnailGridView
             _thumbnailGpuTrimTimer.Start();
     }
 
-    private void ClearGpuTextureCache()
+    private Task RetireGpuTextureCache()
     {
+        _thumbnailGpuUploadTimer.Stop();
+        _thumbnailGpuTrimTimer.Stop();
+        var resources = new Queue<(IDisposable Resource, long Bytes)>();
+        foreach (var effect in _thumbnailColorEffects.Values)
+            resources.Enqueue((effect, 0));
+        _thumbnailColorEffects.Clear();
+        foreach (var item in _thumbnailGpuCache.Values)
+            resources.Enqueue((item.Texture, item.Bytes));
+        foreach (var item in _nativeThumbnailGpuCache.Values)
+            resources.Enqueue((item.Texture, item.Bytes));
+        _thumbnailGpuCache.Clear();
+        _thumbnailGpuLru.Clear();
+        _nativeThumbnailGpuCache.Clear();
+        _nativeThumbnailGpuLru.Clear();
+        _thumbnailGpuCacheBytes = 0;
+        if (resources.Count == 0) return Task.CompletedTask;
+
+        var completion = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var wasEmpty = _retiredThumbnailGpuBatches.Count == 0;
+        _retiredThumbnailGpuBatches.Enqueue(
+            new RetiredThumbnailGpuBatch(resources, completion));
+        // Let the replacement grid paint and upload its first visible textures
+        // before old COM resources consume any UI-thread time. Never extend an
+        // existing grace period: continuous thumbnail uploads/navigation must
+        // not starve retirement and retain whole books in RAM/VRAM.
+        if (wasEmpty) DelayRetiredGpuResources(250);
+        _thumbnailGpuRetireTimer.Start();
+        return completion.Task;
+    }
+
+    private void DelayRetiredGpuResources(int milliseconds)
+    {
+        var delayedUntil = Stopwatch.GetTimestamp() + Math.Max(1,
+            Stopwatch.Frequency * milliseconds / 1000);
+        if (delayedUntil > _retiredGpuNotBeforeTick)
+            _retiredGpuNotBeforeTick = delayedUntil;
+    }
+
+    private void DrainRetiredGpuResources()
+    {
+        if (Stopwatch.GetTimestamp() < _retiredGpuNotBeforeTick) return;
+        const int maximumItemsPerTick = 4;
+        const long maximumBytesPerTick = 16L * 1024 * 1024;
+        var deadline = Stopwatch.GetTimestamp() + Math.Max(1,
+            Stopwatch.Frequency / 1000);
+        var items = 0;
+        long bytes = 0;
+        while (_retiredThumbnailGpuBatches.TryPeek(out var batch))
+        {
+            while (batch.Resources.TryPeek(out var item) &&
+                   items < maximumItemsPerTick &&
+                   (items == 0 || bytes + item.Bytes <= maximumBytesPerTick) &&
+                   Stopwatch.GetTimestamp() < deadline)
+            {
+                batch.Resources.Dequeue();
+                try { item.Resource.Dispose(); }
+                catch { }
+                items++;
+                bytes += item.Bytes;
+            }
+            if (batch.Resources.Count != 0) break;
+            _retiredThumbnailGpuBatches.Dequeue();
+            batch.Completion.TrySetResult();
+        }
+        if (_retiredThumbnailGpuBatches.Count == 0)
+            _thumbnailGpuRetireTimer.Stop();
+    }
+
+    private void ClearGpuTextureCacheImmediate()
+    {
+        _thumbnailGpuRetireTimer.Stop();
+        while (_retiredThumbnailGpuBatches.Count > 0)
+        {
+            var batch = _retiredThumbnailGpuBatches.Dequeue();
+            while (batch.Resources.TryDequeue(out var item))
+            {
+                try { item.Resource.Dispose(); }
+                catch { }
+            }
+            batch.Completion.TrySetResult();
+        }
         DisposeThumbnailColorEffects();
         _thumbnailGpuUploadTimer.Stop();
         _thumbnailGpuTrimTimer.Stop();
@@ -930,11 +1031,11 @@ internal sealed partial class ThumbnailGridView
                     // CUDA/D3D image tied to a lost device. Drop those GPU sources
                     // after the active paint has released its leases, then request
                     // fresh GPU renders. CPU previews remain available meanwhile.
-                    ClearGpuTextureCache();
-                    _gpuFullCache.Clear();
-                    _gpuFastPreviewCache.Clear();
-                    _gpuBrowseFullPreviewCache.Clear();
-                    _gpuBrowseFastPreviewCache.Clear();
+                    var retirement = RetireGpuTextureCache();
+                    _gpuFullCache.Clear(retirement);
+                    _gpuFastPreviewCache.Clear(retirement);
+                    _gpuBrowseFullPreviewCache.Clear(retirement);
+                    _gpuBrowseFastPreviewCache.Clear(retirement);
                     Invalidate();
                     ThumbnailRefreshRequested?.Invoke(this, EventArgs.Empty);
                 }
@@ -952,7 +1053,7 @@ internal sealed partial class ThumbnailGridView
 
     private void DiscardThumbnailDeviceResources()
     {
-        ClearGpuTextureCache();
+        ClearGpuTextureCacheImmediate();
         DisposeThumbnailBrushes();
         DisposeThumbnailDeviceContext();
         _thumbnailRenderTarget?.Dispose();
@@ -1006,6 +1107,7 @@ internal sealed partial class ThumbnailGridView
         DiscardThumbnailDeviceResources();
         _thumbnailGpuUploadTimer.Dispose();
         _thumbnailGpuTrimTimer.Dispose();
+        _thumbnailGpuRetireTimer.Dispose();
         _thumbnailNameFormat.Dispose();
         _thumbnailNumberFormat.Dispose();
         _thumbnailIconFormat.Dispose();

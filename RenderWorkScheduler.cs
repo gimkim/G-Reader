@@ -7,9 +7,14 @@ internal static class RenderWorkScheduler
         public SemaphoreSlim Slots { get; } = new(Math.Max(1, workerCount));
         public int ThreadsPerWorker { get; } = Math.Max(1, threadsPerWorker);
     }
+    private sealed class FullLane(int workerCount)
+    {
+        public SemaphoreSlim Slots { get; } = new(Math.Max(1, workerCount));
+    }
 
     private static readonly object PriorityGate = new();
     private static FastLane _fastLane = new(4, 2);
+    private static FullLane _fullLane = new(3);
     private static int _fastCodecConcurrency = 8;
     private static int _batchCodecConcurrency = 8;
     private static int _pendingFastWork;
@@ -20,6 +25,7 @@ internal static class RenderWorkScheduler
 
     public static int BatchCodecConcurrency =>
         Volatile.Read(ref _batchCodecConcurrency);
+    public static int PendingFastWork => Volatile.Read(ref _pendingFastWork);
 
     public static void Configure(
         int globalFastPreviewConcurrency, int fastPreviewWorkers,
@@ -29,6 +35,8 @@ internal static class RenderWorkScheduler
         Volatile.Write(ref _fastLane, new FastLane(
             Math.Clamp(fastPreviewWorkers, 1, 64),
             Math.Clamp(fastPreviewThreadsPerWorker, 1, 64)));
+        Volatile.Write(ref _fullLane, new FullLane(
+            Math.Clamp(batchWorkers, 1, 64)));
         var logicalCpu = Math.Clamp(Environment.ProcessorCount, 1, 64);
         Volatile.Write(ref _fastCodecConcurrency, Math.Clamp(
             globalFastPreviewConcurrency,
@@ -65,7 +73,8 @@ internal static class RenderWorkScheduler
     {
         // Full-quality work already running is allowed to finish, but no new
         // Lanczos job enters while any fast-preview job is queued or active.
-        while (true)
+        var fairnessDeadline = Environment.TickCount64 + 750;
+        while (Environment.TickCount64 < fairnessDeadline)
         {
             Task wait;
             lock (PriorityGate)
@@ -73,11 +82,36 @@ internal static class RenderWorkScheduler
                 if (_pendingFastWork == 0) break;
                 wait = _fastWorkDrained.Task;
             }
-            await wait.WaitAsync(cancellationToken).ConfigureAwait(false);
+            var remaining = Math.Max(1, fairnessDeadline - Environment.TickCount64);
+            var completed = await Task.WhenAny(wait,
+                Task.Delay((int)Math.Min(int.MaxValue, remaining), cancellationToken))
+                .ConfigureAwait(false);
+            if (!ReferenceEquals(completed, wait)) break;
         }
-        return await Task.Run(
-            () => RunAtPriority(work, ThreadPriority.BelowNormal),
-            cancellationToken).ConfigureAwait(false);
+        var lane = Volatile.Read(ref _fullLane);
+        await lane.Slots.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await Task.Run(
+                () => RunAtPriority(work, ThreadPriority.BelowNormal),
+                cancellationToken).ConfigureAwait(false);
+        }
+        finally { lane.Slots.Release(); }
+    }
+
+    public static async Task<T> RunInteractiveFullAsync<T>(
+        Func<T> work, CancellationToken cancellationToken)
+    {
+        // The page currently on screen must never wait behind thumbnail work.
+        // Registering it as fast work also keeps background Lanczos jobs behind it.
+        RegisterFastWork();
+        try
+        {
+            return await Task.Run(
+                () => RunAtPriority(work, ThreadPriority.AboveNormal),
+                cancellationToken).ConfigureAwait(false);
+        }
+        finally { UnregisterFastWork(); }
     }
 
     public static async Task<T> RunFastCodecAsync<T>(

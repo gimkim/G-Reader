@@ -49,9 +49,23 @@ internal static class GpuContactSheetRenderer
         }
         finally { converted.UnlockBits(data); }
         cancellationToken.ThrowIfCancellationRequested();
-        using var uploaded = GpuInteropDevice.CreateImageFromBgra(
+        var uploaded = GpuInteropDevice.CreateImageFromBgra(
             pixels, converted.Width, converted.Height);
-        return uploaded is null ? null : TryScale(uploaded, target);
+        if (uploaded is null) return null;
+
+        // WIC normally decodes fast previews at their final dimensions already.
+        // Keep that texture directly instead of submitting another Direct2D job on
+        // the process-wide D3D device.  Apart from avoiding a redundant copy, this
+        // prevents background thumbnail workers from holding the driver while the
+        // UI's Direct2D surface is presenting a frame.
+        if (uploaded.Width == target.Width && uploaded.Height == target.Height)
+            return uploaded;
+
+        using (uploaded)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return TryScale(uploaded, target);
+        }
     }
 
     private static GpuRenderedImage? TryScale(

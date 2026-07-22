@@ -6,32 +6,61 @@ namespace CDisplayEx.CSharp;
 internal sealed class AsyncMainForm : Form, IMessageFilter
 {
     private sealed record RetainedPageCache(PageCache Cache, long LastUsed);
+    private sealed class PdfReloadCache(
+        IReadOnlyDictionary<int, int> pageMap,
+        PersistentPreviewCache.PdfRemapPlan persistentPlan,
+        IReadOnlyDictionary<int, int> rotations,
+        IReadOnlyDictionary<int, bool> landscapePages) : IDisposable
+    {
+        public IReadOnlyDictionary<int, int> PageMap { get; } = pageMap;
+        public PersistentPreviewCache.PdfRemapPlan PersistentPlan { get; } = persistentPlan;
+        public IReadOnlyDictionary<int, int> Rotations { get; } = rotations;
+        public IReadOnlyDictionary<int, bool> LandscapePages { get; } = landscapePages;
+        private PageCache? _sourceCache;
+
+        public void Attach(PageCache? cache) => _sourceCache = cache;
+
+        public PageCache CreatePageCache(Func<int, Bitmap> loader)
+        {
+            var source = _sourceCache;
+            _sourceCache = null;
+            return source?.CreateRemapped(loader, PageMap) ?? new PageCache(loader);
+        }
+
+        public void Dispose()
+        {
+            var source = _sourceCache;
+            _sourceCache = null;
+            source?.Dispose();
+        }
+    }
     private sealed class GeneratedThumbnail(Bitmap? bitmap, GpuRenderedImage? gpu) : IDisposable
     {
         private Action? _completion;
         public Bitmap? Bitmap { get; private set; } = bitmap;
         public GpuRenderedImage? Gpu { get; private set; } = gpu;
         public void CompleteWith(Action completion) => _completion = completion;
-        public void Publish(ThumbnailGridView grid, int page, Size size, bool fast)
+        public void Publish(ThumbnailGridView grid, int page, Size size, bool fast,
+            int generation)
         {
             try
             {
                 if (Gpu is { } gpuImage)
-                { Gpu = null; grid.SetThumbnailGpu(page, size, gpuImage, fast); return; }
+                { Gpu = null; grid.SetThumbnailGpu(page, size, gpuImage, fast, generation); return; }
                 if (Bitmap is { } bitmapImage)
-                { Bitmap = null; grid.SetThumbnail(page, size, bitmapImage, fast); }
+                { Bitmap = null; grid.SetThumbnail(page, size, bitmapImage, fast, generation); }
             }
             finally { Complete(); }
         }
         public void PublishBrowse(
-            ThumbnailGridView grid, int item, Size size, bool fast)
+            ThumbnailGridView grid, int item, Size size, bool fast, int generation)
         {
             try
             {
                 if (Gpu is { } gpuImage)
-                { Gpu = null; grid.SetBrowsePreviewGpu(item, size, gpuImage, fast); return; }
+                { Gpu = null; grid.SetBrowsePreviewGpu(item, size, gpuImage, fast, generation); return; }
                 if (Bitmap is { } bitmapImage)
-                { Bitmap = null; grid.SetBrowsePreview(item, size, bitmapImage, fast); }
+                { Bitmap = null; grid.SetBrowsePreview(item, size, bitmapImage, fast, generation); }
             }
             finally { Complete(); }
         }
@@ -164,6 +193,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private bool _visibleThumbnailRefreshPending;
     private int _adjacentBookOpening;
     private int _randomOpenInProgress;
+    private int _pdfPageDeleteInProgress;
     private int _requestedWarmCenter;
     private int _activePrecacheWorkerCount;
     private PageCache? _scheduledTrimCache;
@@ -368,6 +398,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             QueueMonitorColorProfileRefresh();
         };
         Application.AddMessageFilter(this);
+        ExtendedDiagnostics.AttachUi(this, GetDiagnosticContext);
         FormClosing += (_, _) =>
         {
             CancelRandomOpenWork();
@@ -402,6 +433,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             Item("O&pen Folder...", (_, _) => OpenFolder(), Keys.Control | Keys.O), Sep(),
             Item("&Save to File...", (_, _) => SaveCurrent(), Keys.Control | Keys.S),
             Item("Sa&ve to Clipboard...", (_, _) => CopyCurrent(), Keys.Control | Keys.C),
+            Item("&Delete PDF Page...", (_, _) => _ = DeleteSelectedPdfPageAsync(), Keys.Delete), Sep(),
             Item("Pr&int...", (_, _) => PrintCurrent()), Item("Pri&nter Setup...", (_, _) => ShowPrinterSetup()), Sep(),
             Item("&Full Screen", (_, _) => ToggleFullscreen(), Keys.F11),
             Item("&Minimize", (_, _) => WindowState = FormWindowState.Minimized, Keys.Control | Keys.M),
@@ -755,14 +787,17 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private async Task TryOpenAsync(string path,
         string? preferredPageName = null, string? preferredBrowsePath = null,
         bool forceFreshPageCache = false,
-        bool showThumbnailForFolderWithoutImages = false)
+        bool showThumbnailForFolderWithoutImages = false,
+        PdfReloadCache? pdfReloadCache = null)
     {
+        ExtendedDiagnostics.Breadcrumb(
+            $"Open requested: {path}; thumbnailMode={_thumbnailMode}");
         CancelRandomOpenWork();
         RememberCurrentBookPosition();
         CancelBookWork(retainPageCache: !forceFreshPageCache);
         _book = null;
         _viewer.RetireBookCache();
-        BuildThumbnailPlaceholders();
+        if (pdfReloadCache is null) BuildThumbnailPlaceholders();
         _suppressPositionEvent = true;
         _positionSlider.Maximum = 0;
         _positionSlider.Value = 0;
@@ -783,10 +818,28 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             cancellation.Token.ThrowIfCancellationRequested();
             if (_bookCancellation != cancellation) return;
             _book = book;
-            _cache = (!forceFreshPageCache
-                ? TakeRetainedPageCache(book.SourcePath)
-                : null) ??
-                new PageCache(index => DecodePage(book, index));
+            ExtendedDiagnostics.Breadcrumb(
+                $"Open completed: {book.SourcePath}; pages={book.Pages.Count}; " +
+                $"folders={book.Subfolders.Count}; containers={book.Containers.Count}");
+            _rotations.Clear();
+            _landscapePages.Clear();
+            if (pdfReloadCache is not null)
+            {
+                foreach (var pair in pdfReloadCache.Rotations)
+                    _rotations[pair.Key] = pair.Value;
+                foreach (var pair in pdfReloadCache.LandscapePages)
+                    _landscapePages[pair.Key] = pair.Value;
+                _cache = pdfReloadCache.CreatePageCache(index => DecodePage(book, index));
+                await PersistentPreviewCache.ApplyPdfRemapAsync(
+                    pdfReloadCache.PersistentPlan, book);
+            }
+            else
+            {
+                _cache = (!forceFreshPageCache
+                    ? TakeRetainedPageCache(book.SourcePath)
+                    : null) ??
+                    new PageCache(index => DecodePage(book, index));
+            }
             _viewer.ActivateBookCache(book.SourcePath);
             _bookPrecacheStarted = false;
             var preferredIndex = string.IsNullOrWhiteSpace(preferredPageName)
@@ -799,8 +852,6 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                     ? book.IndexOfFile(path)
                     : GetRememberedBookPage(book);
             _ = RefreshCurrentPageInfoAsync(_pageIndex);
-            _rotations.Clear();
-            _landscapePages.Clear();
             _currentAutoSingle = false;
             _suppressPositionEvent = true;
             _positionSlider.Maximum = Math.Max(0, book.Pages.Count - 1);
@@ -809,7 +860,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             _bottomPanel.Visible = true;
             if (_sliderItem is not null) _sliderItem.Checked = true;
             Text = $"{Path.GetFileName(book.SourcePath)} - G Reader";
-            BuildThumbnailPlaceholders();
+            BuildThumbnailPlaceholders(pdfReloadCache?.PageMap);
             var browseEntrySelected = !string.IsNullOrWhiteSpace(preferredBrowsePath) &&
                 _thumbnailGrid.SelectBrowsePath(preferredBrowsePath);
             EndProgress(progress);
@@ -834,9 +885,11 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
+            ExtendedDiagnostics.LogException("Open book failed", ex, $"path={path}");
             EndProgress(progress);
             MessageBox.Show(this, ex.Message, "Cannot open book", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
+        finally { pdfReloadCache?.Dispose(); }
     }
 
     private static bool PathsEqual(string? first, string? second)
@@ -897,6 +950,9 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         var book = _book;
         var cache = _cache;
         _pageIndex = Math.Clamp(_pageIndex, 0, book.Pages.Count - 1);
+        // Do not carry the previous spread's auto-single decision into the new
+        // page while its orientation is still being resolved.
+        _currentAutoSingle = false;
         _ = RefreshCurrentPageInfoAsync(_pageIndex);
         UpdatePosition(); HighlightThumbnail();
         var firstIndex = _pageIndex;
@@ -915,6 +971,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 firstKey, secondKey, firstIndex, cachedSecondIndex))
         {
             _currentAutoSingle = cachedAutoSingle;
+            UpdateSpreadStatus();
             RequestCacheWarm(firstIndex, cache, book);
             var encodedPages = EncodedJpegRenderer.Supports(book.Pages[firstIndex]) &&
                 (cachedSecondIndex < 0 || EncodedJpegRenderer.Supports(book.Pages[cachedSecondIndex]));
@@ -957,26 +1014,32 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 var firstRender = _viewer.PreRenderEncodedJpegAsync(
                     firstIndex, firstKey, book.Pages[firstIndex], visiblePageCount,
                     _rotations.GetValueOrDefault(firstIndex), context,
-                    generatePreview: false, cancellation.Token);
+                    generatePreview: false, cancellation.Token, interactiveFull: true);
                 var secondRender = directSecondIndex >= 0
                     ? _viewer.PreRenderEncodedJpegAsync(
                         directSecondIndex, GetPageCacheKey(book, directSecondIndex),
                         book.Pages[directSecondIndex], visiblePageCount,
                         _rotations.GetValueOrDefault(directSecondIndex), context,
-                        generatePreview: false, cancellation.Token)
+                        generatePreview: false, cancellation.Token, interactiveFull: true)
                     : Task.CompletedTask;
                 await Task.WhenAll(firstRender, secondRender);
                 cancellation.Token.ThrowIfCancellationRequested();
                 if (_book != book || _pageIndex != firstIndex) return;
                 _currentAutoSingle = directAutoSingle;
-                _viewer.TryPresentCachedPages(
+                UpdateSpreadStatus();
+                var presented = _viewer.TryPresentCachedPages(
                     firstKey,
                     directSecondIndex >= 0 ? GetPageCacheKey(book, directSecondIndex) : null,
                     firstIndex, directSecondIndex);
-                EndProgress(progress);
-                RestoreCacheStatus();
-                RequestCacheWarm(firstIndex, cache, book);
-                return;
+                ExtendedDiagnostics.Breadcrumb(
+                    $"Full-view encoded render completed: page={firstIndex}; presented={presented}");
+                if (presented)
+                {
+                    EndProgress(progress);
+                    RestoreCacheStatus();
+                    RequestCacheWarm(firstIndex, cache, book);
+                    return;
+                }
             }
 
             var firstTask = LoadPageAsync(cache, firstIndex, cancellation.Token);
@@ -1013,6 +1076,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             }
 
             _currentAutoSingle = autoSingle;
+            UpdateSpreadStatus();
             _viewer.SetPages(first, second, GetPageCacheKey(book, firstIndex),
                 secondIndex >= 0 ? GetPageCacheKey(book, secondIndex) : null,
                 firstIndex, secondIndex);
@@ -1024,6 +1088,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
+            ExtendedDiagnostics.LogException("Show current page failed", ex,
+                $"source={book.SourcePath}; page={firstIndex}; fastPending={RenderWorkScheduler.PendingFastWork}");
             EndProgress(progress);
             if (!cancellation.IsCancellationRequested)
             {
@@ -1196,6 +1262,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             if (_book != book || _pageIndex != firstIndex || !_viewer.Visible) return;
             _viewer.PresentImmediatePreview(
                 first, second, firstIndex, autoSingle ? -1 : secondIndex);
+            ExtendedDiagnostics.Breadcrumb(
+                $"Full-view immediate preview presented: page={firstIndex}; size={first.Width}x{first.Height}");
             first = null;
             second = null;
         }
@@ -1203,6 +1271,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         catch (Exception exception)
         {
             System.Diagnostics.Debug.WriteLine($"Immediate JPEG preview failed: {exception}");
+            ExtendedDiagnostics.LogException("Immediate full-view preview failed", exception,
+                $"source={book.SourcePath}; page={firstIndex}");
         }
         finally
         {
@@ -1347,7 +1417,10 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     {
         try { await cancellation.CancelAsync().ConfigureAwait(false); }
         catch (ObjectDisposedException) { }
-        finally { cancellation.Dispose(); }
+        // Async render paths capture the CTS and may read Token after their next
+        // await. Disposing here races those readers. Once all operations release
+        // the cancelled source, GC can reclaim it without an explicit Dispose;
+        // none of these sources expose their WaitHandle.
     }
 
     private static void CancelAndDisposeInBackground(CancellationTokenSource? cancellation)
@@ -1410,8 +1483,11 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             }
         }
         catch (OperationCanceledException) { }
-        catch
+        catch (Exception exception)
         {
+            ExtendedDiagnostics.LogException("Cache warming failed", exception,
+                $"source={book.SourcePath}; center={Volatile.Read(ref _requestedWarmCenter)}; " +
+                $"fastPending={RenderWorkScheduler.PendingFastWork}");
             if (id != 0) EndCacheProgress(id, "Ready");
         }
         finally
@@ -1950,7 +2026,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         }
     }
 
-    private void BuildThumbnailPlaceholders()
+    private void BuildThumbnailPlaceholders(
+        IReadOnlyDictionary<int, int>? pageRemap = null)
     {
         CancelThumbnailWork();
         var folders = new List<ThumbnailFolderEntry>();
@@ -1973,9 +2050,16 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         {
             _thumbnailAddressBox.Text = string.Empty;
         }
-        _thumbnailGrid.ResetPages(
-            _book?.Pages.Select(page => page.Name) ?? [], folders);
-        _thumbnailGrid.SelectedPage = _pageIndex;
+        var pageNames = _book?.Pages.Select(page => page.Name) ?? [];
+        if (pageRemap is null)
+        {
+            _thumbnailGrid.ResetPages(pageNames, folders);
+            _thumbnailGrid.SelectedPage = _pageIndex;
+        }
+        else
+        {
+            _thumbnailGrid.RemapPages(pageNames, folders, pageRemap, _pageIndex);
+        }
     }
 
     private void OpenThumbnailAddress()
@@ -2036,6 +2120,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _thumbnailCancellation = cancellation;
         var book = _book;
         var targetSize = _thumbnailGrid.RenderTargetSize;
+        var thumbnailGeneration = _thumbnailGrid.ContentGeneration;
         var browseEntries = _thumbnailGrid.GetBrowseEntries();
         var orderedWork = _thumbnailGrid.GetPreviewPriorityOrder();
         var browseWorkLimit = _thumbnailGrid.BrowsePreviewWorkLimit;
@@ -2080,7 +2165,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 PersistentPreviewCache.StoreCopyInBackground(
                     PersistentPreviewKind.ThumbnailFast, book, page, targetSize,
                     _rotations.GetValueOrDefault(page), quality: 0, fast);
-                _thumbnailGrid.SetThumbnail(page, targetSize, fast, fastPreview: true);
+                _thumbnailGrid.SetThumbnail(page, targetSize, fast, fastPreview: true,
+                    thumbnailGeneration);
                 fast = null;
                 _thumbnailGrid.SetGenerationState(page, "Generating Lanczos...");
 
@@ -2098,7 +2184,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 PersistentPreviewCache.StoreCopyInBackground(
                     PersistentPreviewKind.ThumbnailFinal, book, page, targetSize,
                     _rotations.GetValueOrDefault(page), _settings.LanczosQuality, full);
-                _thumbnailGrid.SetThumbnail(page, targetSize, full, fastPreview: false);
+                _thumbnailGrid.SetThumbnail(page, targetSize, full, fastPreview: false,
+                    thumbnailGeneration);
                 full = null;
                 _thumbnailGrid.SetGenerationState(page, null);
             }
@@ -2149,7 +2236,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                                 thumbnail.Dispose();
                                 return;
                             }
-                            thumbnail.Publish(_thumbnailGrid, page, targetSize, fastPreview);
+                            thumbnail.Publish(_thumbnailGrid, page, targetSize, fastPreview,
+                                thumbnailGeneration);
                             _thumbnailGrid.SetGenerationState(page, null);
                         }
                         var current = Interlocked.Increment(ref loaded);
@@ -2218,7 +2306,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                                         return;
                                     }
                                     preview.PublishBrowse(
-                                        _thumbnailGrid, work.Index, targetSize, fast: true);
+                                        _thumbnailGrid, work.Index, targetSize, fast: true,
+                                        thumbnailGeneration);
                                 }
                             }
                         }
@@ -2249,7 +2338,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                                     return;
                                 }
                                 thumbnail.Publish(
-                                    _thumbnailGrid, page, targetSize, fast: true);
+                                    _thumbnailGrid, page, targetSize, fast: true,
+                                    thumbnailGeneration);
                                 _thumbnailGrid.SetGenerationState(page, null);
                             }
                         }
@@ -2311,7 +2401,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                                     return;
                                 }
                                 preview.PublishBrowse(
-                                    _thumbnailGrid, work.Index, targetSize, fast: false);
+                                    _thumbnailGrid, work.Index, targetSize, fast: false,
+                                    thumbnailGeneration);
                             }
                         }
                         var current = Interlocked.Increment(ref loaded);
@@ -2367,6 +2458,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 // overscan, so sampling it during scrolling remains O(viewport)
                 // even when a folder contains many thousands of entries.
                 var targetSize = _thumbnailGrid.RenderTargetSize;
+                var thumbnailGeneration = _thumbnailGrid.ContentGeneration;
                 var allVisibleWork = _thumbnailGrid.GetVisiblePreviewPriorityOrder();
                 var missingVisibleWork = allVisibleWork.Where(work =>
                         !attempted.Contains(work) && (work.IsBrowse
@@ -2417,7 +2509,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                                     return;
                                 }
                                 preview.PublishBrowse(
-                                    _thumbnailGrid, work.Index, targetSize, fast: true);
+                                    _thumbnailGrid, work.Index, targetSize, fast: true,
+                                    thumbnailGeneration);
                                 return;
                             }
 
@@ -2436,7 +2529,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                                 return;
                             }
                             thumbnail.Publish(
-                                _thumbnailGrid, page, targetSize, fast: true);
+                                _thumbnailGrid, page, targetSize, fast: true,
+                                thumbnailGeneration);
                             _thumbnailGrid.SetGenerationState(page, null);
                         }
                         catch (OperationCanceledException) { }
@@ -2945,8 +3039,20 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private void UpdatePositionSlider(int page)
     {
         _suppressPositionEvent = true;
-        try { _positionSlider.Value = page; }
+        try
+        {
+            _positionSlider.Value = page;
+            _positionSlider.RangeEnd = !_thumbnailMode && page == _pageIndex
+                ? GetSecondPageIndex()
+                : -1;
+        }
         finally { _suppressPositionEvent = false; }
+    }
+
+    private void UpdateSpreadStatus()
+    {
+        UpdatePosition();
+        UpdateFileInfoLabel();
     }
 
     private void RotateCurrent(int degrees)
@@ -3059,11 +3165,41 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private void UpdateFileInfoLabel()
     {
-        var parts = new List<string> { _currentFileName };
+        var parts = new List<string> { GetVisiblePageName() };
         if (!string.IsNullOrWhiteSpace(_currentFileSize)) parts.Add(_currentFileSize);
         if (!string.IsNullOrWhiteSpace(_currentResolution)) parts.Add(_currentResolution);
         parts.Add(_currentZoomPercent > 0 ? $"Zoom {_currentZoomPercent}%" : "Fit");
         _loadStatus.Text = string.Join("   •   ", parts);
+    }
+
+    private string GetVisiblePageName()
+    {
+        if (_thumbnailMode || _book is not { } book) return _currentFileName;
+        var second = GetSecondPageIndex();
+        if (second < 0 || second >= book.Pages.Count) return _currentFileName;
+        return CompactPageRange(
+            _currentFileName, Path.GetFileName(book.Pages[second].Name));
+    }
+
+    private static string CompactPageRange(string first, string second)
+    {
+        static (string Prefix, string Digits, string Extension)? Split(string value)
+        {
+            var extension = Path.GetExtension(value);
+            var stem = extension.Length == 0 ? value : value[..^extension.Length];
+            var digitStart = stem.Length;
+            while (digitStart > 0 && char.IsDigit(stem[digitStart - 1])) digitStart--;
+            return digitStart == stem.Length ? null :
+                (stem[..digitStart], stem[digitStart..], extension);
+        }
+
+        var left = Split(first);
+        var right = Split(second);
+        if (left is { } a && right is { } b &&
+            string.Equals(a.Prefix, b.Prefix, StringComparison.Ordinal) &&
+            string.Equals(a.Extension, b.Extension, StringComparison.OrdinalIgnoreCase))
+            return $"{a.Prefix}{a.Digits}-{b.Digits}{a.Extension}";
+        return $"{first} – {second}";
     }
 
     private static string FormatFileSize(long bytes)
@@ -3134,6 +3270,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             else
                 _ = Task.Run(cache.Dispose);
         }
+        if (!retainPageCache) _book?.Dispose();
     }
 
     private string GetPageCachePoolKey(string sourcePath) => string.Join("|",
@@ -3229,30 +3366,327 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         ShowToast("Copied image to clipboard");
     }
 
+    private void DisposeRetainedPageCache(string sourcePath)
+    {
+        PageCache? dispose = null;
+        lock (_retainedPageCacheGate)
+        {
+            if (_retainedPageCaches.Remove(
+                    GetPageCachePoolKey(sourcePath), out var retained))
+                dispose = retained.Cache;
+        }
+        dispose?.Dispose();
+    }
+
+    private static Dictionary<int, int> CreatePageRemap(
+        int pageCount, IReadOnlyCollection<int> deletedPages)
+    {
+        var deleted = deletedPages.ToHashSet();
+        var result = new Dictionary<int, int>(Math.Max(0, pageCount - deleted.Count));
+        var newPage = 0;
+        for (var oldPage = 0; oldPage < pageCount; oldPage++)
+        {
+            if (deleted.Contains(oldPage)) continue;
+            result[oldPage] = newPage++;
+        }
+        return result;
+    }
+
+    private async Task DeleteSelectedPdfPageAsync()
+    {
+        if (Interlocked.CompareExchange(ref _pdfPageDeleteInProgress, 1, 0) != 0) return;
+        var previews = new List<Bitmap>();
+        string? temporaryPath = null;
+        string? backupPath = null;
+        string? sourcePathForRecovery = null;
+        PdfReloadCache? reloadCache = null;
+        var bookClosed = false;
+        var replacementInstalled = false;
+        try
+        {
+            var book = _book;
+            if (book is null) return;
+            var sourcePath = Path.GetFullPath(book.SourcePath);
+            sourcePathForRecovery = sourcePath;
+            if (!Path.GetExtension(sourcePath).Equals(".pdf", StringComparison.OrdinalIgnoreCase))
+            {
+                ShowToast("Page deletion is available only for PDF files");
+                return;
+            }
+            if (book.Pages.Count <= 1)
+            {
+                MessageBox.Show(this, "The only page cannot be deleted because a PDF must keep at least one page.",
+                    "Cannot delete PDF page", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            if (!File.Exists(sourcePath))
+                throw new FileNotFoundException("The PDF file could not be found.", sourcePath);
+            if ((File.GetAttributes(sourcePath) & FileAttributes.ReadOnly) != 0)
+                throw new UnauthorizedAccessException("The PDF file is read-only.");
+
+            var selectedPage = _thumbnailMode ? _thumbnailGrid.SelectedPage : _pageIndex;
+            if ((uint)selectedPage >= (uint)book.Pages.Count) return;
+            var candidates = _thumbnailMode
+                ? _thumbnailGrid.SelectedPages.ToList()
+                : [selectedPage];
+            if (candidates.Count == 0) candidates.Add(selectedPage);
+            var chooseOnePage = false;
+            if (!_thumbnailMode)
+            {
+                var second = GetSecondPageIndex(ignoreAutoSingle: false);
+                if (second >= 0 && second < book.Pages.Count)
+                {
+                    candidates.Add(second);
+                    chooseOnePage = true;
+                }
+            }
+            candidates = candidates.Distinct().Order().ToList();
+            if (!chooseOnePage && candidates.Count >= book.Pages.Count)
+            {
+                MessageBox.Show(this,
+                    "All pages cannot be deleted because a PDF must keep at least one page.",
+                    "Cannot delete PDF pages", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            var originalInfo = new FileInfo(sourcePath);
+            var originalIdentity = (originalInfo.Length, originalInfo.LastWriteTimeUtc.Ticks);
+            CancelThumbnailWork();
+            var previewProgress = BeginProgress("Preparing delete preview...", 0, true);
+            var previewSize = candidates.Count > 2 ? new Size(280, 330) : new Size(480, 540);
+            var previewTasks = new List<Task<Bitmap?>>(candidates.Count);
+            var previewToken = _bookCancellation?.Token ?? CancellationToken.None;
+            using var previewSlots = new SemaphoreSlim(
+                Math.Clamp(PdfRendering.PdfiumProcessCount, 1, 16));
+
+            async Task<Bitmap?> RenderPreviewAsync(PageEntry entry)
+            {
+                await previewSlots.WaitAsync(previewToken);
+                try
+                {
+                    return await Task.Run(() =>
+                        entry.DecodeThumbnail?.Invoke(previewSize, 1f) ?? entry.Decode?.Invoke(),
+                        previewToken);
+                }
+                finally { previewSlots.Release(); }
+            }
+
+            foreach (var pageIndex in candidates)
+            {
+                var preview = _thumbnailGrid.CloneBestPagePreview(pageIndex);
+                var entry = book.Pages[pageIndex];
+                previewTasks.Add(preview is not null
+                    ? Task.FromResult<Bitmap?>(preview)
+                    : RenderPreviewAsync(entry));
+            }
+            var renderedPreviews = await AwaitPreviewTasksOwnedAsync(previewTasks.ToArray());
+            if (renderedPreviews.Any(preview => preview is null))
+            {
+                foreach (var preview in renderedPreviews)
+                    preview?.Dispose();
+                throw new InvalidDataException("One or more selected pages could not be rendered for confirmation.");
+            }
+            previews.AddRange(renderedPreviews.Select(preview => preview!));
+            EndProgress(previewProgress);
+            if (!ReferenceEquals(_book, book)) return;
+
+            int[] pagesToDelete;
+            using (var dialog = new DeletePdfPageDialog(
+                       sourcePath, candidates, previews, chooseOnePage))
+            {
+                previews.Clear(); // The dialog now owns these bitmaps.
+                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+                pagesToDelete = dialog.SelectedPageIndices;
+            }
+
+            var currentInfo = new FileInfo(sourcePath);
+            if ((currentInfo.Length, currentInfo.LastWriteTimeUtc.Ticks) != originalIdentity)
+                throw new IOException("The PDF changed while the confirmation was open. Reopen it and try again.");
+
+            var pageMap = CreatePageRemap(book.Pages.Count, pagesToDelete);
+            var persistentRemap = await PersistentPreviewCache.CapturePdfRemapAsync(
+                book, pageMap, _thumbnailGrid.RenderTargetSize,
+                new Size(Math.Max(320, _viewer.ClientSize.Width),
+                    Math.Max(240, _viewer.ClientSize.Height)),
+                _rotations, _settings.LanczosQuality);
+            var remappedRotations = _rotations
+                .Where(pair => pageMap.ContainsKey(pair.Key))
+                .ToDictionary(pair => pageMap[pair.Key], pair => pair.Value);
+            var remappedLandscapePages = _landscapePages
+                .Where(pair => pageMap.ContainsKey(pair.Key))
+                .ToDictionary(pair => pageMap[pair.Key], pair => pair.Value);
+            reloadCache = new PdfReloadCache(
+                pageMap, persistentRemap, remappedRotations, remappedLandscapePages);
+
+            var directory = Path.GetDirectoryName(sourcePath)
+                ?? throw new DirectoryNotFoundException("The PDF folder could not be found.");
+            var unique = Guid.NewGuid().ToString("N");
+            var fileName = Path.GetFileName(sourcePath);
+            temporaryPath = Path.Combine(directory, $".{fileName}.{unique}.greader-edit.pdf");
+            backupPath = Path.Combine(directory, $".{fileName}.{unique}.greader-backup.pdf");
+            var editProgress = BeginProgress(
+                pagesToDelete.Length == 1
+                    ? $"Deleting page {pagesToDelete[0] + 1}..."
+                    : $"Deleting {pagesToDelete.Length:N0} pages...", 0, true);
+            await Task.Run(() => PdfPageEditor.CreateCopyWithoutPages(
+                sourcePath, pagesToDelete, temporaryPath));
+
+            currentInfo.Refresh();
+            if ((currentInfo.Length, currentInfo.LastWriteTimeUtc.Ticks) != originalIdentity)
+                throw new IOException("The PDF changed while the edited copy was being prepared. No changes were made.");
+
+            // Stop every producer before releasing PDFium's cached file handles.
+            DisposeRetainedPageCache(sourcePath);
+            var profilePrefix = sourcePath + "|";
+            foreach (var key in _embeddedColorProfiles.Keys)
+                if (key.StartsWith(profilePrefix, StringComparison.OrdinalIgnoreCase))
+                    _embeddedColorProfiles.TryRemove(key, out _);
+            reloadCache.Attach(_cache);
+            _cache = null;
+            CancelBookWork(retainPageCache: false);
+            _book = null;
+            bookClosed = true;
+            _viewer.ClearBookCache();
+            await Task.Run(() => PdfRendering.CloseWorkerDocuments(sourcePath));
+
+            await Task.Run(() =>
+            {
+                File.Copy(sourcePath, backupPath, overwrite: false);
+                File.Move(temporaryPath, sourcePath, overwrite: true);
+            });
+            replacementInstalled = true;
+            temporaryPath = null;
+
+            var newPageCount = book.Pages.Count - pagesToDelete.Length;
+            var targetPage = Math.Clamp(
+                selectedPage - pagesToDelete.Count(page => page < selectedPage),
+                0, newPageCount - 1);
+            await TryOpenAsync(sourcePath, $"Page {targetPage + 1}",
+                forceFreshPageCache: true, pdfReloadCache: reloadCache);
+            reloadCache = null;
+            if (_book is not { } reopened || !PathsEqual(reopened.SourcePath, sourcePath) ||
+                reopened.Pages.Count != newPageCount)
+                throw new InvalidDataException("G Reader could not verify the edited PDF after reloading it.");
+
+            // The new PDF is open and verified; backup cleanup must never turn a
+            // successful edit into a rollback.
+            replacementInstalled = false;
+            try
+            {
+                await Task.Run(() => File.Delete(backupPath));
+                backupPath = null;
+            }
+            catch { }
+            var completedText = pagesToDelete.Length == 1
+                ? $"Deleted page {pagesToDelete[0] + 1}"
+                : $"Deleted {pagesToDelete.Length:N0} pages";
+            EndProgress(editProgress, completedText);
+            ShowToast(completedText, 2200);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception exception)
+        {
+            reloadCache?.Dispose();
+            reloadCache = null;
+            var rollbackFailed = false;
+            if (replacementInstalled && backupPath is not null && File.Exists(backupPath))
+            {
+                try
+                {
+                    CancelBookWork(retainPageCache: false);
+                    _book = null;
+                    _viewer.ClearBookCache();
+                    BuildThumbnailPlaceholders();
+                    await Task.Run(() =>
+                    {
+                        if (sourcePathForRecovery is not null)
+                            PdfRendering.CloseWorkerDocuments(sourcePathForRecovery);
+                    });
+                }
+                catch { }
+                try
+                {
+                    var sourcePath = sourcePathForRecovery
+                        ?? throw new InvalidOperationException("The original PDF path was lost.");
+                    await Task.Run(() => File.Move(backupPath, sourcePath, overwrite: true));
+                    backupPath = null;
+                    await TryOpenAsync(sourcePath, forceFreshPageCache: true);
+                }
+                catch { rollbackFailed = true; }
+            }
+            else if (bookClosed && sourcePathForRecovery is not null &&
+                File.Exists(sourcePathForRecovery))
+            {
+                await TryOpenAsync(sourcePathForRecovery, forceFreshPageCache: true);
+            }
+
+            var details = rollbackFailed && backupPath is not null
+                ? $"\n\nAutomatic rollback failed. The original backup is still here:\n{backupPath}"
+                : string.Empty;
+            MessageBox.Show(this, exception.Message + details, "Cannot delete PDF page",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            reloadCache?.Dispose();
+            foreach (var preview in previews) preview.Dispose();
+            try { if (temporaryPath is not null && File.Exists(temporaryPath)) File.Delete(temporaryPath); }
+            catch { }
+            if (!replacementInstalled)
+            {
+                try { if (backupPath is not null && File.Exists(backupPath)) File.Delete(backupPath); }
+                catch { }
+            }
+            Interlocked.Exchange(ref _pdfPageDeleteInProgress, 0);
+        }
+    }
+
     private async Task CopySelectedThumbnailFileAsync()
     {
         if (_book is null) return;
-        var page = _thumbnailGrid.SelectedPage;
-        if (page < 0 || page >= _book.Pages.Count) return;
         var book = _book;
+        var pages = _thumbnailGrid.SelectedPages
+            .Where(page => page >= 0 && page < book.Pages.Count)
+            .Distinct().Order().ToArray();
+        if (pages.Length == 0) return;
         var token = _bookCancellation?.Token ?? CancellationToken.None;
-        var progress = BeginProgress($"Preparing page {page + 1} for clipboard...", 0, true);
-        ShowToast("Preparing file…", 900);
+        var progress = BeginProgress(
+            pages.Length == 1
+                ? $"Preparing page {pages[0] + 1} for clipboard..."
+                : $"Preparing {pages.Length:N0} pages for clipboard...", 0, true);
+        ShowToast(pages.Length == 1
+            ? "Preparing file…"
+            : $"Preparing {pages.Length:N0} files…", 900);
         try
         {
-            var path = await Task.Run(() => GetClipboardFilePath(book, page, token), token);
+            var paths = await Task.Run(() =>
+            {
+                var result = new string[pages.Length];
+                for (var i = 0; i < pages.Length; i++)
+                {
+                    token.ThrowIfCancellationRequested();
+                    result[i] = GetClipboardFilePath(book, pages[i], token);
+                }
+                return result;
+            }, token);
             token.ThrowIfCancellationRequested();
             if (!ReferenceEquals(_book, book)) return;
-            var files = new System.Collections.Specialized.StringCollection { path };
+            var files = new System.Collections.Specialized.StringCollection();
+            files.AddRange(paths);
             Clipboard.SetFileDropList(files);
-            EndProgress(progress, $"Copied page {page + 1} as file");
-            ShowToast("Copied to clipboard");
+            EndProgress(progress, pages.Length == 1
+                ? $"Copied page {pages[0] + 1} as file"
+                : $"Copied {pages.Length:N0} page files");
+            ShowToast(pages.Length == 1
+                ? "Copied to clipboard"
+                : $"Copied {pages.Length:N0} files to clipboard");
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
             EndProgress(progress, "Copy failed");
-            MessageBox.Show(this, ex.Message, "Cannot copy page", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show(this, ex.Message, "Cannot copy page files",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
@@ -3559,6 +3993,11 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     {
         var shortcut = ToolbarHotkeyCatalog.Normalize(keyData);
         var keyCode = shortcut & Keys.KeyCode;
+        if (shortcut == Keys.Delete && !_thumbnailAddressBox.ContainsFocus)
+        {
+            _ = DeleteSelectedPdfPageAsync();
+            return true;
+        }
         // These commands may intentionally use modified arrow keys, so they
         // must run before Thumbnail view takes ownership of all arrow keys.
         foreach (var actionId in ToolbarHotkeyCatalog.ThumbnailArrowPriorityActions)
@@ -3916,6 +4355,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _settings.BackgroundArgb = dialog.ReaderBackground.ToArgb();
         _settings.AutoMoveMode = dialog.AutoMoveMode;
         _settings.RememberReadingPosition = dialog.RememberReadingPosition;
+        _settings.ExtendedLoggingEnabled = dialog.ExtendedLoggingEnabled;
+        ExtendedDiagnostics.Configure(_settings.ExtendedLoggingEnabled);
         if (dialog.ClearRememberedReadingPositionsRequested)
             (_settings.RememberedReadingPositions ??= new()).Clear();
         _settings.RandomLibraryPath = dialog.RandomLibraryPath;
@@ -4023,6 +4464,17 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             _settings.WindowHeight = normalBounds.Height;
         }
         _settings.Save();
+    }
+
+    private string GetDiagnosticContext()
+    {
+        var source = _book?.SourcePath ?? "none";
+        var pageCount = _book?.Pages.Count ?? 0;
+        return $"mode={(_thumbnailMode ? "thumbnail" : _doublePage ? "double" : "single")}; " +
+            $"source={source}; page={_pageIndex + 1}/{pageCount}; " +
+            $"thumbnailSelection={string.Join(',', _thumbnailGrid.SelectedPages)}; " +
+            $"window={WindowState}; size={ClientSize.Width}x{ClientSize.Height}; " +
+            $"fastPending={RenderWorkScheduler.PendingFastWork}; warming={_bookPrecacheStarted}";
     }
 
     private void RestoreWindowPlacement()

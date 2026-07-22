@@ -25,14 +25,18 @@ internal sealed partial class ThumbnailGridView : Panel
     private readonly System.Collections.Concurrent.ConcurrentDictionary<int, byte[]>
         _pageColorProfiles = new();
     private readonly object _invalidationGate = new();
+    private readonly object _contentGate = new();
     private readonly HashSet<int> _pendingInvalidationItems = [];
     private bool _invalidationDispatchScheduled;
     private string[] _pageNames = [];
     private ThumbnailFolderEntry[] _folders = [];
     private int _pageCount;
+    private int _contentGeneration;
     private int _imagesPerRow = 6;
     private int _selectedPage = -1;
     private int _selectedItem = -1;
+    private readonly HashSet<int> _selectedPages = [];
+    private readonly List<int> _selectedPageOrder = [];
     private int _cellWidth = 120;
     private int _cellHeight = 170;
     private Size _renderTargetSize = new(100, 120);
@@ -64,6 +68,7 @@ internal sealed partial class ThumbnailGridView : Panel
     public event EventHandler? VisiblePreviewRefreshRequested;
 
     public int PageCount => _pageCount;
+    public int ContentGeneration => Volatile.Read(ref _contentGeneration);
     public string? SelectedBrowsePath =>
         _selectedItem >= 0 && _selectedItem < _folders.Length
             ? _folders[_selectedItem].Path
@@ -117,15 +122,26 @@ internal sealed partial class ThumbnailGridView : Panel
         set
         {
             value = _pageCount == 0 ? -1 : Math.Clamp(value, 0, _pageCount - 1);
-            if (_selectedPage == value) return;
+            if (_selectedPage == value && _selectedPages.Count == (value >= 0 ? 1 : 0) &&
+                (value < 0 || _selectedPages.Contains(value))) return;
             var previous = _selectedPage;
+            var previouslySelected = _selectedPages.ToArray();
             _selectedPage = value;
             _selectedItem = value < 0 ? -1 : _folders.Length + value;
-            InvalidateCell(previous);
+            _selectedPages.Clear();
+            _selectedPageOrder.Clear();
+            if (value >= 0)
+            {
+                _selectedPages.Add(value);
+                _selectedPageOrder.Add(value);
+            }
+            foreach (var page in previouslySelected) InvalidateCell(page);
             InvalidateCell(value);
-            SelectionChanged?.Invoke(this, value);
+            if (previous != value) SelectionChanged?.Invoke(this, value);
         }
     }
+
+    public int[] SelectedPages => _selectedPages.Order().ToArray();
 
     public ThumbnailGridView()
     {
@@ -203,48 +219,108 @@ internal sealed partial class ThumbnailGridView : Panel
     public void ClearFullQualityCache()
     {
         // Release D2D views before retiring their underlying D3D textures.
-        ClearGpuTextureCache();
+        var retirement = RetireGpuTextureCache();
         _fullCache.Clear();
-        _gpuFullCache.Clear();
+        _gpuFullCache.Clear(retirement);
         _browseFullPreviewCache.Clear();
-        _gpuBrowseFullPreviewCache.Clear();
+        _gpuBrowseFullPreviewCache.Clear(retirement);
         Invalidate();
     }
 
     public void ClearBrowsePreviewCache()
     {
         // Release D2D views before retiring their underlying D3D textures.
-        ClearGpuTextureCache();
+        var retirement = RetireGpuTextureCache();
         _browseFullPreviewCache.Clear();
         _browseFastPreviewCache.Clear();
-        _gpuBrowseFullPreviewCache.Clear();
-        _gpuBrowseFastPreviewCache.Clear();
+        _gpuBrowseFullPreviewCache.Clear(retirement);
+        _gpuBrowseFastPreviewCache.Clear(retirement);
         Invalidate();
     }
 
     public void ResetPages(IEnumerable<string> pageNames,
         IEnumerable<ThumbnailFolderEntry>? folders = null)
     {
-        // Release D2D views before retiring their underlying D3D textures.
-        ClearGpuTextureCache();
-        _fullCache.Clear();
-        _fastPreviewCache.Clear();
-        _browseFullPreviewCache.Clear();
-        _browseFastPreviewCache.Clear();
-        _gpuFullCache.Clear();
-        _gpuFastPreviewCache.Clear();
-        _gpuBrowseFullPreviewCache.Clear();
-        _gpuBrowseFastPreviewCache.Clear();
-        _pageNames = pageNames.Select(GetDisplayFileName).ToArray();
-        _folders = folders?.ToArray() ?? [];
-        _pageCount = _pageNames.Length;
-        _generationStates.Clear();
-        _pageColorProfiles.Clear();
-        _selectedPage = _pageCount == 0 ? -1 : Math.Clamp(_selectedPage, 0, _pageCount - 1);
-        _selectedItem = _selectedPage >= 0 ? _folders.Length + _selectedPage :
-            _folders.Length > 0 ? 0 : -1;
+        lock (_contentGate)
+        {
+            Interlocked.Increment(ref _contentGeneration);
+            // Release D2D views before retiring their underlying D3D textures.
+            var retirement = RetireGpuTextureCache();
+            _fullCache.Clear();
+            _fastPreviewCache.Clear();
+            _browseFullPreviewCache.Clear();
+            _browseFastPreviewCache.Clear();
+            _gpuFullCache.Clear(retirement);
+            _gpuFastPreviewCache.Clear(retirement);
+            _gpuBrowseFullPreviewCache.Clear(retirement);
+            _gpuBrowseFastPreviewCache.Clear(retirement);
+            _pageNames = pageNames.Select(GetDisplayFileName).ToArray();
+            _folders = folders?.ToArray() ?? [];
+            _pageCount = _pageNames.Length;
+            _generationStates.Clear();
+            _pageColorProfiles.Clear();
+            _selectedPage = _pageCount == 0 ? -1 : Math.Clamp(_selectedPage, 0, _pageCount - 1);
+            _selectedPages.Clear();
+            _selectedPageOrder.Clear();
+            if (_selectedPage >= 0)
+            {
+                _selectedPages.Add(_selectedPage);
+                _selectedPageOrder.Add(_selectedPage);
+            }
+            _selectedItem = _selectedPage >= 0 ? _folders.Length + _selectedPage :
+                _folders.Length > 0 ? 0 : -1;
+        }
         SetScrollOffset(0);
         UpdateVirtualLayout();
+    }
+
+    public void RemapPages(IEnumerable<string> pageNames,
+        IEnumerable<ThumbnailFolderEntry>? folders,
+        IReadOnlyDictionary<int, int> oldToNewPage, int selectedPage)
+    {
+        lock (_contentGate)
+        {
+            Interlocked.Increment(ref _contentGeneration);
+            // Native D2D views refer to the cached source objects. Recreate only
+            // those lightweight views while retaining the decoded CPU/GPU images.
+            var retirement = RetireGpuTextureCache();
+            _fullCache.RemapPages(oldToNewPage);
+            _fastPreviewCache.RemapPages(oldToNewPage);
+            _gpuFullCache.RemapPages(oldToNewPage, retirement);
+            _gpuFastPreviewCache.RemapPages(oldToNewPage, retirement);
+            _browseFullPreviewCache.Clear();
+            _browseFastPreviewCache.Clear();
+            _gpuBrowseFullPreviewCache.Clear(retirement);
+            _gpuBrowseFastPreviewCache.Clear(retirement);
+
+            var states = _generationStates.ToArray();
+            _generationStates.Clear();
+            foreach (var pair in states)
+                if (oldToNewPage.TryGetValue(pair.Key, out var newPage))
+                    _generationStates[newPage] = pair.Value;
+            var profiles = _pageColorProfiles.ToArray();
+            _pageColorProfiles.Clear();
+            foreach (var pair in profiles)
+                if (oldToNewPage.TryGetValue(pair.Key, out var newPage))
+                    _pageColorProfiles[newPage] = pair.Value;
+
+            _pageNames = pageNames.Select(GetDisplayFileName).ToArray();
+            _folders = folders?.ToArray() ?? [];
+            _pageCount = _pageNames.Length;
+            _selectedPage = _pageCount == 0 ? -1 : Math.Clamp(selectedPage, 0, _pageCount - 1);
+            _selectedPages.Clear();
+            _selectedPageOrder.Clear();
+            if (_selectedPage >= 0)
+            {
+                _selectedPages.Add(_selectedPage);
+                _selectedPageOrder.Add(_selectedPage);
+            }
+            _selectedItem = _selectedPage >= 0 ? _folders.Length + _selectedPage :
+                _folders.Length > 0 ? 0 : -1;
+        }
+        SetScrollOffset(0);
+        UpdateVirtualLayout();
+        EnsurePageVisible(_selectedPage);
     }
 
     public bool HasFullThumbnail(int page, Size size) =>
@@ -365,45 +441,54 @@ internal sealed partial class ThumbnailGridView : Panel
             : new ThumbnailPreviewWorkItem(false, item - _folders.Length);
 
     public void SetBrowsePreview(
-        int item, Size size, Bitmap preview, bool fastPreview)
+        int item, Size size, Bitmap preview, bool fastPreview, int generation)
     {
-        if (item < 0 || item >= _folders.Length)
+        lock (_contentGate)
         {
-            preview.Dispose();
-            return;
+            if (generation != ContentGeneration || item < 0 || item >= _folders.Length)
+            { preview.Dispose(); return; }
+            if (fastPreview) _browseFastPreviewCache.AddOwned(item, size, preview);
+            else _browseFullPreviewCache.AddOwned(item, size, preview);
         }
-        if (fastPreview) _browseFastPreviewCache.AddOwned(item, size, preview);
-        else _browseFullPreviewCache.AddOwned(item, size, preview);
         InvalidateItemThreadSafe(item);
     }
 
     public void SetBrowsePreviewGpu(
-        int item, Size size, GpuRenderedImage preview, bool fastPreview)
+        int item, Size size, GpuRenderedImage preview, bool fastPreview, int generation)
     {
-        if (item < 0 || item >= _folders.Length) { preview.Dispose(); return; }
-        if (fastPreview) _gpuBrowseFastPreviewCache.AddOwned(item, size, preview);
-        else _gpuBrowseFullPreviewCache.AddOwned(item, size, preview);
+        lock (_contentGate)
+        {
+            if (generation != ContentGeneration || item < 0 || item >= _folders.Length)
+            { preview.Dispose(); return; }
+            if (fastPreview) _gpuBrowseFastPreviewCache.AddOwned(item, size, preview);
+            else _gpuBrowseFullPreviewCache.AddOwned(item, size, preview);
+        }
         InvalidateItemThreadSafe(item);
     }
 
-    public void SetThumbnail(int page, Size size, Bitmap thumbnail, bool fastPreview)
+    public void SetThumbnail(int page, Size size, Bitmap thumbnail, bool fastPreview,
+        int generation)
     {
-        if (page < 0 || page >= _pageCount)
+        lock (_contentGate)
         {
-            thumbnail.Dispose();
-            return;
+            if (generation != ContentGeneration || page < 0 || page >= _pageCount)
+            { thumbnail.Dispose(); return; }
+            if (fastPreview) _fastPreviewCache.AddOwned(page, size, thumbnail);
+            else _fullCache.AddOwned(page, size, thumbnail);
         }
-        if (fastPreview) _fastPreviewCache.AddOwned(page, size, thumbnail);
-        else _fullCache.AddOwned(page, size, thumbnail);
         InvalidateCellThreadSafe(page);
     }
 
     public void SetThumbnailGpu(
-        int page, Size size, GpuRenderedImage thumbnail, bool fastPreview)
+        int page, Size size, GpuRenderedImage thumbnail, bool fastPreview, int generation)
     {
-        if (page < 0 || page >= _pageCount) { thumbnail.Dispose(); return; }
-        if (fastPreview) _gpuFastPreviewCache.AddOwned(page, size, thumbnail);
-        else _gpuFullCache.AddOwned(page, size, thumbnail);
+        lock (_contentGate)
+        {
+            if (generation != ContentGeneration || page < 0 || page >= _pageCount)
+            { thumbnail.Dispose(); return; }
+            if (fastPreview) _gpuFastPreviewCache.AddOwned(page, size, thumbnail);
+            else _gpuFullCache.AddOwned(page, size, thumbnail);
+        }
         InvalidateCellThreadSafe(page);
     }
 
@@ -683,7 +768,8 @@ internal sealed partial class ThumbnailGridView : Panel
         }
         if (e.Button != MouseButtons.Left) return;
         var item = HitTestItem(e.Location);
-        if (item >= 0) SelectItem(item);
+        if (item >= 0) SelectItem(item,
+            extendPageSelection: (ModifierKeys & Keys.Control) == Keys.Control);
     }
 
     protected override void OnMouseDoubleClick(MouseEventArgs e)
@@ -800,22 +886,60 @@ internal sealed partial class ThumbnailGridView : Panel
         Invalidate(Rectangle.Inflate(bounds, 3, 3));
     }
 
-    private void SelectItem(int item)
+    private void SelectItem(int item, bool extendPageSelection = false)
     {
         item = ItemCount == 0 ? -1 : Math.Clamp(item, 0, ItemCount - 1);
-        if (_selectedItem == item) return;
         var previous = _selectedItem;
-        _selectedItem = item;
-        _selectedPage = item >= _folders.Length ? item - _folders.Length : -1;
+        var previousPage = _selectedPage;
+        var previouslySelected = _selectedPages.ToArray();
+        var page = item >= _folders.Length ? item - _folders.Length : -1;
+
+        if (extendPageSelection && page >= 0)
+        {
+            if (_selectedPages.Remove(page))
+            {
+                _selectedPageOrder.Remove(page);
+                _selectedPage = _selectedPageOrder.Count > 0 ? _selectedPageOrder[^1] : -1;
+                _selectedItem = _selectedPage >= 0 ? _folders.Length + _selectedPage : -1;
+            }
+            else
+            {
+                _selectedPages.Add(page);
+                _selectedPageOrder.Add(page);
+                _selectedPage = page;
+                _selectedItem = item;
+            }
+        }
+        else
+        {
+            if (_selectedItem == item && _selectedPages.Count == (page >= 0 ? 1 : 0) &&
+                (page < 0 || _selectedPages.Contains(page))) return;
+            _selectedPages.Clear();
+            _selectedPageOrder.Clear();
+            _selectedItem = item;
+            _selectedPage = page;
+            if (page >= 0)
+            {
+                _selectedPages.Add(page);
+                _selectedPageOrder.Add(page);
+            }
+        }
+
+        foreach (var selectedPage in previouslySelected) InvalidateCell(selectedPage);
+        foreach (var selectedPage in _selectedPages) InvalidateCell(selectedPage);
         InvalidateItem(previous);
-        InvalidateItem(item);
-        SelectionChanged?.Invoke(this, _selectedPage);
+        InvalidateItem(_selectedItem);
+        if (previousPage != _selectedPage) SelectionChanged?.Invoke(this, _selectedPage);
         // Stop stale background rendering immediately, but only rebuild its
         // ordered working set after a short quiet period during key repeat.
         ThumbnailInteractionStarted?.Invoke(this, EventArgs.Empty);
         _priorityRefreshDebounce.Stop();
         _priorityRefreshDebounce.Start();
     }
+
+    private bool IsItemSelected(int item) => item >= _folders.Length
+        ? _selectedPages.Contains(item - _folders.Length)
+        : item == _selectedItem;
 
     private void EnsureItemVisible(int item)
     {

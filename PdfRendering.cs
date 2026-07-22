@@ -18,4 +18,7 @@ internal static class PdfRendering
 
     public static IPdfDocumentRenderer Open(string path) =>
         new PdfiumDocumentRenderer(path);
+
+    public static void CloseWorkerDocuments(string path) =>
+        PdfiumProcessPoolManager.CloseDocument(path);
 }

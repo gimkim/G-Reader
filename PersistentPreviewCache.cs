@@ -20,6 +20,10 @@ internal enum PersistentPreviewKind
 internal static class PersistentPreviewCache
 {
     public readonly record struct ClearResult(int FileCount, long Bytes, int FailedCount);
+    internal readonly record struct PdfRemapEntry(
+        PersistentPreviewKind Kind, string SourcePath, int NewPageIndex,
+        Size Bounds, int Rotation, int Quality);
+    internal sealed record PdfRemapPlan(IReadOnlyList<PdfRemapEntry> Entries);
 
     private sealed record Configuration(
         string Root, long FullViewLimitBytes, long ThumbnailLimitBytes);
@@ -90,6 +94,86 @@ internal static class PersistentPreviewCache
             catch { }
             Volatile.Write(ref _lastCleanupTick, 0);
             return new ClearResult(fileCount, bytes, failedCount);
+        }
+        finally
+        {
+            while (acquired > 0)
+            {
+                Writers.Release();
+                acquired--;
+            }
+        }
+    }
+
+    public static async Task<PdfRemapPlan> CapturePdfRemapAsync(
+        Book oldBook, IReadOnlyDictionary<int, int> oldToNewPage,
+        Size thumbnailBounds, Size fullViewBounds,
+        IReadOnlyDictionary<int, int> rotations, int thumbnailQuality)
+    {
+        var configuration = Volatile.Read(ref _configuration);
+        var acquired = 0;
+        try
+        {
+            for (; acquired < WriterConcurrency; acquired++)
+                await Writers.WaitAsync().ConfigureAwait(false);
+            var entries = new List<PdfRemapEntry>();
+            foreach (var pair in oldToNewPage)
+            {
+                var rotation = rotations.GetValueOrDefault(pair.Key);
+                AddIfPresent(PersistentPreviewKind.ThumbnailFast,
+                    thumbnailBounds, quality: 0);
+                AddIfPresent(PersistentPreviewKind.ThumbnailFinal,
+                    thumbnailBounds, thumbnailQuality);
+                AddIfPresent(PersistentPreviewKind.FullView,
+                    fullViewBounds, quality: 0);
+
+                void AddIfPresent(PersistentPreviewKind kind, Size bounds, int quality)
+                {
+                    if (GetLimit(configuration, kind) <= 0) return;
+                    var path = GetPath(configuration, kind, oldBook, pair.Key,
+                        bounds, rotation, quality);
+                    if (File.Exists(path))
+                        entries.Add(new PdfRemapEntry(
+                            kind, path, pair.Value, bounds, rotation, quality));
+                }
+            }
+            return new PdfRemapPlan(entries);
+        }
+        finally
+        {
+            while (acquired > 0)
+            {
+                Writers.Release();
+                acquired--;
+            }
+        }
+    }
+
+    public static async Task ApplyPdfRemapAsync(PdfRemapPlan plan, Book newBook)
+    {
+        if (plan.Entries.Count == 0) return;
+        var configuration = Volatile.Read(ref _configuration);
+        var acquired = 0;
+        try
+        {
+            for (; acquired < WriterConcurrency; acquired++)
+                await Writers.WaitAsync().ConfigureAwait(false);
+            foreach (var entry in plan.Entries)
+            {
+                try
+                {
+                    var destination = GetPath(configuration, entry.Kind, newBook,
+                        entry.NewPageIndex, entry.Bounds, entry.Rotation, entry.Quality);
+                    if (string.Equals(entry.SourcePath, destination,
+                            StringComparison.OrdinalIgnoreCase)) continue;
+                    Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+                    if (!File.Exists(destination))
+                        File.Move(entry.SourcePath, destination, overwrite: false);
+                    else
+                        File.Delete(entry.SourcePath);
+                }
+                catch { }
+            }
         }
         finally
         {

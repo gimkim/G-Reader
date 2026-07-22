@@ -998,7 +998,7 @@ internal sealed class AsyncViewerPanel : Panel
     public async Task PreRenderEncodedJpegAsync(
         int pageIndex, string pageKey, PageEntry page, int visiblePageCount,
         int rotation, PreRenderContext context, bool generatePreview,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, bool interactiveFull = false)
     {
         if (HasCachedRender(
                 pageIndex, pageKey, visiblePageCount, context.Version)) return;
@@ -1032,11 +1032,15 @@ internal sealed class AsyncViewerPanel : Panel
             }
         }
 
-        var gpuRendered = await RenderWorkScheduler.RunFullAsync(
-            () => EncodedJpegRenderer.RenderReaderGpu(
-                page, context.ClientSize, visiblePageCount, rotation,
-                fastPreview: false, cancellationToken),
-            cancellationToken).ConfigureAwait(false);
+        var gpuRendered = interactiveFull
+            ? await RenderWorkScheduler.RunInteractiveFullAsync(
+                () => EncodedJpegRenderer.RenderReaderGpu(
+                    page, context.ClientSize, visiblePageCount, rotation,
+                    fastPreview: false, cancellationToken), cancellationToken).ConfigureAwait(false)
+            : await RenderWorkScheduler.RunFullAsync(
+                () => EncodedJpegRenderer.RenderReaderGpu(
+                    page, context.ClientSize, visiblePageCount, rotation,
+                    fastPreview: false, cancellationToken), cancellationToken).ConfigureAwait(false);
         if (gpuRendered is { } directRendered)
         {
             var directKey = new RenderKey(
@@ -1047,11 +1051,17 @@ internal sealed class AsyncViewerPanel : Panel
             return;
         }
 
-        var rendered = await RenderWorkScheduler.RunFullAsync(
-            () => EncodedJpegRenderer.RenderReader(
-                page, context.ClientSize, visiblePageCount, rotation,
-                context.LanczosQuality, fastPreview: false, cancellationToken),
-            cancellationToken).ConfigureAwait(false);
+        var rendered = interactiveFull
+            ? await RenderWorkScheduler.RunInteractiveFullAsync(
+                () => EncodedJpegRenderer.RenderReader(
+                    page, context.ClientSize, visiblePageCount, rotation,
+                    context.LanczosQuality, fastPreview: false, cancellationToken),
+                cancellationToken).ConfigureAwait(false)
+            : await RenderWorkScheduler.RunFullAsync(
+                () => EncodedJpegRenderer.RenderReader(
+                    page, context.ClientSize, visiblePageCount, rotation,
+                    context.LanczosQuality, fastPreview: false, cancellationToken),
+                cancellationToken).ConfigureAwait(false);
         var renderKey = new RenderKey(
             pageIndex, pageKey, rendered.Bitmap.Width, rendered.Bitmap.Height,
             visiblePageCount, context.Version);
@@ -1848,10 +1858,10 @@ internal sealed class AsyncViewerPanel : Panel
             }
 
             var leftTask = qualityRendered[0] is not null ? Task.FromResult(qualityRendered[0]) :
-                RenderWorkScheduler.RunFullAsync(() => ResizeLanczos(
+                RenderWorkScheduler.RunInteractiveFullAsync(() => ResizeLanczos(
                     renderSources[0], sizes[0], _lanczosQuality, cancellation.Token), cancellation.Token);
             var rightTask = qualityRendered[1] is not null ? Task.FromResult(qualityRendered[1]) :
-                RenderWorkScheduler.RunFullAsync(() => ResizeLanczos(
+                RenderWorkScheduler.RunInteractiveFullAsync(() => ResizeLanczos(
                     renderSources[1], sizes[1], _lanczosQuality, cancellation.Token), cancellation.Token);
             qualityTasksOwnResults = true;
             qualityRendered = await AwaitBitmapTasksOwnedAsync([leftTask, rightTask]);
@@ -1880,6 +1890,8 @@ internal sealed class AsyncViewerPanel : Panel
             // BeginRender is an async UI event path. Never allow a worker-side
             // decode/resample failure to escape it and terminate the WinForms app.
             System.Diagnostics.Debug.WriteLine($"Page render failed: {exception}");
+            ExtendedDiagnostics.LogException("Full-view page render failed", exception,
+                $"first={_firstIndex}; second={_secondIndex}; version={version}/{_renderVersion}");
         }
         finally
         {
@@ -2275,7 +2287,8 @@ internal sealed class AsyncViewerPanel : Panel
                 ? Size.Empty
                 : CalculateSize(image.Width, image.Height, targetWidth,
                     availableHeight, fitToScreen: true, zoom: 1f)).ToArray();
-            ApplyRenderedGpu(rendered[0], rendered[1], sizes, availableHeight, gap);
+            if (!ApplyRenderedGpu(rendered[0], rendered[1], sizes, availableHeight, gap))
+                return false;
             _displayedPreview = firstPreview || secondPreview;
             RenderingStateChanged?.Invoke(this, false);
             return true;
@@ -2295,7 +2308,7 @@ internal sealed class AsyncViewerPanel : Panel
         }
     }
 
-    private void ApplyRenderedGpu(
+    private bool ApplyRenderedGpu(
         GpuRenderedImage? left, GpuRenderedImage? right, Size[] sizes,
         int availableHeight, int gap)
     {
@@ -2329,8 +2342,10 @@ internal sealed class AsyncViewerPanel : Panel
             AutoScrollMinSize = Size.Empty;
         }
         finally { ResumeLayout(false); }
-        _direct2DSurface.PresentGpu(left, right, _left.Bounds, _right.Bounds);
+        var presented = _direct2DSurface.PresentGpu(
+            left, right, _left.Bounds, _right.Bounds);
         _displayedContextVersion = _renderContextVersion;
+        return presented;
     }
 
     private void ApplyRendered(
@@ -2412,7 +2427,8 @@ internal sealed class AsyncViewerPanel : Panel
     {
         try { await cancellation.CancelAsync().ConfigureAwait(false); }
         catch (ObjectDisposedException) { }
-        finally { cancellation.Dispose(); }
+        // Render continuations may still read Token after cancellation. Let GC
+        // reclaim the source after those continuations release their reference.
     }
 
     private void AcquireSource(Image? source)

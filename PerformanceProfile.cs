@@ -55,7 +55,10 @@ internal sealed record PerformanceProfile(
         if (availableMB < 8192) fastWorkers = Math.Min(fastWorkers, 3);
         var fastThreads = Math.Clamp(
             (logicalCpu + fastWorkers - 1) / fastWorkers, 1, 16);
-        var globalFastConcurrency = Math.Clamp(fastWorkers * fastThreads, 1, logicalCpu);
+        // Fast previews compete with the UI, PDF workers and final-quality work.
+        // The automatic recommendation therefore uses at most half of the
+        // machine's logical processors instead of saturating every core.
+        var globalFastConcurrency = Math.Max(1, logicalCpu / 2);
         var magickThreads = Math.Clamp(
             (logicalCpu + precacheWorkers - 1) / precacheWorkers, 2, 16);
         // Zoom normally has one latency-sensitive viewport job. Leave one
