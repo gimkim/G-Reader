@@ -649,7 +649,12 @@ internal sealed partial class ThumbnailGridView : Panel
     protected override void OnVisibleChanged(EventArgs e)
     {
         base.OnVisibleChanged(e);
-        if (Visible) RefreshVirtualLayoutAfterShow();
+        if (Visible)
+        {
+            RefreshVirtualLayoutAfterShow();
+            if (ThumbnailTarget is null && IsHandleCreated)
+                ScheduleThumbnailDeviceRecovery("view became visible");
+        }
     }
 
     protected override void OnHandleCreated(EventArgs e)

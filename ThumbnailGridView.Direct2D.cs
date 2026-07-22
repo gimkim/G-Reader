@@ -75,6 +75,7 @@ internal sealed partial class ThumbnailGridView
     private readonly System.Windows.Forms.Timer _thumbnailGpuUploadTimer = new() { Interval = 16 };
     private readonly System.Windows.Forms.Timer _thumbnailGpuTrimTimer = new() { Interval = 650 };
     private readonly System.Windows.Forms.Timer _thumbnailGpuRetireTimer = new() { Interval = 30 };
+    private readonly System.Windows.Forms.Timer _thumbnailDeviceRecoveryTimer = new() { Interval = 50 };
     private readonly Queue<RetiredThumbnailGpuBatch> _retiredThumbnailGpuBatches = [];
     private readonly Dictionary<string, ID2D1ColorContext> _thumbnailColorContexts = [];
     private readonly Dictionary<ID2D1Bitmap, ID2D1Effect> _thumbnailColorEffects =
@@ -125,6 +126,7 @@ internal sealed partial class ThumbnailGridView
     private long _thumbnailGpuCacheLimitBytes = 256L * 1024 * 1024;
     private long _retiredGpuNotBeforeTick;
     private int _gpuSourceRecoveryPending;
+    private int _thumbnailDeviceRecoveryAttempt;
     private double _measuredUploadBytesPerSecond = 2.0 * 1024 * 1024 * 1024;
     private long _lastScrollingPresentTick;
 
@@ -150,6 +152,7 @@ internal sealed partial class ThumbnailGridView
             TrimGpuTextureCache();
         };
         _thumbnailGpuRetireTimer.Tick += (_, _) => DrainRetiredGpuResources();
+        _thumbnailDeviceRecoveryTimer.Tick += (_, _) => RecoverThumbnailDeviceResources();
     }
 
     public void ConfigureColorManagement(bool enabled, byte[]? monitorProfile)
@@ -365,9 +368,8 @@ internal sealed partial class ThumbnailGridView
             {
                 ExtendedDiagnostics.Breadcrumb(
                     $"Thumbnail Direct2D EndDraw failed: {result}");
-                ScheduleGpuSourceRecovery();
                 DiscardThumbnailDeviceResources();
-                Invalidate();
+                ScheduleThumbnailDeviceRecovery("EndDraw");
                 return;
             }
             if (_thumbnailSwapChain is not null)
@@ -377,9 +379,8 @@ internal sealed partial class ThumbnailGridView
         {
             ExtendedDiagnostics.LogException(
                 "Thumbnail Direct2D frame failed", exception);
-            ScheduleGpuSourceRecovery();
             DiscardThumbnailDeviceResources();
-            Invalidate();
+            ScheduleThumbnailDeviceRecovery("frame exception");
             return;
         }
 
@@ -1051,6 +1052,58 @@ internal sealed partial class ThumbnailGridView
         }
     }
 
+    private void ScheduleThumbnailDeviceRecovery(string reason)
+    {
+        if (IsDisposed || Disposing || !IsHandleCreated) return;
+        _thumbnailDeviceRecoveryAttempt = Math.Min(
+            _thumbnailDeviceRecoveryAttempt + 1, 6);
+        _thumbnailDeviceRecoveryTimer.Stop();
+        _thumbnailDeviceRecoveryTimer.Interval = Math.Min(
+            1000, 50 << Math.Min(4, _thumbnailDeviceRecoveryAttempt - 1));
+        ExtendedDiagnostics.Breadcrumb(
+            $"Thumbnail Direct2D recovery scheduled: reason={reason}; " +
+            $"attempt={_thumbnailDeviceRecoveryAttempt}; " +
+            $"delayMs={_thumbnailDeviceRecoveryTimer.Interval}");
+        _thumbnailDeviceRecoveryTimer.Start();
+    }
+
+    private void RecoverThumbnailDeviceResources()
+    {
+        _thumbnailDeviceRecoveryTimer.Stop();
+        if (IsDisposed || Disposing || !IsHandleCreated || !Visible) return;
+        try
+        {
+            EnsureThumbnailRenderTarget();
+            if (ThumbnailTarget is null)
+            {
+                ScheduleThumbnailDeviceRecovery("target unavailable");
+                return;
+            }
+
+            // Invalidate issued from inside WM_PAINT can be coalesced away. Force
+            // one new paint from this later timer turn so a recreated target does
+            // not leave the grid frozen while sibling toolbar controls still work.
+            Invalidate();
+            Update();
+            if (ThumbnailTarget is null)
+            {
+                ScheduleThumbnailDeviceRecovery("retry presentation failed");
+                return;
+            }
+            ExtendedDiagnostics.Breadcrumb(
+                $"Thumbnail Direct2D recovery completed: attempts={_thumbnailDeviceRecoveryAttempt}");
+            _thumbnailDeviceRecoveryAttempt = 0;
+        }
+        catch (Exception exception)
+        {
+            ExtendedDiagnostics.LogException(
+                "Thumbnail Direct2D recovery failed", exception,
+                $"attempt={_thumbnailDeviceRecoveryAttempt}");
+            DiscardThumbnailDeviceResources();
+            ScheduleThumbnailDeviceRecovery("recreate exception");
+        }
+    }
+
     private void DiscardThumbnailDeviceResources()
     {
         ClearGpuTextureCacheImmediate();
@@ -1108,6 +1161,7 @@ internal sealed partial class ThumbnailGridView
         _thumbnailGpuUploadTimer.Dispose();
         _thumbnailGpuTrimTimer.Dispose();
         _thumbnailGpuRetireTimer.Dispose();
+        _thumbnailDeviceRecoveryTimer.Dispose();
         _thumbnailNameFormat.Dispose();
         _thumbnailNumberFormat.Dispose();
         _thumbnailIconFormat.Dispose();
