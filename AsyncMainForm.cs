@@ -797,7 +797,6 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private async Task TryOpenAsync(string path,
         string? preferredPageName = null, string? preferredBrowsePath = null,
         bool forceFreshPageCache = false,
-        bool showThumbnailForFolderWithoutImages = false,
         PdfReloadCache? pdfReloadCache = null)
     {
         ExtendedDiagnostics.Breadcrumb(
@@ -885,14 +884,15 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             var browseEntrySelected = !string.IsNullOrWhiteSpace(preferredBrowsePath) &&
                 _thumbnailGrid.SelectBrowsePath(preferredBrowsePath);
             EndProgress(progress);
-            var switchToThumbnail = showThumbnailForFolderWithoutImages &&
-                Directory.Exists(book.SourcePath) && book.Pages.Count == 0 && !_thumbnailMode;
+            var switchToThumbnail = book.Pages.Count == 0 && !_thumbnailMode &&
+                (Directory.Exists(book.SourcePath) ||
+                 Book.IsSupportedArchive(book.SourcePath));
             if (switchToThumbnail)
             {
                 // A folder can still be useful as a library view when it has no
-                // images directly inside it (it may contain folders, archives or
-                // PDFs). Full view has no page to render, so expose those browse
-                // entries immediately instead of leaving the old viewer visible.
+                // images directly inside it. An empty archive still needs a way
+                // back to its containing folder. Full view has no page to render,
+                // so expose the browse grid instead of leaving the viewer blank.
                 SetThumbnailMode(true);
             }
             else if (_thumbnailMode)
@@ -2078,14 +2078,19 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             _thumbnailAddressBox.Text = string.Empty;
         }
         var pageNames = _book?.Pages.Select(page => page.Name) ?? [];
+        var emptyMessage = _book is { Pages.Count: 0, Subfolders.Count: 0,
+            Containers.Count: 0 }
+            ? "No supported files found."
+            : null;
         if (pageRemap is null)
         {
-            _thumbnailGrid.ResetPages(pageNames, folders);
+            _thumbnailGrid.ResetPages(pageNames, folders, emptyMessage);
             _thumbnailGrid.SelectedPage = _pageIndex;
         }
         else
         {
-            _thumbnailGrid.RemapPages(pageNames, folders, pageRemap, _pageIndex);
+            _thumbnailGrid.RemapPages(
+                pageNames, folders, pageRemap, _pageIndex, emptyMessage);
         }
     }
 
@@ -4303,8 +4308,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         BringToFront();
         Activate();
         Focus();
-        _ = TryOpenAsync(files[0],
-            showThumbnailForFolderWithoutImages: Directory.Exists(files[0]));
+        _ = TryOpenAsync(files[0]);
         BeginInvoke(new Action(() =>
         {
             if (IsDisposed || Disposing) return;

@@ -287,8 +287,6 @@ internal sealed class Book : IDisposable
             sortedPages = SortPages(
                 pages, sortMode, descending, hierarchicalNames: true).ToArray();
         }
-        if (sortedPages.Length == 0) throw new InvalidDataException("The archive contains no supported images.");
-
         var resultPages = sortedPages.Select(page => new PageEntry(page.Name, page.Open)).ToArray();
         return new Book(archivePath, resultPages,
             parentFolder: Path.GetDirectoryName(archivePath));

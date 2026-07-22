@@ -133,6 +133,8 @@ internal sealed partial class ThumbnailGridView
     private long _retiredGpuNotBeforeTick;
     private int _gpuSourceRecoveryPending;
     private int _thumbnailDeviceRecoveryAttempt;
+    private bool _thumbnailSharedDeviceResetRequired;
+    private long _thumbnailDeviceGeneration = -1;
     private double _measuredUploadBytesPerSecond = 2.0 * 1024 * 1024 * 1024;
     private long _lastScrollingPresentTick;
 
@@ -210,6 +212,20 @@ internal sealed partial class ThumbnailGridView
 
     private void EnsureThumbnailRenderTarget()
     {
+        if (_thumbnailSharedDeviceResetRequired)
+        {
+            if (ThumbnailTarget is not null) DiscardThumbnailDeviceResources();
+            return;
+        }
+        if (_thumbnailDeviceContext is not null &&
+            _thumbnailDeviceGeneration != GpuInteropDevice.Generation)
+        {
+            ExtendedDiagnostics.Breadcrumb(
+                $"Thumbnail Direct2D generation changed: " +
+                $"old={_thumbnailDeviceGeneration}; " +
+                $"new={GpuInteropDevice.Generation}");
+            DiscardThumbnailDeviceResources();
+        }
         if (ThumbnailTarget is not null || !IsHandleCreated ||
             ClientSize.Width <= 0 || ClientSize.Height <= 0) return;
 
@@ -260,6 +276,7 @@ internal sealed partial class ThumbnailGridView
                     d3dDevice, Handle, description);
             }
             RecreateThumbnailSwapChainTarget(resize: false);
+            _thumbnailDeviceGeneration = GpuInteropDevice.Generation;
             return _thumbnailSwapChainTarget is not null;
         }
         catch
@@ -368,14 +385,28 @@ internal sealed partial class ThumbnailGridView
                             ref uploadBudget, ref pendingUploads);
                     }
             }
+            if (!string.IsNullOrWhiteSpace(_emptyMessage))
+            {
+                var messageBounds = new Rectangle(
+                    Math.Max(16, ClientSize.Width / 8),
+                    Math.Max(16, ClientSize.Height / 3),
+                    Math.Max(1, ClientSize.Width * 3 / 4),
+                    Math.Max(1, ClientSize.Height / 3));
+                DrawDirect2DText(_emptyMessage, messageBounds,
+                    _thumbnailNameFormat, _mutedTextBrush!);
+            }
             DrawDirect2DScrollbar();
             var result = target.EndDraw();
             if (result.Failure)
             {
+                var deviceRemoved = GpuInteropDevice.TryGetDeviceRemovalReason(
+                    out var removalReason);
                 ExtendedDiagnostics.Breadcrumb(
-                    $"Thumbnail Direct2D EndDraw failed: {result}");
+                    $"Thumbnail Direct2D EndDraw failed: {result}; " +
+                    $"deviceRemoved={deviceRemoved}; removalReason={removalReason}");
                 DiscardThumbnailDeviceResources();
-                ScheduleThumbnailDeviceRecovery("EndDraw");
+                ScheduleThumbnailDeviceRecovery(
+                    "EndDraw", recreateSharedDevice: deviceRemoved);
                 return;
             }
             if (_thumbnailSwapChain is not null)
@@ -383,10 +414,13 @@ internal sealed partial class ThumbnailGridView
         }
         catch (Exception exception)
         {
+            var deviceRemoved = IsGpuDeviceRemoval(exception) ||
+                GpuInteropDevice.TryGetDeviceRemovalReason(out _);
             ExtendedDiagnostics.LogException(
                 "Thumbnail Direct2D frame failed", exception);
             DiscardThumbnailDeviceResources();
-            ScheduleThumbnailDeviceRecovery("frame exception");
+            ScheduleThumbnailDeviceRecovery(
+                "frame exception", recreateSharedDevice: deviceRemoved);
             return;
         }
 
@@ -790,7 +824,11 @@ internal sealed partial class ThumbnailGridView
             ExtendedDiagnostics.LogException(
                 "Native GPU thumbnail import failed", exception,
                 $"source={source.Width}x{source.Height}; bytes={source.Bytes}");
-            ScheduleGpuSourceRecovery();
+            if (IsGpuDeviceRemoval(exception))
+                ScheduleThumbnailDeviceRecovery(
+                    "native GPU import device loss", recreateSharedDevice: true);
+            else
+                ScheduleGpuSourceRecovery();
             return null;
         }
     }
@@ -1067,9 +1105,25 @@ internal sealed partial class ThumbnailGridView
         }
     }
 
-    private void ScheduleThumbnailDeviceRecovery(string reason)
+    private static bool IsGpuDeviceRemoval(Exception exception)
+    {
+        for (Exception? current = exception; current is not null;
+             current = current.InnerException)
+        {
+            if (current.HResult is unchecked((int)0x887A0005) or
+                unchecked((int)0x887A0006) or
+                unchecked((int)0x887A0007) or
+                unchecked((int)0x887A0020))
+                return true;
+        }
+        return false;
+    }
+
+    private void ScheduleThumbnailDeviceRecovery(
+        string reason, bool recreateSharedDevice = false)
     {
         if (IsDisposed || Disposing || !IsHandleCreated) return;
+        _thumbnailSharedDeviceResetRequired |= recreateSharedDevice;
         _thumbnailDeviceRecoveryAttempt = Math.Min(
             _thumbnailDeviceRecoveryAttempt + 1, 6);
         _thumbnailDeviceRecoveryTimer.Stop();
@@ -1078,6 +1132,7 @@ internal sealed partial class ThumbnailGridView
         ExtendedDiagnostics.Breadcrumb(
             $"Thumbnail Direct2D recovery scheduled: reason={reason}; " +
             $"attempt={_thumbnailDeviceRecoveryAttempt}; " +
+            $"resetSharedDevice={_thumbnailSharedDeviceResetRequired}; " +
             $"delayMs={_thumbnailDeviceRecoveryTimer.Interval}");
         _thumbnailDeviceRecoveryTimer.Start();
     }
@@ -1088,6 +1143,25 @@ internal sealed partial class ThumbnailGridView
         if (IsDisposed || Disposing || !IsHandleCreated || !Visible) return;
         try
         {
+            var resetSharedDevice = _thumbnailSharedDeviceResetRequired;
+            if (resetSharedDevice)
+            {
+                // Rebuilding only the Direct2D target cannot revive a removed
+                // D3D11 device. Release imported views before replacing the
+                // shared device and all GPU sources created from its generation.
+                DiscardThumbnailDeviceResources();
+                var recreated = GpuInteropDevice.RecreateAfterDeviceLoss();
+                _thumbnailSharedDeviceResetRequired = false;
+                var retirement = RetireGpuTextureCache();
+                _gpuFullCache.Clear(retirement);
+                _gpuFastPreviewCache.Clear(retirement);
+                _gpuBrowseFullPreviewCache.Clear(retirement);
+                _gpuBrowseFastPreviewCache.Clear(retirement);
+                ExtendedDiagnostics.Breadcrumb(
+                    $"Thumbnail shared D3D device reset: recreated={recreated}; " +
+                    $"generation={GpuInteropDevice.Generation}");
+            }
+
             EnsureThumbnailRenderTarget();
             if (ThumbnailTarget is null)
             {
@@ -1108,6 +1182,8 @@ internal sealed partial class ThumbnailGridView
             ExtendedDiagnostics.Breadcrumb(
                 $"Thumbnail Direct2D recovery completed: attempts={_thumbnailDeviceRecoveryAttempt}");
             _thumbnailDeviceRecoveryAttempt = 0;
+            if (resetSharedDevice)
+                ThumbnailRefreshRequested?.Invoke(this, EventArgs.Empty);
         }
         catch (Exception exception)
         {
@@ -1140,6 +1216,7 @@ internal sealed partial class ThumbnailGridView
         _thumbnailDeviceContext = null;
         _thumbnailD2DDevice?.Dispose();
         _thumbnailD2DDevice = null;
+        _thumbnailDeviceGeneration = -1;
     }
 
     private void DisposeThumbnailBrushes()

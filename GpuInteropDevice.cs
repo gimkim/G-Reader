@@ -25,6 +25,20 @@ internal static class GpuInteropDevice
     public static int PendingRetirements => Volatile.Read(ref _pendingRetirements);
     public static long PendingRetirementBytes => Volatile.Read(ref _pendingRetirementBytes);
 
+    public static bool TryGetDeviceRemovalReason(out int code)
+    {
+        code = 0;
+        var device = _device;
+        if (device is null) return false;
+        try
+        {
+            var reason = device.DeviceRemovedReason;
+            code = reason.Code;
+            return reason.Failure;
+        }
+        catch { return false; }
+    }
+
     internal static void QueueRetirement(Action release, Task? barrier,
         long bytes, string kind)
     {

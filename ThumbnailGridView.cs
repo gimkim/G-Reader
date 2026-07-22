@@ -30,6 +30,7 @@ internal sealed partial class ThumbnailGridView : Panel
     private bool _invalidationDispatchScheduled;
     private string[] _pageNames = [];
     private ThumbnailFolderEntry[] _folders = [];
+    private string? _emptyMessage;
     private int _pageCount;
     private int _contentGeneration;
     private int _imagesPerRow = 6;
@@ -239,7 +240,8 @@ internal sealed partial class ThumbnailGridView : Panel
     }
 
     public void ResetPages(IEnumerable<string> pageNames,
-        IEnumerable<ThumbnailFolderEntry>? folders = null)
+        IEnumerable<ThumbnailFolderEntry>? folders = null,
+        string? emptyMessage = null)
     {
         lock (_contentGate)
         {
@@ -256,6 +258,8 @@ internal sealed partial class ThumbnailGridView : Panel
             _gpuBrowseFastPreviewCache.Clear(retirement);
             _pageNames = pageNames.Select(GetDisplayFileName).ToArray();
             _folders = folders?.ToArray() ?? [];
+            _emptyMessage = string.IsNullOrWhiteSpace(emptyMessage)
+                ? null : emptyMessage;
             _pageCount = _pageNames.Length;
             _generationStates.Clear();
             _pageColorProfiles.Clear();
@@ -276,7 +280,8 @@ internal sealed partial class ThumbnailGridView : Panel
 
     public void RemapPages(IEnumerable<string> pageNames,
         IEnumerable<ThumbnailFolderEntry>? folders,
-        IReadOnlyDictionary<int, int> oldToNewPage, int selectedPage)
+        IReadOnlyDictionary<int, int> oldToNewPage, int selectedPage,
+        string? emptyMessage = null)
     {
         lock (_contentGate)
         {
@@ -306,6 +311,8 @@ internal sealed partial class ThumbnailGridView : Panel
 
             _pageNames = pageNames.Select(GetDisplayFileName).ToArray();
             _folders = folders?.ToArray() ?? [];
+            _emptyMessage = string.IsNullOrWhiteSpace(emptyMessage)
+                ? null : emptyMessage;
             _pageCount = _pageNames.Length;
             _selectedPage = _pageCount == 0 ? -1 : Math.Clamp(selectedPage, 0, _pageCount - 1);
             _selectedPages.Clear();

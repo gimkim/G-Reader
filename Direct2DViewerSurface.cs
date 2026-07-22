@@ -88,6 +88,7 @@ internal sealed class Direct2DViewerSurface : Control
     private byte[]? _rightColorProfile;
     private byte[]? _zoomColorProfile;
     private long _gpuCacheBytes;
+    private long _deviceGeneration = -1;
     private int _deviceRecoveryAttempt;
     private bool _renderTargetResizePending;
     private System.Drawing.Color _backgroundColor = System.Drawing.Color.FromArgb(30, 32, 38);
@@ -428,6 +429,14 @@ internal sealed class Direct2DViewerSurface : Control
 
     private void EnsureRenderTarget()
     {
+        if (_deviceContext is not null &&
+            _deviceGeneration != GpuInteropDevice.Generation)
+        {
+            ExtendedDiagnostics.Breadcrumb(
+                $"Full-view Direct2D generation changed: " +
+                $"old={_deviceGeneration}; new={GpuInteropDevice.Generation}");
+            DiscardDeviceResources();
+        }
         if (_renderTarget is not null || _deviceContext is not null ||
             !IsHandleCreated || ClientSize.Width <= 0 || ClientSize.Height <= 0) return;
         if (TryCreateDeviceContextTarget()) return;
@@ -478,6 +487,7 @@ internal sealed class Direct2DViewerSurface : Control
                     d3dDevice, Handle, description);
             }
             RecreateSwapChainTarget(resize: false);
+            _deviceGeneration = GpuInteropDevice.Generation;
             return _swapChainTarget is not null;
         }
         catch (Exception exception)
@@ -919,6 +929,7 @@ internal sealed class Direct2DViewerSurface : Control
         _deviceContext = null;
         _d2dDevice?.Dispose();
         _d2dDevice = null;
+        _deviceGeneration = -1;
     }
 
     private void DisposeBitmaps()
