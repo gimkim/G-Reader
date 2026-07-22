@@ -172,11 +172,14 @@ internal sealed class ReaderSettingsDialog : Form
         MaximizeBox = false;
         MinimizeBox = false;
         ShowInTaskbar = false;
-        ClientSize = new Size(1040, 820);
-        MinimumSize = new Size(980, 720);
         Font = new Font("Segoe UI", 9.5f);
-        BackColor = Color.FromArgb(242, 244, 248);
         AutoScaleMode = AutoScaleMode.Dpi;
+        AutoScaleDimensions = new SizeF(96f, 96f);
+        ClientSize = new Size(1040, 820);
+        MinimumSize = new Size(720, 560);
+        BackColor = Color.FromArgb(242, 244, 248);
+        Shown += (_, _) => FitToWorkingArea();
+        DpiChanged += (_, _) => BeginInvoke(new Action(FitToWorkingArea));
 
         _quality.Items.AddRange([
             "Fast — Lanczos2",
@@ -341,8 +344,8 @@ internal sealed class ReaderSettingsDialog : Form
         };
         var clearDiskCacheRow = new FlowLayoutPanel
         {
-            Dock = DockStyle.Fill, AutoSize = true, WrapContents = false,
-            Margin = Padding.Empty
+            Dock = DockStyle.Fill, AutoSize = true, WrapContents = true,
+            Margin = Padding.Empty, MinimumSize = new Size(0, 68)
         };
         clearDiskCacheRow.Controls.AddRange([clearDiskCache, clearDiskCacheStatus]);
 
@@ -366,8 +369,8 @@ internal sealed class ReaderSettingsDialog : Form
         };
         var clearReadingPositionsRow = new FlowLayoutPanel
         {
-            Dock = DockStyle.Fill, AutoSize = true, WrapContents = false,
-            Margin = Padding.Empty
+            Dock = DockStyle.Fill, AutoSize = true, WrapContents = true,
+            Margin = Padding.Empty, MinimumSize = new Size(0, 68)
         };
         clearReadingPositionsRow.Controls.AddRange([
             clearReadingPositions, readingPositionsStatus
@@ -502,7 +505,7 @@ internal sealed class ReaderSettingsDialog : Form
         };
         var benchmarkButtons = new FlowLayoutPanel
         {
-            Dock = DockStyle.Fill, AutoSize = false, WrapContents = false,
+            Dock = DockStyle.Fill, AutoSize = false, WrapContents = true,
             Margin = Padding.Empty
         };
         benchmarkButtons.Controls.AddRange([runBenchmark, cancelBenchmark, benchmarkProgress]);
@@ -510,10 +513,10 @@ internal sealed class ReaderSettingsDialog : Form
         {
             Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2,
             Margin = Padding.Empty, Padding = Padding.Empty,
-            MinimumSize = new Size(0, 104)
+            MinimumSize = new Size(0, 144)
         };
         benchmarkCommandRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        benchmarkCommandRow.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+        benchmarkCommandRow.RowStyles.Add(new RowStyle(SizeType.Absolute, 80));
         benchmarkCommandRow.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         benchmarkCommandRow.Controls.Add(benchmarkButtons, 0, 0);
         benchmarkCommandRow.Controls.Add(benchmarkStatus, 0, 1);
@@ -560,8 +563,8 @@ internal sealed class ReaderSettingsDialog : Form
         };
         var updateRow = new FlowLayoutPanel
         {
-            Dock = DockStyle.Fill, AutoSize = true, WrapContents = false,
-            Margin = Padding.Empty
+            Dock = DockStyle.Fill, AutoSize = true, WrapContents = true,
+            Margin = Padding.Empty, MinimumSize = new Size(0, 68)
         };
         updateRow.Controls.AddRange([checkForUpdates, updateStatus]);
 
@@ -794,6 +797,35 @@ internal sealed class ReaderSettingsDialog : Form
         UpdateDetailedEffectLabels();
     }
 
+    private void FitToWorkingArea()
+    {
+        if (IsDisposed || Disposing) return;
+        var workingArea = Screen.FromControl(Owner ?? this).WorkingArea;
+        var margin = Math.Max(8, LogicalToDeviceUnits(16));
+        var maximumWidth = Math.Max(480, workingArea.Width - margin * 2);
+        var maximumHeight = Math.Max(360, workingArea.Height - margin * 2);
+
+        // Temporarily release MinimumSize so a 150-200% DPI scale cannot force
+        // the dialog larger than the monitor's physical working area.
+        MinimumSize = Size.Empty;
+        Size = new Size(
+            Math.Min(Width, maximumWidth),
+            Math.Min(Height, maximumHeight));
+        MinimumSize = new Size(
+            Math.Min(LogicalToDeviceUnits(720), maximumWidth),
+            Math.Min(LogicalToDeviceUnits(560), maximumHeight));
+
+        var left = Math.Clamp(Left,
+            workingArea.Left + margin,
+            Math.Max(workingArea.Left + margin,
+                workingArea.Right - Width - margin));
+        var top = Math.Clamp(Top,
+            workingArea.Top + margin,
+            Math.Max(workingArea.Top + margin,
+                workingArea.Bottom - Height - margin));
+        Location = new Point(left, top);
+    }
+
     private void ApplyPerformanceMode(bool captureManual)
     {
         if (_autoOptimize.Checked)
@@ -839,7 +871,7 @@ internal sealed class ReaderSettingsDialog : Form
         var layout = new TableLayoutPanel
         {
             Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2,
-            MinimumSize = new Size(0, 78), Margin = Padding.Empty,
+            MinimumSize = new Size(0, 100), Margin = Padding.Empty,
             Padding = Padding.Empty
         };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -1377,8 +1409,11 @@ internal sealed class ReaderSettingsDialog : Form
             Dock = DockStyle.Fill, ColumnCount = 2, RowCount = fields.Length,
             Margin = Padding.Empty, BackColor = Color.White
         };
-        fieldTable.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 320));
-        fieldTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        // A proportional label column remains usable when a high-DPI laptop has
+        // much less logical width than the development monitor. Long labels wrap
+        // in their own cell instead of pushing or overlapping the editor.
+        fieldTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 36));
+        fieldTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 64));
         for (var row = 0; row < fields.Length; row++)
         {
             fieldTable.RowStyles.Add(new RowStyle(SizeType.Absolute, fieldHeights[row]));
