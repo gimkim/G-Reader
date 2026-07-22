@@ -647,7 +647,7 @@ internal sealed class PdfiumProcessPool : IDisposable
                     // cleanup waited behind active page renders.
                     if (!_documentReferences.ContainsKey(path) &&
                         Volatile.Read(ref _disposed) == 0)
-                        CloseDocumentCore(path);
+                        CloseDocumentOnAvailableWorkers(path);
                 }
                 finally { _documentCloseGate.Release(); }
             }
@@ -666,6 +666,35 @@ internal sealed class PdfiumProcessPool : IDisposable
         });
     }
 
+    private void CloseDocumentOnAvailableWorkers(string path)
+    {
+        var workers = new List<PdfiumWorkerClient>(_workers.Length);
+        try
+        {
+            // Idle cleanup must never reserve part of the pool while waiting for
+            // one long native PDFium command. Take only workers that are already
+            // idle; busy workers will evict the document through their bounded
+            // two-document cache when they process later work.
+            while (_slots.Wait(0))
+            {
+                if (_available.TryDequeue(out var worker))
+                    workers.Add(worker);
+                else
+                {
+                    _slots.Release();
+                    break;
+                }
+            }
+            foreach (var worker in workers)
+                CloseDocument(worker, path);
+        }
+        finally
+        {
+            foreach (var worker in workers) _available.Enqueue(worker);
+            for (var i = 0; i < workers.Count; i++) _slots.Release();
+        }
+    }
+
     private void CloseDocumentCore(string path)
     {
         var acquired = 0;
@@ -677,11 +706,7 @@ internal sealed class PdfiumProcessPool : IDisposable
             if (workers.Count != _workers.Length)
                 throw new InvalidOperationException("PDFium process pool lost a worker.");
             foreach (var worker in workers)
-                worker.Execute(writer =>
-                {
-                    writer.Write((byte)5);
-                    writer.Write(Path.GetFullPath(path));
-                }, _ => true);
+                CloseDocument(worker, path);
         }
         finally
         {
@@ -689,6 +714,13 @@ internal sealed class PdfiumProcessPool : IDisposable
             for (var i = 0; i < acquired; i++) _slots.Release();
         }
     }
+
+    private static void CloseDocument(PdfiumWorkerClient worker, string path) =>
+        worker.Execute(writer =>
+        {
+            writer.Write((byte)5);
+            writer.Write(Path.GetFullPath(path));
+        }, _ => true);
 
     public void Dispose()
     {
