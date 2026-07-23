@@ -23,6 +23,8 @@ internal sealed class GpuThumbnailRenderCache : IDisposable
         public long Bytes { get; } = image.Bytes;
         public long Sequence { get; set; } = sequence;
         public int Readers { get; set; }
+        public bool Retired { get; set; }
+        public Task RetirementBarrier { get; set; } = Task.CompletedTask;
     }
     private readonly object _gate = new();
     private readonly Dictionary<Key, Entry> _items = [];
@@ -33,18 +35,25 @@ internal sealed class GpuThumbnailRenderCache : IDisposable
     public void SetLimit(long bytes)
     { Volatile.Write(ref _limit, Math.Max(0, bytes)); ScheduleTrim(true); }
     public bool HasExact(int page, Size size)
-    { lock (_gate) return _items.ContainsKey(new(page, size.Width, size.Height)); }
+    {
+        lock (_gate)
+            return _items.TryGetValue(new(page, size.Width, size.Height), out var item) &&
+                item.Image.DeviceGeneration == GpuInteropDevice.Generation;
+    }
     public Lease? AcquireBest(int page, Size size)
     {
         lock (_gate)
         {
             var key = new Key(page, size.Width, size.Height);
-            if (_items.TryGetValue(key, out var exact)) return Acquire(exact, true);
+            if (_items.TryGetValue(key, out var exact) &&
+                exact.Image.DeviceGeneration == GpuInteropDevice.Generation)
+                return Acquire(exact, true);
             if (!_keysByPage.TryGetValue(page, out var keys)) return null;
             Entry? best = null; long distance = long.MaxValue;
             foreach (var candidateKey in keys)
             {
-                if (!_items.TryGetValue(candidateKey, out var candidate)) continue;
+                if (!_items.TryGetValue(candidateKey, out var candidate) ||
+                    candidate.Image.DeviceGeneration != GpuInteropDevice.Generation) continue;
                 var d = Math.Abs((long)candidateKey.Width - size.Width) +
                     Math.Abs((long)candidateKey.Height - size.Height);
                 if (d >= distance) continue;
@@ -55,29 +64,101 @@ internal sealed class GpuThumbnailRenderCache : IDisposable
     }
     public void AddOwned(int page, Size size, GpuRenderedImage image)
     {
-        if (Volatile.Read(ref _limit) <= 0) { image.Dispose(); return; }
+        if (Volatile.Read(ref _limit) <= 0 ||
+            image.DeviceGeneration != GpuInteropDevice.Generation)
+        { image.Dispose(); return; }
         var key = new Key(page, size.Width, size.Height);
+        GpuRenderedImage? stale = null;
         lock (_gate)
         {
             if (_items.TryGetValue(key, out var existing))
-            { existing.Sequence = ++_sequence; image.Dispose(); return; }
+            {
+                if (existing.Image.DeviceGeneration == GpuInteropDevice.Generation)
+                { existing.Sequence = ++_sequence; image.Dispose(); return; }
+                _items.Remove(key);
+                _bytes -= existing.Bytes;
+                if (_keysByPage.TryGetValue(page, out var oldKeys))
+                {
+                    oldKeys.Remove(key);
+                    if (oldKeys.Count == 0) _keysByPage.Remove(page);
+                }
+                existing.Retired = true;
+                if (existing.Readers == 0) stale = existing.Image;
+            }
             _items[key] = new Entry(image, ++_sequence);
             if (!_keysByPage.TryGetValue(page, out var keys)) _keysByPage[page] = keys = [];
             keys.Add(key); _bytes += image.Bytes;
         }
+        stale?.Dispose();
         ScheduleTrim(false);
     }
-    public void Clear()
+    public void Clear(Task? retirementBarrier = null)
     {
-        GpuRenderedImage[] images;
+        retirementBarrier ??= Task.CompletedTask;
+        List<GpuRenderedImage> images = [];
         lock (_gate)
-        { images = _items.Values.Select(x => x.Image).ToArray(); _items.Clear(); _keysByPage.Clear(); _bytes = 0; }
-        if (images.Length > 0) _ = Task.Run(() => { foreach (var image in images) image.Dispose(); });
+        {
+            foreach (var entry in _items.Values)
+            {
+                entry.Retired = true;
+                entry.RetirementBarrier = retirementBarrier;
+                if (entry.Readers == 0) images.Add(entry.Image);
+            }
+            _items.Clear();
+            _keysByPage.Clear();
+            _bytes = 0;
+        }
+        DisposeInBackground(images, retirementBarrier);
+    }
+    public void RemapPages(IReadOnlyDictionary<int, int> oldToNewPage,
+        Task? retirementBarrier = null)
+    {
+        retirementBarrier ??= Task.CompletedTask;
+        List<GpuRenderedImage> discarded = [];
+        lock (_gate)
+        {
+            var previous = _items.ToArray();
+            _items.Clear();
+            _keysByPage.Clear();
+            _bytes = 0;
+            foreach (var pair in previous)
+            {
+                if (!oldToNewPage.TryGetValue(pair.Key.Page, out var newPage))
+                {
+                    pair.Value.Retired = true;
+                    pair.Value.RetirementBarrier = retirementBarrier;
+                    if (pair.Value.Readers == 0) discarded.Add(pair.Value.Image);
+                    continue;
+                }
+                var key = pair.Key with { Page = newPage };
+                if (!_items.TryAdd(key, pair.Value))
+                {
+                    pair.Value.Retired = true;
+                    pair.Value.RetirementBarrier = retirementBarrier;
+                    if (pair.Value.Readers == 0) discarded.Add(pair.Value.Image);
+                    continue;
+                }
+                if (!_keysByPage.TryGetValue(newPage, out var keys))
+                    _keysByPage[newPage] = keys = [];
+                keys.Add(key);
+                _bytes += pair.Value.Bytes;
+            }
+        }
+        DisposeInBackground(discarded, retirementBarrier);
     }
     public void Dispose() => Clear();
     private Lease Acquire(Entry entry, bool exact)
     { entry.Readers++; entry.Sequence = ++_sequence; return new(this, entry, exact); }
-    private void Release(Entry entry) { lock (_gate) entry.Readers--; }
+    private void Release(Entry entry)
+    {
+        GpuRenderedImage? retired = null;
+        lock (_gate)
+        {
+            entry.Readers--;
+            if (entry.Readers == 0 && entry.Retired) retired = entry.Image;
+        }
+        if (retired is not null) DisposeInBackground([retired], entry.RetirementBarrier);
+    }
     private void ScheduleTrim(bool force)
     {
         var limit = Volatile.Read(ref _limit);
@@ -107,6 +188,15 @@ internal sealed class GpuThumbnailRenderCache : IDisposable
                 evicted.Add(candidate.Value.Image);
             }
         }
-        foreach (var image in evicted) image.Dispose();
+        DisposeInBackground(evicted);
+    }
+
+    private static void DisposeInBackground(IEnumerable<GpuRenderedImage> images,
+        Task? retirementBarrier = null)
+    {
+        var pending = images.ToArray();
+        if (pending.Length == 0) return;
+        var barrier = retirementBarrier ?? Task.CompletedTask;
+        foreach (var image in pending) image.RetireAfter(barrier);
     }
 }

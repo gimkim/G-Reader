@@ -4,8 +4,10 @@ namespace CDisplayEx.CSharp;
 
 internal sealed class PositionSlider : Control
 {
+    private const int PositionTextWidth = 132;
     private int _maximum;
     private int _value;
+    private int _rangeEnd = -1;
     private bool _dragging;
     private bool _reverseDirection;
     private int _cacheBehindStart = -1;
@@ -44,9 +46,23 @@ internal sealed class PositionSlider : Control
             var next = Math.Clamp(value, 0, _maximum);
             if (_value == next) return;
             _value = next;
+            _rangeEnd = -1;
             UpdateAccessibleText();
             Invalidate();
             ValueChanged?.Invoke(this, EventArgs.Empty);
+        }
+    }
+
+    public int RangeEnd
+    {
+        get => _rangeEnd;
+        set
+        {
+            var next = value < 0 ? -1 : Math.Clamp(value, _value, _maximum);
+            if (_rangeEnd == next) return;
+            _rangeEnd = next;
+            UpdateAccessibleText();
+            Invalidate();
         }
     }
 
@@ -77,7 +93,10 @@ internal sealed class PositionSlider : Control
     {
         var page = _maximum == 0 ? 0 : _value + 1;
         var total = _maximum == 0 ? 0 : _maximum + 1;
-        Text = $"Page position {page} of {total}";
+        var end = _rangeEnd > _value ? _rangeEnd + 1 : page;
+        Text = end > page
+            ? $"Page position {page} to {end} of {total}"
+            : $"Page position {page} of {total}";
         AccessibleName = Text;
     }
 
@@ -85,7 +104,7 @@ internal sealed class PositionSlider : Control
     {
         base.OnPaint(e);
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        var textWidth = 92;
+        var textWidth = PositionTextWidth;
         var bar = GetBarRectangle(textWidth);
         using var track = Rounded(bar, 4);
         using var trackBrush = new SolidBrush(Color.FromArgb(68, 72, 80));
@@ -116,7 +135,10 @@ internal sealed class PositionSlider : Control
         e.Graphics.FillEllipse(thumbBrush, thumbX - 7, Height / 2 - 7, 14, 14);
         e.Graphics.DrawEllipse(thumbPen, thumbX - 7, Height / 2 - 7, 14, 14);
 
-        var text = $"{(_maximum == 0 ? 0 : _value + 1)} / {(_maximum == 0 ? 0 : _maximum + 1)}";
+        var page = _maximum == 0 ? 0 : _value + 1;
+        var end = _rangeEnd > _value ? _rangeEnd + 1 : page;
+        var position = end > page ? $"{page}-{end}" : page.ToString();
+        var text = $"{position} / {(_maximum == 0 ? 0 : _maximum + 1)}";
         var textBounds = _reverseDirection
             ? new Rectangle(8, 0, textWidth - 8, Height)
             : new Rectangle(Width - textWidth, 0, textWidth - 8, Height);
@@ -149,7 +171,7 @@ internal sealed class PositionSlider : Control
 
     private void SetFromMouse(int x)
     {
-        var bar = GetBarRectangle(92);
+        var bar = GetBarRectangle(PositionTextWidth);
         var ratio = Math.Clamp((float)(x - bar.X) / bar.Width, 0f, 1f);
         if (_reverseDirection) ratio = 1f - ratio;
         Value = (int)Math.Round(_maximum * ratio);
