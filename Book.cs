@@ -3,6 +3,7 @@ using System.IO;
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Collections.Concurrent;
 using SharpCompress.Archives;
 
 namespace CDisplayEx.CSharp;
@@ -28,13 +29,21 @@ internal sealed class Book : IDisposable
     public IReadOnlyList<string> Containers { get; }
     public string? ParentFolder { get; }
     private readonly IDisposable? _ownedResource;
+    private readonly ConcurrentDictionary<int, CacheSourceIdentity> _cacheSourceIdentities = [];
+    private readonly string _cacheSourcePath;
+    private readonly bool _sourceIsDirectory;
     private int _disposed;
+
+    internal readonly record struct CacheSourceIdentity(
+        string SourcePath, string PageName, long Length, long ModifiedTicks);
 
     private Book(string sourcePath, IReadOnlyList<PageEntry> pages,
         IReadOnlyList<string>? subfolders = null, string? parentFolder = null,
         IReadOnlyList<string>? containers = null, IDisposable? ownedResource = null)
     {
         SourcePath = sourcePath;
+        _cacheSourcePath = Path.GetFullPath(sourcePath);
+        _sourceIsDirectory = Directory.Exists(_cacheSourcePath);
         Pages = pages;
         Subfolders = subfolders ?? [];
         Containers = containers ?? [];
@@ -84,6 +93,27 @@ internal sealed class Book : IDisposable
             if (Path.GetFileName(Pages[i].Name).Equals(name, StringComparison.OrdinalIgnoreCase)) return i;
         return 0;
     }
+
+    internal CacheSourceIdentity GetCacheSourceIdentity(int pageIndex) =>
+        _cacheSourceIdentities.GetOrAdd(pageIndex, index =>
+        {
+            if ((uint)index >= (uint)Pages.Count)
+                throw new ArgumentOutOfRangeException(nameof(pageIndex));
+            var identityPath = _sourceIsDirectory
+                ? Path.Combine(_cacheSourcePath, Pages[index].Name)
+                : _cacheSourcePath;
+            var length = 0L;
+            var modifiedTicks = 0L;
+            try
+            {
+                var info = new FileInfo(identityPath);
+                length = info.Length;
+                modifiedTicks = info.LastWriteTimeUtc.Ticks;
+            }
+            catch { }
+            return new CacheSourceIdentity(
+                _cacheSourcePath, Pages[index].Name, length, modifiedTicks);
+        });
 
     public static IReadOnlyList<PageEntry> OpenPreviewPages(
         string path, int maximumPages, CancellationToken cancellationToken)
@@ -155,13 +185,28 @@ internal sealed class Book : IDisposable
         PageSortMode sortMode = PageSortMode.NameNumeric,
         bool descending = false)
     {
-        var folderFiles = Directory.EnumerateFiles(folder).ToArray();
-        var discoveredFiles = folderFiles.Where(IsSupportedImage).ToArray();
+        var discovered = new List<string>();
+        var containerList = new List<string>();
+        foreach (var path in Directory.EnumerateFiles(folder))
+        {
+            if (IsSupportedImage(path)) discovered.Add(path);
+            else if (IsSupportedArchive(path) || Path.GetExtension(path).Equals(
+                         ".pdf", StringComparison.OrdinalIgnoreCase))
+                containerList.Add(path);
+        }
+        var discoveredFiles = discovered.ToArray();
         var sortablePages = discoveredFiles.Select(path =>
         {
-            var info = new FileInfo(path);
+            var needsFileInfo = sortMode is PageSortMode.Size or PageSortMode.DateModified;
+            FileInfo? info = null;
+            if (needsFileInfo)
+            {
+                try { info = new FileInfo(path); }
+                catch { }
+            }
             return new SortablePage(
-                Path.GetFileName(path), info.Length, info.LastWriteTimeUtc,
+                Path.GetFileName(path), info?.Length ?? 0L,
+                info?.LastWriteTimeUtc ?? DateTime.MinValue,
                 sortMode == PageSortMode.DateTaken ? TryReadDateTaken(path) : null,
                 () => File.OpenRead(path));
         }).ToArray();
@@ -175,11 +220,7 @@ internal sealed class Book : IDisposable
                 .Select(path => byName[Path.GetFileName(path)])
                 .ToArray();
         }
-        var containers = folderFiles
-            .Where(path => IsSupportedArchive(path) ||
-                Path.GetExtension(path).Equals(".pdf", StringComparison.OrdinalIgnoreCase))
-            .OrderBy(path => path, NumericFirstComparer.Instance)
-            .ToArray();
+        var containers = containerList.ToArray();
         string[] subfolders;
         try
         {
@@ -282,14 +323,19 @@ internal sealed class Book : IDisposable
                 }
                 pages.Add(new SortablePage(
                     name, entry.Size, entry.LastModifiedTime ?? DateTime.MinValue, taken,
-                    () => OpenArchiveEntry(archivePath, name)));
+                    () => throw new InvalidOperationException("Archive session is not initialized.")));
             }
             sortedPages = SortPages(
                 pages, sortMode, descending, hierarchicalNames: true).ToArray();
         }
-        var resultPages = sortedPages.Select(page => new PageEntry(page.Name, page.Open)).ToArray();
+        var sessions = new ArchiveSessionPool(archivePath);
+        var resultPages = sortedPages.Select(page =>
+        {
+            var name = page.Name;
+            return new PageEntry(name, () => sessions.OpenEntry(name));
+        }).ToArray();
         return new Book(archivePath, resultPages,
-            parentFolder: Path.GetDirectoryName(archivePath));
+            parentFolder: Path.GetDirectoryName(archivePath), ownedResource: sessions);
     }
 
     private static Stream OpenArchiveEntry(string archivePath, string name)
@@ -301,6 +347,97 @@ internal sealed class Book : IDisposable
         using (var source = entry.OpenEntryStream()) source.CopyTo(memory);
         memory.Position = 0;
         return memory;
+    }
+
+    private sealed class ArchiveSessionPool : IDisposable
+    {
+        private readonly string _archivePath;
+        private readonly int _maximumSessions = Math.Clamp(Environment.ProcessorCount / 4, 2, 4);
+        private readonly SemaphoreSlim _slots;
+        private readonly ConcurrentBag<ArchiveSession> _available = [];
+        private readonly object _poolGate = new();
+        private int _disposed;
+
+        public ArchiveSessionPool(string archivePath)
+        {
+            _archivePath = archivePath;
+            _slots = new SemaphoreSlim(_maximumSessions, _maximumSessions);
+        }
+
+        public Stream OpenEntry(string name)
+        {
+            _slots.Wait();
+            ArchiveSession? session = null;
+            var reusable = false;
+            try
+            {
+                lock (_poolGate)
+                {
+                    ObjectDisposedException.ThrowIf(_disposed != 0, this);
+                    if (!_available.TryTake(out session))
+                        session = new ArchiveSession(_archivePath);
+                }
+                if (!session.Entries.TryGetValue(name, out var entry))
+                    throw new InvalidDataException($"Missing archive entry: {name}");
+                var memory = entry.Size is > 0 and <= int.MaxValue
+                    ? new MemoryStream((int)entry.Size)
+                    : new MemoryStream();
+                using (var source = entry.OpenEntryStream()) source.CopyTo(memory);
+                memory.Position = 0;
+                reusable = true;
+                return memory;
+            }
+            finally
+            {
+                if (session is not null)
+                {
+                    lock (_poolGate)
+                    {
+                        if (reusable && _disposed == 0)
+                            _available.Add(session);
+                        else
+                            session.Dispose();
+                    }
+                }
+                _slots.Release();
+            }
+        }
+
+        public void Dispose()
+        {
+            lock (_poolGate)
+            {
+                if (_disposed != 0) return;
+                _disposed = 1;
+                // Only close idle handles here. A handle currently leased to a
+                // decoder observes the disposed flag when it returns and closes
+                // itself, so rapid book switching cannot dispose a native archive
+                // object while another thread is reading from it.
+                while (_available.TryTake(out var session))
+                {
+                    try { session.Dispose(); }
+                    catch { }
+                }
+            }
+        }
+
+        private sealed class ArchiveSession : IDisposable
+        {
+            private readonly IArchive _archive;
+            public IReadOnlyDictionary<string, IArchiveEntry> Entries { get; }
+
+            public ArchiveSession(string path)
+            {
+                _archive = ArchiveFactory.Open(path);
+                var entries = new Dictionary<string, IArchiveEntry>(StringComparer.Ordinal);
+                foreach (var entry in _archive.Entries)
+                    if (!entry.IsDirectory && entry.Key is { } key)
+                        entries.TryAdd(key, entry);
+                Entries = entries;
+            }
+
+            public void Dispose() => _archive.Dispose();
+        }
     }
 
     private static IEnumerable<SortablePage> SortPages(
@@ -412,14 +549,17 @@ internal sealed class Book : IDisposable
         string path, PageSortMode mode, bool directory)
     {
         long size = 0;
-        DateTime modified;
-        try
+        var modified = DateTime.MinValue;
+        if (mode == PageSortMode.DateModified)
         {
-            modified = directory
-                ? Directory.GetLastWriteTimeUtc(path)
-                : File.GetLastWriteTimeUtc(path);
+            try
+            {
+                modified = directory
+                    ? Directory.GetLastWriteTimeUtc(path)
+                    : File.GetLastWriteTimeUtc(path);
+            }
+            catch { }
         }
-        catch { modified = DateTime.MinValue; }
 
         if (mode == PageSortMode.Size)
         {

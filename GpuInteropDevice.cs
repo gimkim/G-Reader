@@ -9,15 +9,51 @@ namespace CDisplayEx.CSharp;
 /// <summary>One process-wide D3D11 device shared by Direct2D and CUDA.</summary>
 internal static class GpuInteropDevice
 {
-    private sealed record Retirement(Action Release, long Bytes, string Kind);
+    private sealed record Retirement(Action Release, long Bytes, string Kind, long Generation);
+    private sealed class RetirementLane
+    {
+        public ConcurrentQueue<Retirement> Queue { get; } = new();
+        public SemaphoreSlim Signal { get; } = new(0);
+        public int Started;
+    }
+    internal sealed class DeviceHolder(ID3D11Device device, long generation)
+    {
+        public ID3D11Device Device { get; } = device;
+        public long Generation { get; } = generation;
+        public int Users;
+        public bool Retired;
+        public bool DisposalQueued;
+    }
+
+    internal sealed class DeviceUsageLease : IDisposable
+    {
+        private DeviceHolder? _holder;
+        internal DeviceUsageLease(DeviceHolder holder) => _holder = holder;
+        public ID3D11Device Device => _holder?.Device ??
+            throw new ObjectDisposedException(nameof(DeviceUsageLease));
+        public long Generation => _holder?.Generation ?? -1;
+        public DeviceUsageLease Duplicate()
+        {
+            lock (Gate)
+            {
+                var holder = _holder ??
+                    throw new ObjectDisposedException(nameof(DeviceUsageLease));
+                holder.Users++;
+                return new DeviceUsageLease(holder);
+            }
+        }
+        public void Dispose()
+        {
+            var holder = Interlocked.Exchange(ref _holder, null);
+            if (holder is not null) ReleaseDeviceUsage(holder);
+        }
+    }
 
     private static readonly object Gate = new();
-    private static readonly ConcurrentQueue<Retirement> RetirementQueue = new();
-    private static readonly SemaphoreSlim RetirementSignal = new(0);
-    private static ID3D11Device? _device;
+    private static readonly ConcurrentDictionary<long, RetirementLane> RetirementLanes = new();
+    private static DeviceHolder? _currentDevice;
     private static int _initializationState;
     private static long _generation;
-    private static int _retirementWorkerStarted;
     private static int _pendingRetirements;
     private static long _pendingRetirementBytes;
 
@@ -28,11 +64,11 @@ internal static class GpuInteropDevice
     public static bool TryGetDeviceRemovalReason(out int code)
     {
         code = 0;
-        var device = _device;
-        if (device is null) return false;
+        using var lease = AcquireUsage();
+        if (lease is null) return false;
         try
         {
-            var reason = device.DeviceRemovedReason;
+            var reason = lease.Device.DeviceRemovedReason;
             code = reason.Code;
             return reason.Failure;
         }
@@ -40,14 +76,13 @@ internal static class GpuInteropDevice
     }
 
     internal static void QueueRetirement(Action release, Task? barrier,
-        long bytes, string kind)
+        long bytes, string kind, long generation)
     {
         ArgumentNullException.ThrowIfNull(release);
         barrier ??= Task.CompletedTask;
         var count = Interlocked.Increment(ref _pendingRetirements);
         var queuedBytes = Interlocked.Add(ref _pendingRetirementBytes, Math.Max(0, bytes));
-        EnsureRetirementWorker();
-        var retirement = new Retirement(release, Math.Max(0, bytes), kind);
+        var retirement = new Retirement(release, Math.Max(0, bytes), kind, generation);
         if (barrier.IsCompleted)
         {
             EnqueueReadyRetirement(retirement);
@@ -64,24 +99,30 @@ internal static class GpuInteropDevice
                 $"GPU retirement queued: pending={count}; bytes={queuedBytes}; kind={kind}");
     }
 
-    private static void EnsureRetirementWorker()
+    private static RetirementLane EnsureRetirementLane(long generation)
     {
-        if (Interlocked.Exchange(ref _retirementWorkerStarted, 1) != 0) return;
-        _ = Task.Run(ProcessRetirementsAsync);
+        var lane = RetirementLanes.GetOrAdd(generation, static _ => new RetirementLane());
+        if (Interlocked.Exchange(ref lane.Started, 1) == 0)
+            _ = Task.Run(() => ProcessRetirementsAsync(lane));
+        return lane;
     }
 
     private static void EnqueueReadyRetirement(Retirement retirement)
     {
-        RetirementQueue.Enqueue(retirement);
-        RetirementSignal.Release();
+        var lane = EnsureRetirementLane(retirement.Generation);
+        lane.Queue.Enqueue(retirement);
+        lane.Signal.Release();
     }
 
-    private static async Task ProcessRetirementsAsync()
+    private static async Task ProcessRetirementsAsync(RetirementLane lane)
     {
         while (true)
         {
-            await RetirementSignal.WaitAsync().ConfigureAwait(false);
-            if (!RetirementQueue.TryDequeue(out var item)) continue;
+            await lane.Signal.WaitAsync().ConfigureAwait(false);
+            if (!lane.Queue.TryDequeue(out var item)) continue;
+            var completed = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            _ = WatchRetirementAsync(item, completed.Task);
             try
             {
                 item.Release();
@@ -93,6 +134,7 @@ internal static class GpuInteropDevice
             }
             finally
             {
+                completed.TrySetResult();
                 var bytes = Interlocked.Add(ref _pendingRetirementBytes, -item.Bytes);
                 var count = Interlocked.Decrement(ref _pendingRetirements);
                 if (count == 0)
@@ -102,22 +144,43 @@ internal static class GpuInteropDevice
         }
     }
 
+    private static async Task WatchRetirementAsync(Retirement item, Task completed)
+    {
+        if (await Task.WhenAny(completed, Task.Delay(TimeSpan.FromSeconds(10))) == completed)
+            return;
+        ExtendedDiagnostics.Breadcrumb(
+            $"GPU retirement stalled: generation={item.Generation}; kind={item.Kind}; " +
+            $"bytes={item.Bytes}; pending={PendingRetirements}");
+    }
+
     public static ID3D11Device? Device
     {
         get
         {
             EnsureCreated();
-            return _device;
+            return _currentDevice?.Device;
+        }
+    }
+
+    public static DeviceUsageLease? AcquireUsage()
+    {
+        EnsureCreated();
+        lock (Gate)
+        {
+            var holder = _currentDevice;
+            if (holder is null || holder.Retired) return null;
+            holder.Users++;
+            return new DeviceUsageLease(holder);
         }
     }
 
     public static bool EnsureCreated()
     {
         if (Volatile.Read(ref _initializationState) != 0)
-            return _device is not null;
+            return _currentDevice is not null;
         lock (Gate)
         {
-            if (_initializationState != 0) return _device is not null;
+            if (_initializationState != 0) return _currentDevice is not null;
             try
             {
                 var levels = new[]
@@ -125,38 +188,66 @@ internal static class GpuInteropDevice
                     FeatureLevel.Level_11_1, FeatureLevel.Level_11_0,
                     FeatureLevel.Level_10_1, FeatureLevel.Level_10_0
                 };
-                _device = D3D11CreateDevice(
+                var device = D3D11CreateDevice(
                     DriverType.Hardware, DeviceCreationFlags.BgraSupport,
                     levels[0], levels[1], levels[2], levels[3]);
+                _currentDevice = new DeviceHolder(device, _generation);
             }
-            catch { _device = null; }
+            catch { _currentDevice = null; }
             finally { Volatile.Write(ref _initializationState, 1); }
-            return _device is not null;
+            return _currentDevice is not null;
         }
     }
 
     public static bool RecreateAfterDeviceLoss()
     {
-        ID3D11Device? removedDevice;
+        DeviceHolder? removedDevice;
         lock (Gate)
         {
-            removedDevice = _device;
-            _device = null;
+            removedDevice = _currentDevice;
+            _currentDevice = null;
             Volatile.Write(ref _initializationState, 0);
             Interlocked.Increment(ref _generation);
+            if (removedDevice is not null) removedDevice.Retired = true;
         }
-        try { removedDevice?.Dispose(); }
-        catch { }
+        if (removedDevice is not null) QueueDeviceDisposalIfReady(removedDevice);
         return EnsureCreated();
+    }
+
+    private static void ReleaseDeviceUsage(DeviceHolder holder)
+    {
+        lock (Gate)
+        {
+            if (holder.Users > 0) holder.Users--;
+        }
+        QueueDeviceDisposalIfReady(holder);
+    }
+
+    private static void QueueDeviceDisposalIfReady(DeviceHolder holder)
+    {
+        lock (Gate)
+        {
+            if (!holder.Retired || holder.Users != 0 || holder.DisposalQueued) return;
+            holder.DisposalQueued = true;
+        }
+        QueueRetirement(holder.Device.Dispose, Task.CompletedTask, 0,
+            "D3D11 device", holder.Generation);
     }
 
     public static ID3D11Texture2D? CreateTexture(
         int width, int height, bool renderTarget = false)
     {
-        if (Device is not { } device || width <= 0 || height <= 0) return null;
+        using var usage = AcquireUsage();
+        return usage is null ? null : CreateTexture(usage, width, height, renderTarget);
+    }
+
+    public static ID3D11Texture2D? CreateTexture(DeviceUsageLease usage,
+        int width, int height, bool renderTarget = false)
+    {
+        if (width <= 0 || height <= 0) return null;
         try
         {
-            return device.CreateTexture2D(new Texture2DDescription
+            return usage.Device.CreateTexture2D(new Texture2DDescription
             {
                 Width = (uint)width,
                 Height = (uint)height,
@@ -177,7 +268,8 @@ internal static class GpuInteropDevice
     public static unsafe GpuRenderedImage? CreateImageFromBgra(
         byte[] pixels, int width, int height)
     {
-        if (Device is not { } device || width <= 0 || height <= 0) return null;
+        using var usage = AcquireUsage();
+        if (usage is null || width <= 0 || height <= 0) return null;
         var rowPitch = checked(width * 4);
         if (pixels.Length < checked(rowPitch * height)) return null;
         ID3D11Texture2D? texture = null;
@@ -200,9 +292,9 @@ internal static class GpuInteropDevice
                     CPUAccessFlags = CpuAccessFlags.None,
                     MiscFlags = ResourceOptionFlags.None
                 };
-                texture = device.CreateTexture2D(description, initial);
+                texture = usage.Device.CreateTexture2D(description, initial);
                 var result = new GpuRenderedImage(
-                    texture, IntPtr.Zero, width, height, _ => { });
+                    texture, IntPtr.Zero, width, height, _ => { }, usage);
                 texture = null;
                 return result;
             }
@@ -223,6 +315,7 @@ internal sealed class GpuRenderedImage : IDisposable
 
     private readonly object _lifetimeGate = new();
     private readonly Action<IntPtr> _unregister;
+    private GpuInteropDevice.DeviceUsageLease? _deviceUsage;
     private IntPtr _cudaResource;
     private int _usageCount;
     private bool _retirementRequested;
@@ -233,16 +326,21 @@ internal sealed class GpuRenderedImage : IDisposable
     public ID3D11Texture2D Texture { get; }
     public int Width { get; }
     public int Height { get; }
+    public long DeviceGeneration { get; }
     public long Bytes => (long)Width * Height * 4;
     public byte[]? TakeEncodedJpeg() => Interlocked.Exchange(ref _encodedJpeg, null);
 
     internal GpuRenderedImage(ID3D11Texture2D texture, IntPtr cudaResource,
-        int width, int height, Action<IntPtr> unregister, byte[]? encodedJpeg = null)
+        int width, int height, Action<IntPtr> unregister,
+        GpuInteropDevice.DeviceUsageLease deviceUsage,
+        byte[]? encodedJpeg = null)
     {
         Texture = texture;
         _cudaResource = cudaResource;
         Width = width;
         Height = height;
+        DeviceGeneration = deviceUsage.Generation;
+        _deviceUsage = deviceUsage.Duplicate();
         _unregister = unregister;
         _encodedJpeg = encodedJpeg;
     }
@@ -307,8 +405,9 @@ internal sealed class GpuRenderedImage : IDisposable
                 try { _unregister(resource); }
                 catch { }
             }
-            Texture.Dispose();
-        }, _retirementBarrier, Bytes, "GpuRenderedImage");
+            try { Texture.Dispose(); }
+            finally { Interlocked.Exchange(ref _deviceUsage, null)?.Dispose(); }
+        }, _retirementBarrier, Bytes, "GpuRenderedImage", DeviceGeneration);
     }
 
     ~GpuRenderedImage() => RetireAfter(Task.CompletedTask);

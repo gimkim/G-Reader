@@ -183,7 +183,7 @@ internal sealed class PdfiumDocumentRenderer : IPdfDocumentRenderer
             writer.Write(command);
             writer.Write(_path);
             payload?.Invoke(writer);
-        }, response), background, cancellationToken);
+        }, response, cancellationToken, background), background, cancellationToken);
         var elapsed = Environment.TickCount64 - started;
         if (elapsed >= 750)
             ExtendedDiagnostics.Breadcrumb(

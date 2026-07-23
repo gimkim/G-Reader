@@ -355,27 +355,56 @@ internal sealed partial class ThumbnailGridView : Panel
     }
 
     public ThumbnailFolderEntry[] GetBrowseEntries() => _folders.ToArray();
+    public ThumbnailFolderEntry[] GetBrowseEntriesSnapshot() => _folders;
 
     public ThumbnailFolderEntry? GetBrowseEntry(int item) =>
         item >= 0 && item < _folders.Length ? _folders[item] : null;
 
     public ThumbnailPreviewWorkItem[] GetPreviewPriorityOrder()
     {
-        if (ItemCount == 0) return [];
+        return BuildPreviewPriorityOrder(ItemCount, _folders.Length,
+            _folders.Select(folder => folder.IsParent).ToArray(), ScrollOffset,
+            ClientSize.Height, _cellHeight, _imagesPerRow, _selectedItem,
+            CancellationToken.None);
+    }
+
+    public Task<ThumbnailPreviewWorkItem[]> GetPreviewPriorityOrderAsync(
+        CancellationToken cancellationToken)
+    {
+        // Capture control-owned state on the UI thread, then perform the O(N)
+        // ordering away from the message loop for very large folders/books.
+        var itemCount = ItemCount;
+        var folderCount = _folders.Length;
+        var parentFlags = _folders.Select(folder => folder.IsParent).ToArray();
+        var scrollOffset = ScrollOffset;
+        var clientHeight = ClientSize.Height;
+        var cellHeight = _cellHeight;
+        var imagesPerRow = _imagesPerRow;
+        var selectedItem = _selectedItem;
+        return Task.Run(() => BuildPreviewPriorityOrder(itemCount, folderCount,
+            parentFlags, scrollOffset, clientHeight, cellHeight, imagesPerRow,
+            selectedItem, cancellationToken), cancellationToken);
+    }
+
+    private static ThumbnailPreviewWorkItem[] BuildPreviewPriorityOrder(
+        int itemCount, int folderCount, bool[] parentFlags, int scrollOffset,
+        int clientHeight, int cellHeight, int imagesPerRow, int selectedItem,
+        CancellationToken cancellationToken)
+    {
+        if (itemCount == 0) return [];
         var firstVisible = Math.Clamp(
-            ScrollOffset / Math.Max(1, _cellHeight) * _imagesPerRow,
-            0, ItemCount - 1);
+            scrollOffset / Math.Max(1, cellHeight) * imagesPerRow,
+            0, itemCount - 1);
         var lastVisible = Math.Clamp(
-            ((ScrollOffset + Math.Max(1, ClientSize.Height) - 1) /
-                Math.Max(1, _cellHeight) + 1) * _imagesPerRow - 1,
-            firstVisible, ItemCount - 1);
-        var selectedItem = _selectedItem >= 0 && _selectedItem < ItemCount
-            ? _selectedItem : -1;
+            ((scrollOffset + Math.Max(1, clientHeight) - 1) /
+                Math.Max(1, cellHeight) + 1) * imagesPerRow - 1,
+            firstVisible, itemCount - 1);
+        selectedItem = selectedItem >= 0 && selectedItem < itemCount ? selectedItem : -1;
         var selectedIsVisible = selectedItem >= firstVisible && selectedItem <= lastVisible;
         var anchor = selectedItem >= 0
             ? selectedItem
             : (firstVisible + lastVisible) / 2;
-        var result = new List<int>(ItemCount);
+        var result = new List<int>(itemCount);
 
         void AddByDistance(int center, int minimum, int maximum,
             int skipMinimum = 1, int skipMaximum = 0)
@@ -385,6 +414,7 @@ internal sealed partial class ThumbnailGridView : Panel
             var maximumDistance = Math.Max(center - minimum, maximum - center);
             for (var distance = 0; distance <= maximumDistance; distance++)
             {
+                if ((distance & 1023) == 0) cancellationToken.ThrowIfCancellationRequested();
                 var left = center - distance;
                 if (left >= minimum && (left < skipMinimum || left > skipMaximum))
                     result.Add(left);
@@ -397,20 +427,19 @@ internal sealed partial class ThumbnailGridView : Panel
 
         if (selectedIsVisible)
         {
-            AddByDistance(selectedItem, 0, ItemCount - 1);
+            AddByDistance(selectedItem, 0, itemCount - 1);
         }
         else
         {
             // Off-screen selection must never delay the tiles the user can see.
             AddByDistance((firstVisible + lastVisible) / 2,
                 firstVisible, lastVisible);
-            AddByDistance(anchor, 0, ItemCount - 1, firstVisible, lastVisible);
+            AddByDistance(anchor, 0, itemCount - 1, firstVisible, lastVisible);
         }
-        return result.Where(item => item >= _folders.Length ||
-                !_folders[item].IsParent)
-            .Select(item => item < _folders.Length
+        return result.Where(item => item >= folderCount || !parentFlags[item])
+            .Select(item => item < folderCount
                 ? new ThumbnailPreviewWorkItem(true, item)
-                : new ThumbnailPreviewWorkItem(false, item - _folders.Length))
+                : new ThumbnailPreviewWorkItem(false, item - folderCount))
             .ToArray();
     }
 
@@ -467,6 +496,8 @@ internal sealed partial class ThumbnailGridView : Panel
         {
             if (generation != ContentGeneration || item < 0 || item >= _folders.Length)
             { preview.Dispose(); return; }
+            if (preview.DeviceGeneration != GpuInteropDevice.Generation)
+            { preview.Dispose(); return; }
             if (fastPreview) _gpuBrowseFastPreviewCache.AddOwned(item, size, preview);
             else _gpuBrowseFullPreviewCache.AddOwned(item, size, preview);
         }
@@ -492,6 +523,8 @@ internal sealed partial class ThumbnailGridView : Panel
         lock (_contentGate)
         {
             if (generation != ContentGeneration || page < 0 || page >= _pageCount)
+            { thumbnail.Dispose(); return; }
+            if (thumbnail.DeviceGeneration != GpuInteropDevice.Generation)
             { thumbnail.Dispose(); return; }
             if (fastPreview) _gpuFastPreviewCache.AddOwned(page, size, thumbnail);
             else _gpuFullCache.AddOwned(page, size, thumbnail);

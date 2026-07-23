@@ -7,6 +7,8 @@ internal sealed class PageCache : IDisposable
         public Task<Bitmap> Task { get; } = task;
         public long Bytes { get; set; }
         public int ActiveReaders { get; set; }
+        public bool Retired { get; set; }
+        public bool Disposed { get; set; }
     }
 
     private readonly object _gate = new();
@@ -15,6 +17,7 @@ internal sealed class PageCache : IDisposable
     private readonly System.Collections.Concurrent.ConcurrentDictionary<int, long> _pageBytes = [];
     private CancellationTokenSource _lifetime = new();
     private long _cachedBytes;
+    private bool _disposed;
 
     public PageCache(Func<int, CancellationToken, Bitmap> loader)
     {
@@ -90,7 +93,9 @@ internal sealed class PageCache : IDisposable
         {
             var bitmap = await item.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
             RecordLoaded(index, item, bitmap);
-            _lifetime.Token.ThrowIfCancellationRequested();
+            lock (_gate)
+                if (item.Retired) throw new OperationCanceledException(
+                    "The page cache entry was retired.", cancellationToken);
             return await Task.Run(() =>
             {
                 lock (bitmap) return new Bitmap(bitmap);
@@ -98,7 +103,7 @@ internal sealed class PageCache : IDisposable
         }
         finally
         {
-            lock (_gate) item.ActiveReaders--;
+            ReleaseReader(item);
         }
     }
 
@@ -119,7 +124,8 @@ internal sealed class PageCache : IDisposable
         CacheItem? item;
         lock (_gate)
         {
-            if (!_items.TryGetValue(index, out item) || !item.Task.IsCompletedSuccessfully)
+            if (_disposed || !_items.TryGetValue(index, out item) || item.Retired ||
+                !item.Task.IsCompletedSuccessfully)
                 return null;
             item.ActiveReaders++;
         }
@@ -134,7 +140,7 @@ internal sealed class PageCache : IDisposable
         }
         finally
         {
-            lock (_gate) item.ActiveReaders--;
+            ReleaseReader(item);
         }
     }
 
@@ -193,8 +199,11 @@ internal sealed class PageCache : IDisposable
         CacheItem[] items;
         lock (_gate)
         {
+            if (_disposed) return;
+            _disposed = true;
             lifetime = _lifetime;
             items = _items.Values.ToArray();
+            foreach (var item in items) item.Retired = true;
             _items.Clear();
             _pageBytes.Clear();
             _cachedBytes = 0;
@@ -202,18 +211,39 @@ internal sealed class PageCache : IDisposable
         try { lifetime.Cancel(); }
         catch (ObjectDisposedException) { }
 
-        var completed = items.Where(item => item.Task.IsCompletedSuccessfully).ToArray();
+        List<Bitmap> completed = [];
+        foreach (var item in items.Where(item => item.Task.IsCompletedSuccessfully))
+        {
+            lock (_gate)
+            {
+                if (item.ActiveReaders == 0 && !item.Disposed)
+                {
+                    item.Disposed = true;
+                    completed.Add(item.Task.Result);
+                }
+            }
+        }
         foreach (var item in items.Where(item => !item.Task.IsCompletedSuccessfully))
         {
             _ = item.Task.ContinueWith(task =>
             {
-                if (task.IsCompletedSuccessfully) DisposeBitmap(task.Result);
+                if (!task.IsCompletedSuccessfully) return;
+                Bitmap? bitmap = null;
+                lock (_gate)
+                {
+                    if (item.ActiveReaders == 0 && !item.Disposed)
+                    {
+                        item.Disposed = true;
+                        bitmap = task.Result;
+                    }
+                }
+                if (bitmap is not null) DisposeBitmap(bitmap);
             }, TaskScheduler.Default);
         }
-        if (completed.Length > 0)
+        if (completed.Count > 0)
             _ = Task.Run(() =>
             {
-                foreach (var item in completed) DisposeBitmap(item.Task.Result);
+                foreach (var bitmap in completed) DisposeBitmap(bitmap);
             });
         lifetime.Dispose();
     }
@@ -222,6 +252,7 @@ internal sealed class PageCache : IDisposable
     {
         lock (_gate)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             if (_items.TryGetValue(index, out var existing) &&
                 !existing.Task.IsFaulted && !existing.Task.IsCanceled)
             {
@@ -247,7 +278,7 @@ internal sealed class PageCache : IDisposable
     {
         lock (_gate)
         {
-            if (item.Bytes != 0) return;
+            if (_disposed || item.Retired || item.Bytes != 0) return;
             item.Bytes = EstimateBytes(bitmap);
             _cachedBytes += item.Bytes;
             _pageBytes[index] = item.Bytes;
@@ -260,6 +291,22 @@ internal sealed class PageCache : IDisposable
     private static void DisposeBitmap(Bitmap bitmap)
     {
         lock (bitmap) bitmap.Dispose();
+    }
+
+    private void ReleaseReader(CacheItem item)
+    {
+        Bitmap? dispose = null;
+        lock (_gate)
+        {
+            if (item.ActiveReaders > 0) item.ActiveReaders--;
+            if (item.ActiveReaders == 0 && item.Retired &&
+                item.Task.IsCompletedSuccessfully && !item.Disposed)
+            {
+                item.Disposed = true;
+                dispose = item.Task.Result;
+            }
+        }
+        if (dispose is not null) DisposeBitmap(dispose);
     }
 
 }

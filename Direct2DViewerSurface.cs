@@ -62,6 +62,7 @@ internal sealed class Direct2DViewerSurface : Control
     private readonly LinkedList<GpuRenderedImage> _nativeGpuLru = [];
     private ID2D1HwndRenderTarget? _renderTarget;
     private ID2D1Device? _d2dDevice;
+    private GpuInteropDevice.DeviceUsageLease? _sharedDeviceUsage;
     private ID2D1DeviceContext? _deviceContext;
     private IDXGISwapChain1? _swapChain;
     private ID2D1Bitmap1? _swapChainTarget;
@@ -208,6 +209,11 @@ internal sealed class Direct2DViewerSurface : Control
     public void PresentAnimatedPageGpu(
         bool rightPage, GpuRenderedImage frame, int rotation)
     {
+        if (frame.DeviceGeneration != GpuInteropDevice.Generation)
+        {
+            frame.Dispose();
+            return;
+        }
         EnsureRenderTarget();
         if (_deviceContext is null)
         {
@@ -464,7 +470,9 @@ internal sealed class Direct2DViewerSurface : Control
 
     private bool TryCreateDeviceContextTarget()
     {
-        if (GpuInteropDevice.Device is not { } d3dDevice) return false;
+        var deviceUsage = GpuInteropDevice.AcquireUsage();
+        if (deviceUsage is null) return false;
+        var d3dDevice = deviceUsage.Device;
         try
         {
             using var dxgiDevice = d3dDevice.QueryInterface<IDXGIDevice>();
@@ -487,7 +495,9 @@ internal sealed class Direct2DViewerSurface : Control
                     d3dDevice, Handle, description);
             }
             RecreateSwapChainTarget(resize: false);
-            _deviceGeneration = GpuInteropDevice.Generation;
+            _sharedDeviceUsage = deviceUsage;
+            deviceUsage = null;
+            _deviceGeneration = _sharedDeviceUsage.Generation;
             return _swapChainTarget is not null;
         }
         catch (Exception exception)
@@ -497,6 +507,7 @@ internal sealed class Direct2DViewerSurface : Control
             DisposeDeviceContextTarget();
             return false;
         }
+        finally { deviceUsage?.Dispose(); }
     }
 
     private void RecreateSwapChainTarget(bool resize)
@@ -564,7 +575,8 @@ internal sealed class Direct2DViewerSurface : Control
 
     private ID2D1Bitmap? GetOrCreateGpuBitmap(GpuRenderedImage? source)
     {
-        if (source is null || _deviceContext is null) return null;
+        if (source is null || _deviceContext is null ||
+            source.DeviceGeneration != GpuInteropDevice.Generation) return null;
         if (_nativeGpuCache.TryGetValue(source, out var cached))
         {
             _nativeGpuLru.Remove(cached.LruNode);
@@ -929,6 +941,8 @@ internal sealed class Direct2DViewerSurface : Control
         _deviceContext = null;
         _d2dDevice?.Dispose();
         _d2dDevice = null;
+        _sharedDeviceUsage?.Dispose();
+        _sharedDeviceUsage = null;
         _deviceGeneration = -1;
     }
 

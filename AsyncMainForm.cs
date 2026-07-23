@@ -963,6 +963,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private async Task ShowPageAsync()
     {
         if (_book is null || _cache is null || _book.Pages.Count == 0) return;
+        PersistentPreviewCache.NotifyUserActivity();
         ExtendedDiagnostics.Breadcrumb(
             $"Full-view request started: page={_pageIndex}; source={_book.SourcePath}; " +
             $"gpuRetirements={GpuInteropDevice.PendingRetirements}; " +
@@ -1017,14 +1018,15 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             // A grid thumbnail is already decoded and tiny. Publish it before
             // even the reduced JPEG pass so navigation has immediate visual
             // feedback when this page was previously seen in Thumbnail view.
-            await ShowThumbnailPlaceholderAsync(
+            var thumbnailPlaceholderShown = await ShowThumbnailPlaceholderAsync(
                 book, firstIndex, secondCandidate, cancellation.Token);
             cancellation.Token.ThrowIfCancellationRequested();
             // Let the reduced JPEG decode finish before starting the 45MP source
             // decode, otherwise the full decode competes for memory bandwidth and
             // defeats the purpose of an immediate preview.
-            await ShowImmediateDecodePreviewAsync(
-                book, firstIndex, secondCandidate, cancellation.Token);
+            if (!thumbnailPlaceholderShown)
+                await ShowImmediateDecodePreviewAsync(
+                    book, firstIndex, secondCandidate, cancellation.Token);
             cancellation.Token.ThrowIfCancellationRequested();
 
             var directAutoSingle = _doublePage && _autoSingleLandscape &&
@@ -1305,7 +1307,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         }
     }
 
-    private async Task ShowThumbnailPlaceholderAsync(
+    private async Task<bool> ShowThumbnailPlaceholderAsync(
         Book book, int firstIndex, int secondIndex,
         CancellationToken cancellationToken)
     {
@@ -1335,7 +1337,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             var loaded = await AwaitPreviewTasksOwnedAsync([firstTask, secondTask]);
             first = loaded[0];
             second = loaded[1];
-            if (first is null) return;
+            if (first is null) return false;
 
             _landscapePages[firstIndex] = first.Width > first.Height;
             if (second is not null && secondIndex >= 0)
@@ -1348,18 +1350,20 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 second = null;
             }
             cancellationToken.ThrowIfCancellationRequested();
-            if (_book != book || _pageIndex != firstIndex || !_viewer.Visible) return;
+            if (_book != book || _pageIndex != firstIndex || !_viewer.Visible) return false;
             _viewer.PresentImmediatePreview(
                 first, second, firstIndex, autoSingle ? -1 : secondIndex,
                 refitAfterPendingLayout: true);
             first = null;
             second = null;
+            return true;
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException) { return false; }
         catch (Exception exception)
         {
             System.Diagnostics.Debug.WriteLine(
                 $"Thumbnail placeholder failed: {exception}");
+            return false;
         }
         finally { DisposeBitmapsInBackground(first, second); }
     }
@@ -1483,7 +1487,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 int center;
                 lock (_warmStateGate) center = _requestedWarmCenter;
                 if (!immediate)
-                    await Task.Delay(220, cancellationToken).ConfigureAwait(false);
+                    await Task.Delay(650, cancellationToken).ConfigureAwait(false);
                 immediate = false;
                 if (Volatile.Read(ref _requestedWarmCenter) != center) continue;
                 if (!rebuildRenderContext) ScheduleRelaxedCacheTrim(cache);
@@ -1538,8 +1542,9 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             ? _viewer.GetStaleCachedPages(context.Version)
             : null;
         var workerCount = PrecacheWorkerCount;
-        var dispatchCount = Math.Max(
-            workerCount, RenderWorkScheduler.BatchCodecConcurrency);
+        // Keep idle warming incremental. A navigation/resize cancellation can
+        // now drain at most four active renders instead of a full CPU-wide batch.
+        var dispatchCount = Math.Clamp(workerCount, 1, 4);
         Volatile.Write(ref _activePrecacheWorkerCount, dispatchCount);
         using var genericDecodeSlots = new SemaphoreSlim(workerCount);
         await Parallel.ForEachAsync(
@@ -2164,14 +2169,23 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private async Task LoadThumbnailsProgressivelyAsync()
     {
         if (_book is null || !_thumbnailMode) return;
+        PersistentPreviewCache.NotifyUserActivity();
         CancelThumbnailWork();
         var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_bookCancellation!.Token);
         _thumbnailCancellation = cancellation;
         var book = _book;
         var targetSize = _thumbnailGrid.RenderTargetSize;
         var thumbnailGeneration = _thumbnailGrid.ContentGeneration;
-        var browseEntries = _thumbnailGrid.GetBrowseEntries();
-        var orderedWork = _thumbnailGrid.GetPreviewPriorityOrder();
+        var browseEntries = _thumbnailGrid.GetBrowseEntriesSnapshot();
+        ThumbnailPreviewWorkItem[] orderedWork;
+        try
+        {
+            orderedWork = await _thumbnailGrid.GetPreviewPriorityOrderAsync(
+                cancellation.Token);
+        }
+        catch (OperationCanceledException) { return; }
+        if (cancellation.IsCancellationRequested || !ReferenceEquals(_book, book) ||
+            !_thumbnailMode) return;
         var browseWorkLimit = _thumbnailGrid.BrowsePreviewWorkLimit;
         if (browseEntries.Length > browseWorkLimit)
         {
@@ -2194,56 +2208,6 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         using var genericFastSlots = new SemaphoreSlim(
             Math.Clamp(_performance.FastPreviewWorkerCount, 1, 64));
         using var genericFullSlots = new SemaphoreSlim(PrecacheWorkerCount);
-
-        async Task GenerateNonJpegThumbnailPairAsync(
-            int page, CancellationToken workerToken)
-        {
-            Bitmap? fast = null;
-            Bitmap? full = null;
-            using var source = await LoadThumbnailSourceAsync(
-                book, page, targetSize, oversample: 2f, workerToken)
-                .ConfigureAwait(false);
-            try
-            {
-                fast = await RenderWorkScheduler.RunFastAsync(
-                    threads => AsyncViewerPanel.CreateFastThumbnail(
-                        source, targetSize, threads, workerToken), workerToken)
-                    .ConfigureAwait(false);
-                workerToken.ThrowIfCancellationRequested();
-                if (!ReferenceEquals(_book, book) || !_thumbnailMode) return;
-                PersistentPreviewCache.StoreCopyInBackground(
-                    PersistentPreviewKind.ThumbnailFast, book, page, targetSize,
-                    _rotations.GetValueOrDefault(page), quality: 0, fast);
-                _thumbnailGrid.SetThumbnail(page, targetSize, fast, fastPreview: true,
-                    thumbnailGeneration);
-                fast = null;
-                _thumbnailGrid.SetGenerationState(page, "Generating Lanczos...");
-
-                await genericFullSlots.WaitAsync(workerToken).ConfigureAwait(false);
-                try
-                {
-                    full = await RenderWorkScheduler.RunFullAsync(
-                        () => AsyncViewerPanel.CreateLanczosThumbnail(
-                            source, targetSize, _settings.LanczosQuality, workerToken),
-                        workerToken).ConfigureAwait(false);
-                }
-                finally { genericFullSlots.Release(); }
-                workerToken.ThrowIfCancellationRequested();
-                if (!ReferenceEquals(_book, book) || !_thumbnailMode) return;
-                PersistentPreviewCache.StoreCopyInBackground(
-                    PersistentPreviewKind.ThumbnailFinal, book, page, targetSize,
-                    _rotations.GetValueOrDefault(page), _settings.LanczosQuality, full);
-                _thumbnailGrid.SetThumbnail(page, targetSize, full, fastPreview: false,
-                    thumbnailGeneration);
-                full = null;
-                _thumbnailGrid.SetGenerationState(page, null);
-            }
-            finally
-            {
-                fast?.Dispose();
-                full?.Dispose();
-            }
-        }
 
         async Task<bool> RunPassAsync(IEnumerable<int> phasePages, bool fastPreview)
         {
@@ -2368,15 +2332,6 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                             {
                                 _thumbnailGrid.SetGenerationState(page, "Loading preview...");
                                 _ = UpdateThumbnailColorProfileAsync(book, work.Index, workerToken);
-                                if (!encodedPage)
-                                {
-                                    await GenerateNonJpegThumbnailPairAsync(
-                                        page, workerToken).ConfigureAwait(false);
-                                    var pairedCurrent = Interlocked.Increment(ref loaded);
-                                    ReportThumbnailProgress(id, pairedCurrent, total,
-                                        $"Fast previews {pairedCurrent}/{total}");
-                                    return;
-                                }
                                 var thumbnail = await CreateThumbnailAsync(
                                     book, page, targetSize, fastPreview: true, workerToken)
                                     .ConfigureAwait(false);
@@ -2435,13 +2390,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                     {
                         workerToken.ThrowIfCancellationRequested();
                         var entry = browseEntries[work.Index];
-                        // The PDF fast pass already rasterized and composed all
-                        // four cover pages. Do not reopen the same document and
-                        // render those four pages again for a second folder tile.
-                        var pdfCoverReady = entry.IsPdf &&
-                            _thumbnailGrid.HasBrowseFastPreview(work.Index, targetSize);
-                        if (!_thumbnailGrid.HasBrowseFullPreview(work.Index, targetSize) &&
-                            !pdfCoverReady)
+                        if (!_thumbnailGrid.HasBrowseFullPreview(work.Index, targetSize))
                         {
                             var preview = await CreateBrowseThumbnailAsync(
                                 entry.Path, targetSize, fastPreview: false,
@@ -2491,6 +2440,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private void RequestVisibleThumbnailRefresh()
     {
+        PersistentPreviewCache.NotifyUserActivity();
         _visibleThumbnailRefreshPending = true;
         if (_visibleThumbnailRefreshRunning) return;
         _visibleThumbnailRefreshRunning = true;

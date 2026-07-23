@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Threading.Channels;
 
 namespace CDisplayEx.CSharp;
 
@@ -26,6 +27,16 @@ internal static class ExtendedDiagnostics
 
     private static readonly object FileGate = new();
     private static readonly ConcurrentDictionary<string, long> RecentErrors = new();
+    private static readonly Channel<string> LogLines = Channel.CreateBounded<string>(
+        new BoundedChannelOptions(4096)
+        {
+            // Fatal/hang paths drain pending lines synchronously before writing
+            // their terminal record, so the channel can temporarily have a
+            // second reader besides the normal background writer.
+            SingleReader = false,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.DropOldest
+        });
     private static readonly string DiagnosticsFolder = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "Fast Reader Viewer", "Diagnostics");
@@ -38,6 +49,7 @@ internal static class ExtendedDiagnostics
     private static string _uiContext = "UI not attached";
     private static string? _sessionLogPath;
     private static System.Windows.Forms.Timer? _heartbeatTimer;
+    private static int _logWriterStarted;
 
     public static string FolderPath => DiagnosticsFolder;
 
@@ -53,7 +65,11 @@ internal static class ExtendedDiagnostics
                     $"terminating={eventArgs.IsTerminating}; object={eventArgs.ExceptionObject}");
             TaskScheduler.UnobservedTaskException += (_, eventArgs) =>
                 LogException("Unobserved task exception", eventArgs.Exception);
-            AppDomain.CurrentDomain.ProcessExit += (_, _) => Write("SESSION", "Process exit");
+            AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+            {
+                Write("SESSION", "Process exit");
+                FlushPendingLogLines();
+            };
             var watchdog = new Thread(WatchdogLoop)
             {
                 IsBackground = true,
@@ -144,6 +160,9 @@ internal static class ExtendedDiagnostics
         var now = Environment.TickCount64;
         if (RecentErrors.TryGetValue(key, out var previous) && now - previous < 5000) return;
         RecentErrors[key] = now;
+        if (RecentErrors.Count > 2048)
+            foreach (var stale in RecentErrors.Where(pair => now - pair.Value > 60_000).Take(512))
+                RecentErrors.TryRemove(stale.Key, out _);
         Write("ERROR", $"{category}\n{detail}\n{exception}");
     }
 
@@ -151,7 +170,7 @@ internal static class ExtendedDiagnostics
         string? detail = null)
     {
         if (!_enabled) return;
-        Write("CRASH", $"{category}\n{detail}\n{exception}\n{CreateProcessSnapshot()}");
+        WriteCritical("CRASH", $"{category}\n{detail}\n{exception}\n{CreateProcessSnapshot()}");
         WriteDump("crash");
     }
 
@@ -173,7 +192,7 @@ internal static class ExtendedDiagnostics
             {
                 if (Interlocked.CompareExchange(ref _hangStarted, now, 0) == 0)
                 {
-                    Write("HANG", $"UI heartbeat stalled for {heartbeatAge} ms\n" +
+                    WriteCritical("HANG", $"UI heartbeat stalled for {heartbeatAge} ms\n" +
                         CreateProcessSnapshot());
                     WriteDump("hang");
                 }
@@ -270,12 +289,48 @@ internal static class ExtendedDiagnostics
         if (!_enabled) return;
         try
         {
+            EnsureLogWriter();
+            LogLines.Writer.TryWrite(FormatLine(category, message));
+        }
+        catch { }
+    }
+
+    private static string FormatLine(string category, string message) =>
+        $"[{DateTime.Now:O}] [{category}] [T{Environment.CurrentManagedThreadId}] " +
+        message.Replace("\0", "") + Environment.NewLine;
+
+    private static void EnsureLogWriter()
+    {
+        if (Interlocked.Exchange(ref _logWriterStarted, 1) != 0) return;
+        _ = Task.Run(ProcessLogLinesAsync);
+    }
+
+    private static async Task ProcessLogLinesAsync()
+    {
+        await foreach (var line in LogLines.Reader.ReadAllAsync())
+            AppendLine(line);
+    }
+
+    private static void AppendLine(string line)
+    {
+        try
+        {
             EnsureSessionLog();
-            var line = $"[{DateTime.Now:O}] [{category}] [T{Environment.CurrentManagedThreadId}] " +
-                message.Replace("\0", "") + Environment.NewLine;
             lock (FileGate) File.AppendAllText(_sessionLogPath!, line);
         }
         catch { }
+    }
+
+    private static void WriteCritical(string category, string message)
+    {
+        if (!_enabled) return;
+        FlushPendingLogLines();
+        AppendLine(FormatLine(category, message));
+    }
+
+    private static void FlushPendingLogLines()
+    {
+        while (LogLines.Reader.TryRead(out var line)) AppendLine(line);
     }
 
     private static void CleanupOldFiles()

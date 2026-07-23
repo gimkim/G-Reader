@@ -19,6 +19,8 @@ internal static class RenderWorkScheduler
     private static int _batchCodecConcurrency = 8;
     private static int _pendingFastWork;
     private static TaskCompletionSource _fastWorkDrained = CreateCompletedSignal();
+    private static readonly SemaphoreSlim InteractiveFullSlots = new(2, 2);
+    private static readonly SemaphoreSlim UrgentViewportSlots = new(1, 1);
 
     public static int FastCodecConcurrency =>
         Volatile.Read(ref _fastCodecConcurrency);
@@ -105,13 +107,20 @@ internal static class RenderWorkScheduler
         // The page currently on screen must never wait behind thumbnail work.
         // Registering it as fast work also keeps background Lanczos jobs behind it.
         RegisterFastWork();
+        var entered = false;
         try
         {
+            await InteractiveFullSlots.WaitAsync(cancellationToken).ConfigureAwait(false);
+            entered = true;
             return await Task.Run(
                 () => RunAtPriority(work, ThreadPriority.AboveNormal),
                 cancellationToken).ConfigureAwait(false);
         }
-        finally { UnregisterFastWork(); }
+        finally
+        {
+            if (entered) InteractiveFullSlots.Release();
+            UnregisterFastWork();
+        }
     }
 
     public static async Task<T> RunFastCodecAsync<T>(
@@ -137,13 +146,20 @@ internal static class RenderWorkScheduler
         // page-preview slots. It still registers as fast work so new batch
         // Lanczos jobs yield until the visible crop is ready.
         RegisterFastWork();
+        var entered = false;
         try
         {
+            await UrgentViewportSlots.WaitAsync(cancellationToken).ConfigureAwait(false);
+            entered = true;
             return await Task.Run(
                 () => RunAtPriority(work, ThreadPriority.AboveNormal),
                 cancellationToken).ConfigureAwait(false);
         }
-        finally { UnregisterFastWork(); }
+        finally
+        {
+            if (entered) UrgentViewportSlots.Release();
+            UnregisterFastWork();
+        }
     }
 
     private static void RegisterFastWork()

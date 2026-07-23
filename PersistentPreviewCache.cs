@@ -1,6 +1,9 @@
 using System.Drawing.Imaging;
+using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading.Channels;
 
 namespace CDisplayEx.CSharp;
 
@@ -28,16 +31,69 @@ internal static class PersistentPreviewCache
     private sealed record Configuration(
         string Root, long FullViewLimitBytes, long ThumbnailLimitBytes);
 
+    private sealed class CacheWrite : IDisposable
+    {
+        public required PersistentPreviewKind Kind { get; init; }
+        public required string Path { get; init; }
+        public required int Epoch { get; init; }
+        public Bitmap? Bitmap { get; init; }
+        public byte[]? Encoded { get; init; }
+        public long ReservedBytes { get; set; }
+        public void Dispose()
+        {
+            Bitmap?.Dispose();
+            if (ReservedBytes > 0)
+            {
+                Interlocked.Add(ref _queuedWriteBytes, -ReservedBytes);
+                ReservedBytes = 0;
+            }
+        }
+    }
+
+    private readonly record struct PagePreviewPathKey(
+        string Root, PersistentPreviewKind Kind, int PageIndex,
+        int WidthBucket, int HeightBucket, int Rotation, int Quality);
+    private readonly record struct BrowseSourceIdentity(
+        long Length, long ModifiedTicks, long CheckedTick);
+    private readonly record struct PendingWriteKey(string Path, int Epoch);
+
     private const long Megabyte = 1024L * 1024;
     private const long MaximumQuotaMB = 1024L * 1024;
     private const int WriterConcurrency = 2;
+    private const int WriterQueueCapacity = 96;
+    private const long MaximumQueuedWriteBytes = 256L * Megabyte;
     private static readonly SemaphoreSlim Writers = new(
         WriterConcurrency, WriterConcurrency);
+    private static readonly Channel<CacheWrite> WriterQueue =
+        Channel.CreateBounded<CacheWrite>(new BoundedChannelOptions(WriterQueueCapacity)
+        {
+            SingleReader = false,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.Wait
+        });
+    private static readonly ConcurrentDictionary<PendingWriteKey, byte> PendingWrites = [];
+    private static readonly ConditionalWeakTable<Book,
+        ConcurrentDictionary<PagePreviewPathKey, string>> PagePaths = new();
+    private static readonly ConcurrentDictionary<string, BrowseSourceIdentity>
+        BrowseIdentities = new(StringComparer.OrdinalIgnoreCase);
     private static Configuration _configuration = new(
         UserSettings.DefaultPersistentCachePath,
         4096L * Megabyte, 4096L * Megabyte);
     private static int _cleanupScheduled;
     private static long _lastCleanupTick;
+    private static long _lastUserActivityTick = Environment.TickCount64;
+    private static int _cacheEpoch;
+    private static long _queuedWriteBytes;
+    private static int _browseIdentityTrimScheduled;
+
+    static PersistentPreviewCache()
+    {
+        for (var index = 0; index < WriterConcurrency; index++)
+            _ = Task.Run(ProcessWritesAsync);
+    }
+
+    public static void NotifyUserActivity() =>
+        Volatile.Write(ref _lastUserActivityTick, Environment.TickCount64);
 
     public static void Configure(
         string? root, int fullViewLimitMB, int thumbnailLimitMB)
@@ -52,6 +108,7 @@ internal static class PersistentPreviewCache
 
     public static async Task<ClearResult> ClearAllAsync(string? root)
     {
+        Interlocked.Increment(ref _cacheEpoch);
         var cacheRoot = Path.Combine(ResolveRoot(root), "v2");
         var acquired = 0;
         try
@@ -214,8 +271,6 @@ internal static class PersistentPreviewCache
             using var image = Image.FromStream(stream, useEmbeddedColorManagement: false,
                 validateImageData: false);
             bitmap = new Bitmap(image);
-            try { File.SetLastAccessTimeUtc(path, DateTime.UtcNow); }
-            catch { }
             return true;
         }
         catch
@@ -248,7 +303,13 @@ internal static class PersistentPreviewCache
             return;
         }
 
-        StoreOwnedCopyInBackground(kind, path, copy);
+        EnqueueWrite(new CacheWrite
+        {
+            Kind = kind,
+            Path = path,
+            Epoch = Volatile.Read(ref _cacheEpoch),
+            Bitmap = copy
+        });
     }
 
     public static void StoreEncodedInBackground(
@@ -260,60 +321,86 @@ internal static class PersistentPreviewCache
         string path;
         try { path = GetPath(configuration, kind, book, pageIndex, bounds, rotation, quality); }
         catch { return; }
-        _ = Task.Run(async () =>
+        EnqueueWrite(new CacheWrite
+        {
+            Kind = kind,
+            Path = path,
+            Epoch = Volatile.Read(ref _cacheEpoch),
+            Encoded = encodedJpeg
+        });
+    }
+
+    private static void EnqueueWrite(CacheWrite write)
+    {
+        var pendingKey = new PendingWriteKey(write.Path.ToUpperInvariant(), write.Epoch);
+        if (!PendingWrites.TryAdd(pendingKey, 0))
+        {
+            write.Dispose();
+            return;
+        }
+        var estimatedBytes = write.Encoded?.LongLength ??
+            (write.Bitmap is { } bitmap
+                ? (long)bitmap.Width * bitmap.Height * 4
+                : 0L);
+        if (estimatedBytes > 0)
+        {
+            var queuedBytes = Interlocked.Add(ref _queuedWriteBytes, estimatedBytes);
+            if (queuedBytes > MaximumQueuedWriteBytes)
+            {
+                Interlocked.Add(ref _queuedWriteBytes, -estimatedBytes);
+                PendingWrites.TryRemove(pendingKey, out _);
+                write.Dispose();
+                return;
+            }
+            write.ReservedBytes = estimatedBytes;
+        }
+        if (!WriterQueue.Writer.TryWrite(write))
+        {
+            PendingWrites.TryRemove(pendingKey, out _);
+            write.Dispose();
+        }
+    }
+
+    private static async Task ProcessWritesAsync()
+    {
+        await foreach (var write in WriterQueue.Reader.ReadAllAsync().ConfigureAwait(false))
         {
             await Writers.WaitAsync().ConfigureAwait(false);
             try
             {
-                if (File.Exists(path)) return;
-                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-                var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                if (write.Epoch != Volatile.Read(ref _cacheEpoch) || File.Exists(write.Path))
+                    continue;
+                Directory.CreateDirectory(Path.GetDirectoryName(write.Path)!);
+                var temporary = write.Path + "." + Guid.NewGuid().ToString("N") + ".tmp";
                 try
                 {
-                    await File.WriteAllBytesAsync(temporary, encodedJpeg).ConfigureAwait(false);
-                    try { File.Move(temporary, path, overwrite: false); }
-                    catch (IOException) when (File.Exists(path)) { }
+                    if (write.Encoded is { Length: > 0 } encoded)
+                        await File.WriteAllBytesAsync(temporary, encoded).ConfigureAwait(false);
+                    else if (write.Bitmap is { } bitmap)
+                        SaveImage(bitmap, temporary, write.Kind,
+                            write.Kind == PersistentPreviewKind.ThumbnailFinal ? 92L : 82L);
+                    else
+                        continue;
+                    try { File.Move(temporary, write.Path, overwrite: false); }
+                    catch (IOException) when (File.Exists(write.Path)) { }
                 }
                 finally { try { File.Delete(temporary); } catch { } }
                 ScheduleCleanup(force: false);
             }
-            catch { }
-            finally { Writers.Release(); }
-        });
-    }
-
-    private static void StoreOwnedCopyInBackground(
-        PersistentPreviewKind kind, string path, Bitmap copy)
-    {
-        _ = Task.Run(async () =>
-        {
-            await Writers.WaitAsync().ConfigureAwait(false);
-            try
+            catch (Exception exception)
             {
-                if (File.Exists(path)) return;
-                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-                var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-                try
-                {
-                    SaveImage(copy, temporary, kind,
-                        kind == PersistentPreviewKind.ThumbnailFinal ? 92L : 82L);
-                    try { File.Move(temporary, path, overwrite: false); }
-                    catch (IOException) when (File.Exists(path)) { }
-                }
-                finally
-                {
-                    try { File.Delete(temporary); }
-                    catch { }
-                }
-                ScheduleCleanup(force: false);
+                ExtendedDiagnostics.LogException(
+                    "Persistent preview cache write failed", exception,
+                    $"kind={write.Kind}; path={write.Path}");
             }
-            catch { }
             finally
             {
-                copy.Dispose();
                 Writers.Release();
+                PendingWrites.TryRemove(
+                    new PendingWriteKey(write.Path.ToUpperInvariant(), write.Epoch), out _);
+                write.Dispose();
             }
-        });
+        }
     }
 
     public static bool TryLoadBrowse(
@@ -334,8 +421,6 @@ internal static class PersistentPreviewCache
             using var image = Image.FromStream(stream, useEmbeddedColorManagement: false,
                 validateImageData: false);
             bitmap = new Bitmap(image);
-            try { File.SetLastAccessTimeUtc(path, DateTime.UtcNow); }
-            catch { }
             return true;
         }
         catch
@@ -366,50 +451,43 @@ internal static class PersistentPreviewCache
             copy.Dispose();
             return;
         }
-        StoreOwnedCopyInBackground(
-            fastPreview
+        EnqueueWrite(new CacheWrite
+        {
+            Kind = fastPreview
                 ? PersistentPreviewKind.BrowseThumbnailFast
                 : PersistentPreviewKind.BrowseThumbnailFinal,
-            path, copy);
+            Path = path,
+            Epoch = Volatile.Read(ref _cacheEpoch),
+            Bitmap = copy
+        });
     }
 
     private static string GetPath(
         Configuration configuration, PersistentPreviewKind kind,
         Book book, int pageIndex, Size bounds, int rotation, int quality)
     {
-        if ((uint)pageIndex >= (uint)book.Pages.Count)
-            throw new ArgumentOutOfRangeException(nameof(pageIndex));
-        var sourcePath = Path.GetFullPath(book.SourcePath);
-        var identityPath = Directory.Exists(sourcePath)
-            ? Path.Combine(sourcePath, book.Pages[pageIndex].Name)
-            : sourcePath;
-        var length = 0L;
-        var modifiedTicks = 0L;
-        try
-        {
-            var info = new FileInfo(identityPath);
-            length = info.Length;
-            modifiedTicks = info.LastWriteTimeUtc.Ticks;
-        }
-        catch { }
-
         var bucketUnit = kind == PersistentPreviewKind.FullView ? 256 : 32;
         var widthBucket = RoundUp(Math.Max(32, bounds.Width), bucketUnit);
         var heightBucket = RoundUp(Math.Max(32, bounds.Height), bucketUnit);
+        var normalizedRotation = NormalizeRotation(rotation);
+        var normalizedQuality = kind == PersistentPreviewKind.ThumbnailFinal ? quality : 0;
+        var key = new PagePreviewPathKey(configuration.Root, kind, pageIndex,
+            widthBucket, heightBucket, normalizedRotation, normalizedQuality);
+        return PagePaths.GetOrCreateValue(book).GetOrAdd(key, _ =>
+        {
+            var source = book.GetCacheSourceIdentity(pageIndex);
         // v3 invalidates previews produced before the nvJPEG RGBI/BGRI channel
         // order correction; keeping the same category lets quota cleanup remove
         // old v2 files normally.
-        var identity = string.Join('\n', "greader-preview-v3-color", kind, sourcePath,
-            book.Pages[pageIndex].Name, length, modifiedTicks,
-            NormalizeRotation(rotation), widthBucket, heightBucket,
-            kind == PersistentPreviewKind.ThumbnailFinal ? quality : 0,
-            GetPdfEngineIdentity(sourcePath));
-        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)))
-            .ToLowerInvariant();
-        var extension = IsBrowseKind(kind)
-            ? ".png" : ".jpg";
-        return Path.Combine(GetCategoryRoot(configuration, kind),
-            hash[..2], hash + extension);
+            var identity = string.Join('\n', "greader-preview-v3-color", kind,
+                source.SourcePath, source.PageName, source.Length, source.ModifiedTicks,
+                normalizedRotation, widthBucket, heightBucket, normalizedQuality,
+                GetPdfEngineIdentity(source.SourcePath));
+            var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)))
+                .ToLowerInvariant();
+            return Path.Combine(GetCategoryRoot(configuration, kind),
+                hash[..2], hash + ".jpg");
+        });
     }
 
     private static string GetCategoryRoot(
@@ -422,6 +500,29 @@ internal static class PersistentPreviewCache
         bool fastPreview, int quality)
     {
         sourcePath = Path.GetFullPath(sourcePath);
+        var source = GetBrowseSourceIdentity(sourcePath);
+        var widthBucket = RoundUp(Math.Max(32, bounds.Width), 32);
+        var heightBucket = RoundUp(Math.Max(32, bounds.Height), 32);
+        // Fast and Lanczos contact sheets are independent so a quick placeholder
+        // can never mask a completed full-quality disk entry.
+        var identity = string.Join('\n', "greader-browse-preview-v10-front-first",
+            fastPreview ? "fast" : "full", sourcePath,
+            source.Length, source.ModifiedTicks, widthBucket, heightBucket,
+            fastPreview ? 0 : quality, GetPdfEngineIdentity(sourcePath));
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)))
+            .ToLowerInvariant();
+        return Path.Combine(GetCategoryRoot(
+            configuration, fastPreview
+                ? PersistentPreviewKind.BrowseThumbnailFast
+                : PersistentPreviewKind.BrowseThumbnailFinal),
+            hash[..2], hash + ".jpg");
+    }
+
+    private static BrowseSourceIdentity GetBrowseSourceIdentity(string sourcePath)
+    {
+        var now = Environment.TickCount64;
+        if (BrowseIdentities.TryGetValue(sourcePath, out var cached) &&
+            now - cached.CheckedTick < 5000) return cached;
         var length = 0L;
         var modifiedTicks = 0L;
         try
@@ -436,21 +537,25 @@ internal static class PersistentPreviewCache
             }
         }
         catch { }
-        var widthBucket = RoundUp(Math.Max(32, bounds.Width), 32);
-        var heightBucket = RoundUp(Math.Max(32, bounds.Height), 32);
-        // Fast and Lanczos contact sheets are independent so a quick placeholder
-        // can never mask a completed full-quality disk entry.
-        var identity = string.Join('\n', "greader-browse-preview-v8-shallow-folder-cover",
-            fastPreview ? "fast" : "full", sourcePath,
-            length, modifiedTicks, widthBucket, heightBucket,
-            fastPreview ? 0 : quality, GetPdfEngineIdentity(sourcePath));
-        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)))
-            .ToLowerInvariant();
-        return Path.Combine(GetCategoryRoot(
-            configuration, fastPreview
-                ? PersistentPreviewKind.BrowseThumbnailFast
-                : PersistentPreviewKind.BrowseThumbnailFinal),
-            hash[..2], hash + ".png");
+        var identity = new BrowseSourceIdentity(length, modifiedTicks, now);
+        BrowseIdentities[sourcePath] = identity;
+        if (BrowseIdentities.Count > 16384 &&
+            Interlocked.Exchange(ref _browseIdentityTrimScheduled, 1) == 0)
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    var cutoff = Environment.TickCount64 - 30000;
+                    foreach (var pair in BrowseIdentities)
+                        if (pair.Value.CheckedTick < cutoff)
+                            BrowseIdentities.TryRemove(pair.Key, out _);
+                    if (BrowseIdentities.Count > 16384)
+                        foreach (var pair in BrowseIdentities.Take(8192))
+                            BrowseIdentities.TryRemove(pair.Key, out _);
+                }
+                finally { Volatile.Write(ref _browseIdentityTrimScheduled, 0); }
+            });
+        return identity;
     }
 
     private static long GetLimit(
@@ -476,11 +581,6 @@ internal static class PersistentPreviewCache
     private static void SaveImage(
         Bitmap bitmap, string path, PersistentPreviewKind kind, long quality)
     {
-        if (IsBrowseKind(kind))
-        {
-            bitmap.Save(path, ImageFormat.Png);
-            return;
-        }
         var codec = ImageCodecInfo.GetImageEncoders().FirstOrDefault(
             candidate => candidate.FormatID == ImageFormat.Jpeg.Guid);
         if (codec is null)
@@ -491,7 +591,19 @@ internal static class PersistentPreviewCache
         using var parameters = new EncoderParameters(1);
         parameters.Param[0] = new EncoderParameter(
             System.Drawing.Imaging.Encoder.Quality, quality);
-        bitmap.Save(path, codec, parameters);
+        if (!IsBrowseKind(kind))
+        {
+            bitmap.Save(path, codec, parameters);
+            return;
+        }
+        using var flattened = new Bitmap(bitmap.Width, bitmap.Height,
+            PixelFormat.Format24bppRgb);
+        using (var graphics = Graphics.FromImage(flattened))
+        {
+            graphics.Clear(Color.FromArgb(42, 45, 51));
+            graphics.DrawImageUnscaled(bitmap, 0, 0);
+        }
+        flattened.Save(path, codec, parameters);
     }
 
     private static bool IsBrowseKind(PersistentPreviewKind kind) =>
@@ -506,24 +618,33 @@ internal static class PersistentPreviewCache
             now - previous < TimeSpan.FromMinutes(10).TotalMilliseconds) return;
         if (Interlocked.Exchange(ref _cleanupScheduled, 1) != 0) return;
         Volatile.Write(ref _lastCleanupTick, now);
-        var configuration = Volatile.Read(ref _configuration);
-        _ = Task.Run(() =>
+        _ = Task.Run(async () =>
         {
             try
             {
-                TrimCategory(Path.Combine(configuration.Root, "v2", "full-view"),
+                while (Environment.TickCount64 - Volatile.Read(
+                           ref _lastUserActivityTick) < 5000)
+                    await Task.Delay(1000).ConfigureAwait(false);
+                var configuration = Volatile.Read(ref _configuration);
+                var more = TrimCategory(Path.Combine(configuration.Root, "v2", "full-view"),
                     configuration.FullViewLimitBytes);
-                TrimCategory(Path.Combine(configuration.Root, "v2", "thumbnails"),
+                more |= TrimCategory(Path.Combine(configuration.Root, "v2", "thumbnails"),
                     configuration.ThumbnailLimitBytes);
+                if (more)
+                {
+                    Volatile.Write(ref _lastCleanupTick, 0);
+                    await Task.Delay(1000).ConfigureAwait(false);
+                }
             }
             catch { }
             finally { Volatile.Write(ref _cleanupScheduled, 0); }
+            if (Volatile.Read(ref _lastCleanupTick) == 0) ScheduleCleanup(force: true);
         });
     }
 
-    private static void TrimCategory(string root, long limitBytes)
+    private static bool TrimCategory(string root, long limitBytes)
     {
-        if (!Directory.Exists(root)) return;
+        if (!Directory.Exists(root)) return false;
         var files = Directory.EnumerateFiles(root, "*.*", SearchOption.AllDirectories)
             .Where(path => Path.GetExtension(path).Equals(".jpg",
                     StringComparison.OrdinalIgnoreCase) ||
@@ -533,23 +654,26 @@ internal static class PersistentPreviewCache
                 try
                 {
                     var info = new FileInfo(path);
-                    return (Path: path, Size: info.Length, Accessed: info.LastAccessTimeUtc);
+                    return (Path: path, Size: info.Length, Accessed: info.LastWriteTimeUtc);
                 }
                 catch { return (Path: path, Size: 0L, Accessed: DateTime.MaxValue); }
             }).ToArray();
         var total = files.Sum(file => file.Size);
         var headroom = limitBytes <= 0 ? 0 : Math.Min(512L * Megabyte,
             Math.Max(64L * Megabyte, limitBytes / 8));
-        if (total <= limitBytes + headroom) return;
+        if (total <= limitBytes + headroom) return false;
+        var removed = 0;
         foreach (var file in files.OrderBy(file => file.Accessed))
         {
-            if (total <= limitBytes) break;
+            if (total <= limitBytes || removed >= 256) break;
             try
             {
                 File.Delete(file.Path);
                 total -= file.Size;
+                removed++;
             }
             catch { }
         }
+        return total > limitBytes;
     }
 }

@@ -17,6 +17,7 @@ internal static class GpuContactSheetRenderer
     private static ID2D1Factory1? _factory;
     private static ID2D1Device? _device;
     private static ID2D1DeviceContext? _context;
+    private static GpuInteropDevice.DeviceUsageLease? _deviceUsage;
     private static long _deviceGeneration = -1;
 
     public static GpuRenderedImage? TryScale(
@@ -72,13 +73,15 @@ internal static class GpuContactSheetRenderer
     private static GpuRenderedImage? TryScale(
         GpuRenderedImage source, System.Drawing.Size targetSize)
     {
+        if (source.DeviceGeneration != GpuInteropDevice.Generation) return null;
         lock (Gate)
         {
             try
             {
                 EnsureContext();
-                if (_context is null) return null;
-                var texture = GpuInteropDevice.CreateTexture(
+                if (_context is null || source.DeviceGeneration != _deviceGeneration) return null;
+                if (_deviceUsage is null) return null;
+                var texture = GpuInteropDevice.CreateTexture(_deviceUsage,
                     targetSize.Width, targetSize.Height, renderTarget: true);
                 if (texture is null) return null;
                 try
@@ -103,13 +106,17 @@ internal static class GpuContactSheetRenderer
                     _context.Target = null;
                     if (result.Failure) return null;
                     var rendered = new GpuRenderedImage(texture, IntPtr.Zero,
-                        targetSize.Width, targetSize.Height, _ => { });
+                        targetSize.Width, targetSize.Height, _ => { }, _deviceUsage);
                     texture = null;
                     return rendered;
                 }
                 finally { _context.Target = null; texture?.Dispose(); }
             }
             catch { return null; }
+            finally
+            {
+                if (_deviceGeneration != GpuInteropDevice.Generation) DiscardContext();
+            }
         }
     }
 
@@ -118,13 +125,17 @@ internal static class GpuContactSheetRenderer
     {
         if (images.Count == 0 || targetSize.Width <= 0 || targetSize.Height <= 0)
             return null;
+        if (images.Any(image => image.DeviceGeneration != GpuInteropDevice.Generation))
+            return null;
         lock (Gate)
         {
             try
             {
                 EnsureContext();
                 if (_context is null) return null;
-                var texture = GpuInteropDevice.CreateTexture(
+                if (images.Any(image => image.DeviceGeneration != _deviceGeneration)) return null;
+                if (_deviceUsage is null) return null;
+                var texture = GpuInteropDevice.CreateTexture(_deviceUsage,
                     targetSize.Width, targetSize.Height, renderTarget: true);
                 if (texture is null) return null;
                 try
@@ -153,7 +164,9 @@ internal static class GpuContactSheetRenderer
                         var maximumWidth = targetSize.Width * 0.76f;
                         var maximumHeight = targetSize.Height * 0.90f;
                         var count = inputs.Count;
-                        for (var index = 0; index < count; index++)
+                        // Match the CPU contact-sheet path: the first source is
+                        // the front card and later sources fan out behind it.
+                        for (var index = count - 1; index >= 0; index--)
                         {
                             var bitmap = inputs[index];
                             var scale = Math.Min(maximumWidth / bitmap.PixelSize.Width,
@@ -185,7 +198,7 @@ internal static class GpuContactSheetRenderer
                         _context.Target = null;
                         if (result.Failure) { texture.Dispose(); return null; }
                         var owned = new GpuRenderedImage(texture, IntPtr.Zero,
-                            targetSize.Width, targetSize.Height, _ => { });
+                            targetSize.Width, targetSize.Height, _ => { }, _deviceUsage);
                         texture = null;
                         return owned;
                     }
@@ -198,6 +211,10 @@ internal static class GpuContactSheetRenderer
                 finally { texture?.Dispose(); }
             }
             catch { return null; }
+            finally
+            {
+                if (_deviceGeneration != GpuInteropDevice.Generation) DiscardContext();
+            }
         }
     }
 
@@ -206,21 +223,35 @@ internal static class GpuContactSheetRenderer
         var generation = GpuInteropDevice.Generation;
         if (_context is not null && _deviceGeneration == generation) return;
         if (_deviceGeneration != generation)
+            DiscardContext();
+        var usage = GpuInteropDevice.AcquireUsage();
+        if (usage is null) return;
+        var d3d = usage.Device;
+        try
         {
-            if (_context is not null) _context.Target = null;
-            _context?.Dispose();
-            _device?.Dispose();
-            _factory?.Dispose();
-            _context = null;
-            _device = null;
-            _factory = null;
+            _factory = D2D1CreateFactory<ID2D1Factory1>(FactoryType.MultiThreaded,
+                DebugLevel.None);
+            using var dxgi = d3d.QueryInterface<IDXGIDevice>();
+            _device = _factory.CreateDevice(dxgi);
+            _context = _device.CreateDeviceContext(DeviceContextOptions.None);
+            _deviceUsage = usage;
+            usage = null;
+            _deviceGeneration = _deviceUsage.Generation;
         }
-        if (GpuInteropDevice.Device is not { } d3d) return;
-        _factory = D2D1CreateFactory<ID2D1Factory1>(FactoryType.MultiThreaded,
-            DebugLevel.None);
-        using var dxgi = d3d.QueryInterface<IDXGIDevice>();
-        _device = _factory.CreateDevice(dxgi);
-        _context = _device.CreateDeviceContext(DeviceContextOptions.None);
-        _deviceGeneration = generation;
+        finally { usage?.Dispose(); }
+    }
+
+    private static void DiscardContext()
+    {
+        if (_context is not null) _context.Target = null;
+        _context?.Dispose();
+        _device?.Dispose();
+        _factory?.Dispose();
+        _deviceUsage?.Dispose();
+        _context = null;
+        _device = null;
+        _factory = null;
+        _deviceUsage = null;
+        _deviceGeneration = -1;
     }
 }

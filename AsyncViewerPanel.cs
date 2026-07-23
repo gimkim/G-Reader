@@ -1785,6 +1785,20 @@ internal sealed class AsyncViewerPanel : Panel
 
     private async void BeginRender()
     {
+        try { await BeginRenderCoreAsync(); }
+        catch (OperationCanceledException) { }
+        catch (Exception exception)
+        {
+            // This is the only async-void boundary. Keeping the complete render
+            // pipeline behind it prevents any pre-await layout/cache exception
+            // from escaping into the WinForms message loop.
+            ExtendedDiagnostics.LogException("Full-view render boundary failed", exception,
+                $"first={_firstIndex}; second={_secondIndex}; version={_renderVersion}");
+        }
+    }
+
+    private async Task BeginRenderCoreAsync()
+    {
         if (IsDisposed || Disposing) return;
         CancelRender();
         var cancellation = new CancellationTokenSource();
@@ -1813,9 +1827,26 @@ internal sealed class AsyncViewerPanel : Panel
         var renderKeys = pageKeys.Select((key, index) => key is null || sizes[index].IsEmpty
             ? null : new RenderKey(pageIndices[index], key, sizes[index].Width, sizes[index].Height,
                 visible, _renderContextVersion)).ToArray();
-        var qualityRendered = await Task.WhenAll(renderKeys.Select(key => key is null
-            ? Task.FromResult<Bitmap?>(null)
-            : GetRenderCloneAsync(key, cancellation.Token)));
+        Bitmap?[] qualityRendered;
+        try
+        {
+            qualityRendered = await Task.WhenAll(renderKeys.Select(key => key is null
+                ? Task.FromResult<Bitmap?>(null)
+                : GetRenderCloneAsync(key, cancellation.Token)));
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+        catch (Exception exception)
+        {
+            // BeginRender is an async-void UI entry point. Every awaited operation
+            // must be guarded or its exception is reposted to the WinForms message
+            // loop and terminates the process.
+            ExtendedDiagnostics.LogException("Full-view cached render lookup failed", exception,
+                $"first={_firstIndex}; second={_secondIndex}; version={version}/{_renderVersion}");
+            return;
+        }
         if (cancellation.IsCancellationRequested || version != _renderVersion || IsDisposed)
         {
             foreach (var rendered in qualityRendered) RetireSource(rendered);
@@ -2513,7 +2544,8 @@ internal sealed class AsyncViewerPanel : Panel
     {
         var lookup = new RenderLookupKey(pageIndex, pageKey, visiblePageCount, _renderContextVersion);
         if (!_gpuRenderLookup.TryGetValue(lookup, out var key) ||
-            !_gpuRenderCache.TryGetValue(key, out var item)) return null;
+            !_gpuRenderCache.TryGetValue(key, out var item) ||
+            item.Image.DeviceGeneration != GpuInteropDevice.Generation) return null;
         item.ActiveReaders++;
         item.Sequence = Interlocked.Increment(ref _renderCacheSequence);
         return item;
@@ -2524,7 +2556,8 @@ internal sealed class AsyncViewerPanel : Panel
     {
         var lookup = new RenderLookupKey(pageIndex, pageKey, visiblePageCount, _renderContextVersion);
         if (!_gpuPreviewLookup.TryGetValue(lookup, out var key) ||
-            !_gpuPreviewCache.TryGetValue(key, out var item)) return null;
+            !_gpuPreviewCache.TryGetValue(key, out var item) ||
+            item.Image.DeviceGeneration != GpuInteropDevice.Generation) return null;
         item.ActiveReaders++;
         item.Sequence = Interlocked.Increment(ref _renderCacheSequence);
         return item;
@@ -2653,13 +2686,25 @@ internal sealed class AsyncViewerPanel : Panel
 
     private bool AddGpuRenderOwned(RenderKey key, GpuRenderedImage image)
     {
-        if (key.ContextVersion != Volatile.Read(ref _renderContextVersion)) return false;
+        if (key.ContextVersion != Volatile.Read(ref _renderContextVersion) ||
+            image.DeviceGeneration != GpuInteropDevice.Generation) return false;
+        GpuRenderedImage? stale = null;
         lock (_renderCacheGate)
         {
             if (_gpuRenderCache.TryGetValue(key, out var existing))
             {
-                existing.Sequence = Interlocked.Increment(ref _renderCacheSequence);
-                return false;
+                if (existing.Image.DeviceGeneration == GpuInteropDevice.Generation)
+                {
+                    existing.Sequence = Interlocked.Increment(ref _renderCacheSequence);
+                    return false;
+                }
+                _gpuRenderCache.Remove(key);
+                _gpuRenderLookup.Remove(new RenderLookupKey(
+                    key.PageIndex, key.PageKey, key.VisiblePageCount, key.ContextVersion));
+                _renderCacheBytes -= existing.Bytes;
+                SubtractRenderStats(key, existing.Bytes);
+                existing.Retired = true;
+                if (existing.ActiveReaders == 0) stale = existing.Image;
             }
             var item = new GpuRenderCacheItem(
                 image, Interlocked.Increment(ref _renderCacheSequence));
@@ -2672,8 +2717,9 @@ internal sealed class AsyncViewerPanel : Panel
                 (key.ContextVersion, key.PageIndex, key.PageKey), item.Bytes, (_, bytes) => bytes + item.Bytes);
             _cachedPageCounts.AddOrUpdate(
                 (key.ContextVersion, key.PageIndex, key.PageKey), 1, (_, count) => count + 1);
-            return true;
         }
+        stale?.Dispose();
+        return true;
     }
 
     private bool AddPreviewOwned(RenderKey key, Bitmap bitmap)
@@ -2699,13 +2745,24 @@ internal sealed class AsyncViewerPanel : Panel
     private bool AddGpuPreviewOwned(RenderKey key, GpuRenderedImage image)
     {
         if (Volatile.Read(ref _previewCacheLimitBytes) <= 0 ||
-            key.ContextVersion != Volatile.Read(ref _renderContextVersion)) return false;
+            key.ContextVersion != Volatile.Read(ref _renderContextVersion) ||
+            image.DeviceGeneration != GpuInteropDevice.Generation) return false;
+        GpuRenderedImage? stale = null;
         lock (_previewCacheGate)
         {
             if (_gpuPreviewCache.TryGetValue(key, out var existing))
             {
-                existing.Sequence = Interlocked.Increment(ref _renderCacheSequence);
-                return false;
+                if (existing.Image.DeviceGeneration == GpuInteropDevice.Generation)
+                {
+                    existing.Sequence = Interlocked.Increment(ref _renderCacheSequence);
+                    return false;
+                }
+                _gpuPreviewCache.Remove(key);
+                _gpuPreviewLookup.Remove(new RenderLookupKey(
+                    key.PageIndex, key.PageKey, key.VisiblePageCount, key.ContextVersion));
+                _previewCacheBytes -= existing.Bytes;
+                existing.Retired = true;
+                if (existing.ActiveReaders == 0) stale = existing.Image;
             }
             var item = new GpuRenderCacheItem(
                 image, Interlocked.Increment(ref _renderCacheSequence));
@@ -2713,8 +2770,9 @@ internal sealed class AsyncViewerPanel : Panel
             _gpuPreviewLookup[new RenderLookupKey(
                 key.PageIndex, key.PageKey, key.VisiblePageCount, key.ContextVersion)] = key;
             _previewCacheBytes += item.Bytes;
-            return true;
         }
+        stale?.Dispose();
+        return true;
     }
 
     // Called while _renderCacheGate is held. Readers enumerate the concurrent

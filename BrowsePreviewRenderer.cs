@@ -262,7 +262,11 @@ internal static class BrowsePreviewRenderer
         try
         {
             var cardTarget = GetCardTarget(targetSize, fastPreview);
-            var count = Math.Min(4, document.PageCount);
+            // Publish a one-page cover during the fast pass. The later full pass
+            // upgrades it to the four-page contact sheet, so a folder containing
+            // several uncached PDFs no longer waits for four PDFium rasters per
+            // card before displaying anything.
+            var count = Math.Min(fastPreview ? 1 : 4, document.PageCount);
             previews = new Bitmap?[count];
             Parallel.For(0, count, new ParallelOptions
             {
@@ -326,7 +330,9 @@ internal static class BrowsePreviewRenderer
         var angles = new[] { -8f, -3f, 3f, 8f };
         var offsets = new[] { -0.10f, -0.04f, 0.04f, 0.10f };
         var count = previews.Count;
-        for (var index = 0; index < count; index++)
+        // Draw in reverse source order so the first page/image is the front card
+        // instead of being hidden behind the last page in the contact sheet.
+        for (var index = count - 1; index >= 0; index--)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var source = previews[index];

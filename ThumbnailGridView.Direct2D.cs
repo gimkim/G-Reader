@@ -82,6 +82,7 @@ internal sealed partial class ThumbnailGridView
     private readonly System.Windows.Forms.Timer _thumbnailGpuTrimTimer = new() { Interval = 650 };
     private readonly System.Windows.Forms.Timer _thumbnailGpuRetireTimer = new() { Interval = 30 };
     private readonly System.Windows.Forms.Timer _thumbnailDeviceRecoveryTimer = new() { Interval = 50 };
+    private readonly System.Windows.Forms.Timer _thumbnailPresentRetryTimer = new() { Interval = 8 };
     private readonly Queue<RetiredThumbnailGpuBatch> _retiredThumbnailGpuBatches = [];
     private readonly Dictionary<string, ID2D1ColorContext> _thumbnailColorContexts = [];
     private readonly Dictionary<ID2D1Bitmap, ID2D1Effect> _thumbnailColorEffects =
@@ -97,6 +98,7 @@ internal sealed partial class ThumbnailGridView
     private IDWriteTextFormat _thumbnailPlaceholderFormat = null!;
     private ID2D1HwndRenderTarget? _thumbnailRenderTarget;
     private ID2D1Device? _thumbnailD2DDevice;
+    private GpuInteropDevice.DeviceUsageLease? _thumbnailSharedDeviceUsage;
     private ID2D1DeviceContext? _thumbnailDeviceContext;
     private IDXGISwapChain1? _thumbnailSwapChain;
     private ID2D1Bitmap1? _thumbnailSwapChainTarget;
@@ -161,6 +163,11 @@ internal sealed partial class ThumbnailGridView
         };
         _thumbnailGpuRetireTimer.Tick += (_, _) => DrainRetiredGpuResources();
         _thumbnailDeviceRecoveryTimer.Tick += (_, _) => RecoverThumbnailDeviceResources();
+        _thumbnailPresentRetryTimer.Tick += (_, _) =>
+        {
+            _thumbnailPresentRetryTimer.Stop();
+            if (!IsDisposed && !Disposing && IsHandleCreated) Invalidate();
+        };
     }
 
     public void ConfigureColorManagement(bool enabled, byte[]? monitorProfile)
@@ -253,7 +260,9 @@ internal sealed partial class ThumbnailGridView
 
     private bool TryCreateThumbnailDeviceContext()
     {
-        if (GpuInteropDevice.Device is not { } d3dDevice) return false;
+        var deviceUsage = GpuInteropDevice.AcquireUsage();
+        if (deviceUsage is null) return false;
+        var d3dDevice = deviceUsage.Device;
         try
         {
             using var dxgiDevice = d3dDevice.QueryInterface<IDXGIDevice>();
@@ -276,7 +285,9 @@ internal sealed partial class ThumbnailGridView
                     d3dDevice, Handle, description);
             }
             RecreateThumbnailSwapChainTarget(resize: false);
-            _thumbnailDeviceGeneration = GpuInteropDevice.Generation;
+            _thumbnailSharedDeviceUsage = deviceUsage;
+            deviceUsage = null;
+            _thumbnailDeviceGeneration = _thumbnailSharedDeviceUsage.Generation;
             return _thumbnailSwapChainTarget is not null;
         }
         catch
@@ -284,6 +295,7 @@ internal sealed partial class ThumbnailGridView
             DisposeThumbnailDeviceContext();
             return false;
         }
+        finally { deviceUsage?.Dispose(); }
     }
 
     private void RecreateThumbnailSwapChainTarget(bool resize)
@@ -410,7 +422,29 @@ internal sealed partial class ThumbnailGridView
                 return;
             }
             if (_thumbnailSwapChain is not null)
-                _thumbnailSwapChain.Present(0, PresentFlags.None);
+            {
+                // Painting runs on the UI thread. Never wait inside the display
+                // driver when the GPU queue is saturated; retry the latest frame.
+                var presentResult = _thumbnailSwapChain.Present(0, PresentFlags.DoNotWait);
+                if (presentResult == Vortice.DXGI.ResultCode.WasStillDrawing)
+                {
+                    _thumbnailPresentRetryTimer.Stop();
+                    _thumbnailPresentRetryTimer.Start();
+                    return;
+                }
+                if (presentResult.Failure)
+                {
+                    var deviceRemoved = GpuInteropDevice.TryGetDeviceRemovalReason(
+                        out var removalReason);
+                    ExtendedDiagnostics.Breadcrumb(
+                        $"Thumbnail DXGI Present failed: {presentResult.Code}; " +
+                        $"deviceRemoved={deviceRemoved}; removalReason={removalReason}");
+                    DiscardThumbnailDeviceResources();
+                    ScheduleThumbnailDeviceRecovery(
+                        $"Present {presentResult.Code}", recreateSharedDevice: deviceRemoved);
+                    return;
+                }
+            }
         }
         catch (Exception exception)
         {
@@ -789,6 +823,7 @@ internal sealed partial class ThumbnailGridView
 
     private ID2D1Bitmap? GetOrCreateNativeGpuTexture(GpuRenderedImage source)
     {
+        if (source.DeviceGeneration != GpuInteropDevice.Generation) return null;
         if (_thumbnailDeviceContext is null)
         {
             ScheduleGpuSourceRecovery();
@@ -1216,6 +1251,8 @@ internal sealed partial class ThumbnailGridView
         _thumbnailDeviceContext = null;
         _thumbnailD2DDevice?.Dispose();
         _thumbnailD2DDevice = null;
+        _thumbnailSharedDeviceUsage?.Dispose();
+        _thumbnailSharedDeviceUsage = null;
         _thumbnailDeviceGeneration = -1;
     }
 
@@ -1254,6 +1291,7 @@ internal sealed partial class ThumbnailGridView
         _thumbnailGpuTrimTimer.Dispose();
         _thumbnailGpuRetireTimer.Dispose();
         _thumbnailDeviceRecoveryTimer.Dispose();
+        _thumbnailPresentRetryTimer.Dispose();
         _thumbnailNameFormat.Dispose();
         _thumbnailNumberFormat.Dispose();
         _thumbnailIconFormat.Dispose();

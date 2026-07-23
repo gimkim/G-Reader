@@ -386,6 +386,9 @@ internal static unsafe class PdfiumWorkerServer
 
 internal sealed class PdfiumWorkerClient : IDisposable
 {
+    private const int InteractiveTimeoutMilliseconds = 30_000;
+    private const int BackgroundTimeoutMilliseconds = 45_000;
+    private const int CancellationAbortGraceMilliseconds = 750;
     private readonly string _workerArgument;
     private Process? _process;
     private AnonymousPipeServerStream? _requestPipe;
@@ -393,6 +396,8 @@ internal sealed class PdfiumWorkerClient : IDisposable
     private BinaryWriter? _writer;
     private BinaryReader? _reader;
     private int _disposed;
+    private int _commandSequence;
+    private int _activeCommand;
 
     public PdfiumWorkerClient(string workerArgument)
     {
@@ -400,19 +405,115 @@ internal sealed class PdfiumWorkerClient : IDisposable
         Start();
     }
 
-    public T Execute<T>(Action<BinaryWriter> writeRequest, Func<BinaryReader, T> readResponse)
+    public T Execute<T>(Action<BinaryWriter> writeRequest, Func<BinaryReader, T> readResponse,
+        CancellationToken cancellationToken = default, bool background = false)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-        try { return ExecuteCore(writeRequest, readResponse); }
-        catch (Exception first) when (first is IOException or EndOfStreamException or ObjectDisposedException)
+        var timeout = background ? BackgroundTimeoutMilliseconds : InteractiveTimeoutMilliseconds;
+        try { return ExecuteWithWatchdog(writeRequest, readResponse, cancellationToken, timeout); }
+        catch (OperationCanceledException)
         {
+            // Cancellation aborts the native process to break a blocking pipe read.
+            // Replace it before the pool makes this client available again.
             Restart();
-            try { return ExecuteCore(writeRequest, readResponse); }
+            throw;
+        }
+        catch (Exception first) when (first is IOException or EndOfStreamException or
+            ObjectDisposedException or TimeoutException)
+        {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                Restart();
+                throw new OperationCanceledException(cancellationToken);
+            }
+            Restart();
+            try
+            {
+                return ExecuteWithWatchdog(
+                    writeRequest, readResponse, cancellationToken, timeout);
+            }
+            catch (OperationCanceledException)
+            {
+                Restart();
+                throw;
+            }
             catch (Exception second)
             {
+                // The retry may itself have tripped the watchdog. Do not return a
+                // killed process to the pool; leave a fresh worker ready instead.
+                try { Restart(); }
+                catch (Exception restartException)
+                {
+                    ExtendedDiagnostics.LogException(
+                        "PDFium worker restart after repeated failure failed",
+                        restartException);
+                }
                 throw new InvalidDataException(
                     $"PDFium worker process failed after restart: {second.Message}", second);
             }
+        }
+    }
+
+    private T ExecuteWithWatchdog<T>(Action<BinaryWriter> writeRequest,
+        Func<BinaryReader, T> readResponse, CancellationToken cancellationToken, int timeout)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var sequence = Interlocked.Increment(ref _commandSequence);
+        Volatile.Write(ref _activeCommand, sequence);
+        var timedOut = 0;
+        using var cancellation = cancellationToken.Register(() =>
+            _ = AbortCancelledCommandAfterGraceAsync(sequence));
+        using var watchdog = new System.Threading.Timer(_ =>
+        {
+            if (Volatile.Read(ref _activeCommand) != sequence) return;
+            Interlocked.Exchange(ref timedOut, 1);
+            ExtendedDiagnostics.Breadcrumb(
+                $"PDFium watchdog fired: pid={TryGetProcessId()}; timeoutMs={timeout}");
+            AbortActiveCommand(sequence, timedOut: true);
+        }, null, timeout, Timeout.Infinite);
+        try
+        {
+            return ExecuteCore(writeRequest, readResponse);
+        }
+        catch (Exception exception) when (Volatile.Read(ref timedOut) != 0)
+        {
+            throw new TimeoutException(
+                $"PDFium worker did not respond within {timeout} ms.", exception);
+        }
+        catch (Exception) when (cancellationToken.IsCancellationRequested)
+        {
+            throw new OperationCanceledException(cancellationToken);
+        }
+        finally
+        {
+            Interlocked.CompareExchange(ref _activeCommand, 0, sequence);
+        }
+    }
+
+    private int TryGetProcessId()
+    {
+        try { return _process?.Id ?? 0; }
+        catch { return 0; }
+    }
+
+    private async Task AbortCancelledCommandAfterGraceAsync(int sequence)
+    {
+        await Task.Delay(CancellationAbortGraceMilliseconds).ConfigureAwait(false);
+        AbortActiveCommand(sequence, timedOut: false);
+    }
+
+    private void AbortActiveCommand(int sequence, bool timedOut)
+    {
+        if (Volatile.Read(ref _activeCommand) != sequence) return;
+        try
+        {
+            if (_process is { HasExited: false }) _process.Kill(entireProcessTree: true);
+        }
+        catch (Exception exception)
+        {
+            if (timedOut)
+                ExtendedDiagnostics.LogException("PDFium watchdog could not terminate worker",
+                    exception, $"pid={TryGetProcessId()}");
         }
     }
 
@@ -536,6 +637,7 @@ internal sealed class PdfiumProcessPool : IDisposable
     private int _referenceCount;
     private int _retired;
     private int _disposed;
+    private int _disposeScheduled;
 
     public int Count => _workers.Length;
 
@@ -590,13 +692,19 @@ internal sealed class PdfiumProcessPool : IDisposable
     public void ReleaseReference()
     {
         if (Interlocked.Decrement(ref _referenceCount) == 0 &&
-            Volatile.Read(ref _retired) != 0) Dispose();
+            Volatile.Read(ref _retired) != 0) ScheduleDispose();
     }
 
     public void Retire()
     {
         Volatile.Write(ref _retired, 1);
-        if (Volatile.Read(ref _referenceCount) == 0) Dispose();
+        if (Volatile.Read(ref _referenceCount) == 0) ScheduleDispose();
+    }
+
+    private void ScheduleDispose()
+    {
+        if (Interlocked.Exchange(ref _disposeScheduled, 1) != 0) return;
+        _ = Task.Run(Dispose);
     }
 
     public T Execute<T>(Func<PdfiumWorkerClient, T> operation,
@@ -720,12 +828,12 @@ internal sealed class PdfiumProcessPool : IDisposable
         {
             writer.Write((byte)5);
             writer.Write(Path.GetFullPath(path));
-        }, _ => true);
+        }, _ => true, background: true);
 
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        foreach (var worker in _workers) worker.Dispose();
+        Parallel.ForEach(_workers, worker => worker.Dispose());
         _documentCloseGate.Dispose();
         _backgroundSlots.Dispose();
         _slots.Dispose();

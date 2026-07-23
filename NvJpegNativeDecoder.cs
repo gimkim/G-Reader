@@ -712,7 +712,10 @@ internal static unsafe class NvJpegNativeDecoder
                 return false;
 
             using var interopLease = EnterDirectTextureInterop(cancellationToken);
-            var texture = GpuInteropDevice.CreateTexture(target.Width, target.Height);
+            using var deviceUsage = GpuInteropDevice.AcquireUsage();
+            if (deviceUsage is null) return false;
+            var texture = GpuInteropDevice.CreateTexture(
+                deviceUsage, target.Width, target.Height);
             if (texture is null) return false;
             IntPtr resource = IntPtr.Zero;
             try
@@ -755,7 +758,8 @@ internal static unsafe class NvJpegNativeDecoder
                     ? TryEncodeBgr(colorSource, colorPitch, target, jpegQuality) : null;
                 image = new GpuRenderedImage(texture, IntPtr.Zero,
                     target.Width, target.Height,
-                    value => _api.CudaGraphicsUnregisterResource(value), encoded);
+                    value => _api.CudaGraphicsUnregisterResource(value),
+                    deviceUsage, encoded);
                 texture = null;
                 return true;
             }
@@ -915,7 +919,10 @@ internal static unsafe class NvJpegNativeDecoder
                     new NppiSize(target.Width, target.Height), order, 255,
                     _nppContext!.Value) != 0) return false;
             using var interopLease = EnterDirectTextureInterop(cancellationToken);
-            var texture = GpuInteropDevice.CreateTexture(target.Width, target.Height);
+            using var deviceUsage = GpuInteropDevice.AcquireUsage();
+            if (deviceUsage is null) return false;
+            var texture = GpuInteropDevice.CreateTexture(
+                deviceUsage, target.Width, target.Height);
             if (texture is null) return false;
             IntPtr resource = IntPtr.Zero;
             try
@@ -949,7 +956,7 @@ internal static unsafe class NvJpegNativeDecoder
                 interopLease.Dispose();
                 cancellationToken.ThrowIfCancellationRequested();
                 image = new GpuRenderedImage(texture, IntPtr.Zero, target.Width, target.Height,
-                    value => _api.CudaGraphicsUnregisterResource(value));
+                    value => _api.CudaGraphicsUnregisterResource(value), deviceUsage);
                 texture = null; return true;
             }
             finally
@@ -964,7 +971,10 @@ internal static unsafe class NvJpegNativeDecoder
         {
             image = null;
             using var interopLease = EnterDirectTextureInterop(cancellationToken);
-            var texture = GpuInteropDevice.CreateTexture(target.Width, target.Height);
+            using var deviceUsage = GpuInteropDevice.AcquireUsage();
+            if (deviceUsage is null) return false;
+            var texture = GpuInteropDevice.CreateTexture(
+                deviceUsage, target.Width, target.Height);
             if (texture is null) return false;
             IntPtr resource = IntPtr.Zero;
             try
@@ -997,7 +1007,7 @@ internal static unsafe class NvJpegNativeDecoder
                 interopLease.Dispose();
                 cancellationToken.ThrowIfCancellationRequested();
                 image = new GpuRenderedImage(texture, IntPtr.Zero, target.Width, target.Height,
-                    value => _api.CudaGraphicsUnregisterResource(value));
+                    value => _api.CudaGraphicsUnregisterResource(value), deviceUsage);
                 texture = null;
                 return true;
             }
@@ -1247,7 +1257,9 @@ internal static unsafe class NvJpegNativeDecoder
 
         public bool TryBindDirect3DDevice()
         {
-            if (GpuInteropDevice.Device is not { } device) return false;
+            using var deviceUsage = GpuInteropDevice.AcquireUsage();
+            if (deviceUsage is null) return false;
+            var device = deviceUsage.Device;
             var devices = stackalloc int[8];
             uint count = 0;
             if (CudaD3D11GetDevices(&count, devices, 8,
