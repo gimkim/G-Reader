@@ -10,8 +10,7 @@ internal sealed class PositionSlider : Control
     private int _rangeEnd = -1;
     private bool _dragging;
     private bool _reverseDirection;
-    private int _cacheBehindStart = -1;
-    private int _cacheAheadEnd = -1;
+    private int[] _cachedPages = [];
 
     public event EventHandler? ValueChanged;
 
@@ -76,16 +75,14 @@ internal sealed class PositionSlider : Control
         SetStyle(ControlStyles.ResizeRedraw, true);
     }
 
-    public void SetCacheRange(int behindStart, int aheadEnd)
+    public void SetCachedPages(int[] cachedPages)
     {
-        var nextBehind = behindStart < 0 ? -1 : Math.Clamp(behindStart, 0, _maximum);
-        var nextAhead = aheadEnd < 0 ? -1 : Math.Clamp(aheadEnd, 0, _maximum);
-        if (_cacheBehindStart == nextBehind && _cacheAheadEnd == nextAhead) return;
-        _cacheBehindStart = nextBehind;
-        _cacheAheadEnd = nextAhead;
-        AccessibleDescription = _cacheBehindStart < 0 || _cacheAheadEnd < 0
-            ? "No rendered cache range"
-            : $"Rendered cache from page {_cacheBehindStart + 1} to {_cacheAheadEnd + 1}";
+        ArgumentNullException.ThrowIfNull(cachedPages);
+        if (_cachedPages.AsSpan().SequenceEqual(cachedPages)) return;
+        _cachedPages = cachedPages;
+        AccessibleDescription = cachedPages.Length == 0
+            ? "No rendered pages cached"
+            : $"{cachedPages.Length} rendered pages cached";
         Invalidate();
     }
 
@@ -120,12 +117,10 @@ internal sealed class PositionSlider : Control
         using var gradient = new LinearGradientBrush(fill, Color.FromArgb(63, 169, 245), Color.FromArgb(123, 92, 246), 0f);
         e.Graphics.FillPath(gradient, fillPath);
 
-        // A thin overlay keeps the position fill readable while showing the
-        // contiguous render-ready window around the current page.
-        if (_maximum > 0 && _cacheBehindStart >= 0 && _cacheBehindStart <= _value)
-            DrawCacheSegment(e.Graphics, bar, _cacheBehindStart, _value, Color.FromArgb(238, 158, 63));
-        if (_maximum > 0 && _cacheAheadEnd >= _value)
-            DrawCacheSegment(e.Graphics, bar, _value, _cacheAheadEnd, Color.FromArgb(52, 205, 139));
+        // Show every render-ready page. Adjacent pages are coalesced into one
+        // segment, while gaps remain visible even when a far-away worker finishes
+        // before the pages between it and the current position.
+        if (_maximum > 0) DrawCachedPages(e.Graphics, bar);
 
         var thumbX = _reverseDirection
             ? bar.Right - (int)Math.Round(bar.Width * ratio)
@@ -181,15 +176,36 @@ internal sealed class PositionSlider : Control
         ? new Rectangle(textWidth + 10, Height / 2 - 4, Math.Max(20, Width - textWidth - 24), 8)
         : new Rectangle(14, Height / 2 - 4, Math.Max(20, Width - textWidth - 24), 8);
 
-    private void DrawCacheSegment(Graphics graphics, Rectangle bar, int startPage, int endPage, Color color)
+    private void DrawCacheSegment(
+        Graphics graphics, Rectangle bar, int startPage, int endPage, Brush brush)
     {
         var startX = PageToX(bar, startPage);
         var endX = PageToX(bar, endPage);
         var left = Math.Clamp(Math.Min(startX, endX), bar.Left, bar.Right - 1);
         var width = Math.Max(3, Math.Abs(endX - startX) + 1);
         var segment = new Rectangle(left, bar.Y + 2, Math.Max(1, Math.Min(width, bar.Right - left)), 4);
-        using var brush = new SolidBrush(color);
         graphics.FillRectangle(brush, segment);
+    }
+
+    private void DrawCachedPages(Graphics graphics, Rectangle bar)
+    {
+        using var behindBrush = new SolidBrush(Color.FromArgb(238, 158, 63));
+        using var aheadBrush = new SolidBrush(Color.FromArgb(52, 205, 139));
+        for (var index = 0; index < _cachedPages.Length;)
+        {
+            var start = _cachedPages[index];
+            var end = start;
+            index++;
+            while (index < _cachedPages.Length && _cachedPages[index] == end + 1)
+                end = _cachedPages[index++];
+
+            if (start < _value)
+                DrawCacheSegment(
+                    graphics, bar, start, Math.Min(end, _value - 1), behindBrush);
+            if (end >= _value)
+                DrawCacheSegment(
+                    graphics, bar, Math.Max(start, _value), end, aheadBrush);
+        }
     }
 
     private int PageToX(Rectangle bar, int page)

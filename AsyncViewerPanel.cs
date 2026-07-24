@@ -863,20 +863,16 @@ internal sealed class AsyncViewerPanel : Panel
             .Select(pair => pair.Key.Page)
             .ToHashSet();
 
-    public (int BehindStart, int AheadEnd) GetCachedPageRange(int center)
+    public int[] GetCachedPages()
     {
         var context = Volatile.Read(ref _renderContextVersion);
-        var pages = _cachedPageCounts
+        return _cachedPageCounts
             .Where(pair => pair.Key.Context == context &&
                 IsActivePageKey(pair.Key.PageKey) && pair.Value > 0)
             .Select(pair => pair.Key.Page)
-            .ToHashSet();
-        if (!pages.Contains(center)) return (-1, -1);
-        var behind = center;
-        var ahead = center;
-        while (pages.Contains(behind - 1)) behind--;
-        while (pages.Contains(ahead + 1)) ahead++;
-        return (behind, ahead);
+            .Distinct()
+            .Order()
+            .ToArray();
     }
 
     public void ClearBookCache()
@@ -944,7 +940,8 @@ internal sealed class AsyncViewerPanel : Panel
         Bitmap source,
         int visiblePageCount,
         PreRenderContext context,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool idlePriority = false)
     {
         var gap = 10;
         var availableWidth = Math.Max(100, context.ClientSize.Width - gap * 3);
@@ -955,7 +952,8 @@ internal sealed class AsyncViewerPanel : Panel
             pageIndex, pageKey, size.Width, size.Height, visiblePageCount, context.Version);
         if (ContainsRender(key)) return;
 
-        if (Volatile.Read(ref _previewCacheLimitBytes) > 0 && !ContainsPreview(key))
+        if (!idlePriority && Volatile.Read(ref _previewCacheLimitBytes) > 0 &&
+            !ContainsPreview(key))
         {
             GpuRenderedImage? gpuPreview = null;
             var sourceBytes = (long)source.Width * source.Height * 4;
@@ -983,13 +981,16 @@ internal sealed class AsyncViewerPanel : Panel
             (long)source.Width * source.Height * 4 >=
             ImagePipelineTuning.GenericGpuMinimumSourceBytes)
         {
-            var gpuRendered = await RenderWorkScheduler.RunFullAsync(() =>
+            var gpuWork = () =>
             {
                 using var lease = ImagePipelineTuning.EnterGenericGpu(cancellationToken);
                 return NvJpegNativeDecoder.TryResizeBitmapToGpu(
                     source, size, fastPreview: false, cancellationToken,
                     out var image) ? image : null;
-            }, cancellationToken);
+            };
+            var gpuRendered = idlePriority
+                ? await RenderWorkScheduler.RunIdleFullAsync(gpuWork, cancellationToken)
+                : await RenderWorkScheduler.RunFullAsync(gpuWork, cancellationToken);
             if (gpuRendered is not null)
             {
                 if (!AddGpuRenderOwned(key, gpuRendered)) gpuRendered.Dispose();
@@ -999,9 +1000,11 @@ internal sealed class AsyncViewerPanel : Panel
 
         // The caller owns this source clone until the await completes, so another
         // full-size defensive copy only adds allocation pressure and GC pauses.
-        var rendered = await RenderWorkScheduler.RunFullAsync(
-            () => ResizeLanczosForPrecache(
-                source, size, context.LanczosQuality, cancellationToken), cancellationToken);
+        var fullWork = () => ResizeLanczosForPrecache(
+            source, size, context.LanczosQuality, cancellationToken);
+        var rendered = idlePriority
+            ? await RenderWorkScheduler.RunIdleFullAsync(fullWork, cancellationToken)
+            : await RenderWorkScheduler.RunFullAsync(fullWork, cancellationToken);
         if (rendered is null) return;
         // Transfer the completed bitmap into the cache. No pixel copy is made
         // while holding the render-cache lock.
@@ -1011,7 +1014,8 @@ internal sealed class AsyncViewerPanel : Panel
     public async Task PreRenderEncodedJpegAsync(
         int pageIndex, string pageKey, PageEntry page, int visiblePageCount,
         int rotation, PreRenderContext context, bool generatePreview,
-        CancellationToken cancellationToken, bool interactiveFull = false)
+        CancellationToken cancellationToken, bool interactiveFull = false,
+        bool idlePriority = false)
     {
         if (HasCachedRender(
                 pageIndex, pageKey, visiblePageCount, context.Version)) return;
@@ -1045,15 +1049,17 @@ internal sealed class AsyncViewerPanel : Panel
             }
         }
 
+        var gpuWork = () => EncodedJpegRenderer.RenderReaderGpu(
+            page, context.ClientSize, visiblePageCount, rotation,
+            fastPreview: false, cancellationToken);
         var gpuRendered = interactiveFull
             ? await RenderWorkScheduler.RunInteractiveFullAsync(
-                () => EncodedJpegRenderer.RenderReaderGpu(
-                    page, context.ClientSize, visiblePageCount, rotation,
-                    fastPreview: false, cancellationToken), cancellationToken).ConfigureAwait(false)
-            : await RenderWorkScheduler.RunFullAsync(
-                () => EncodedJpegRenderer.RenderReaderGpu(
-                    page, context.ClientSize, visiblePageCount, rotation,
-                    fastPreview: false, cancellationToken), cancellationToken).ConfigureAwait(false);
+                gpuWork, cancellationToken).ConfigureAwait(false)
+            : idlePriority
+                ? await RenderWorkScheduler.RunIdleFullAsync(
+                    gpuWork, cancellationToken).ConfigureAwait(false)
+                : await RenderWorkScheduler.RunFullAsync(
+                    gpuWork, cancellationToken).ConfigureAwait(false);
         if (gpuRendered is { } directRendered)
         {
             var directKey = new RenderKey(
@@ -1064,17 +1070,18 @@ internal sealed class AsyncViewerPanel : Panel
             return;
         }
 
+        var cpuWork = () => EncodedJpegRenderer.RenderReader(
+            page, context.ClientSize, visiblePageCount, rotation,
+            context.LanczosQuality, fastPreview: false, cancellationToken);
         var rendered = interactiveFull
             ? await RenderWorkScheduler.RunInteractiveFullAsync(
-                () => EncodedJpegRenderer.RenderReader(
-                    page, context.ClientSize, visiblePageCount, rotation,
-                    context.LanczosQuality, fastPreview: false, cancellationToken),
+                cpuWork,
                 cancellationToken).ConfigureAwait(false)
-            : await RenderWorkScheduler.RunFullAsync(
-                () => EncodedJpegRenderer.RenderReader(
-                    page, context.ClientSize, visiblePageCount, rotation,
-                    context.LanczosQuality, fastPreview: false, cancellationToken),
-                cancellationToken).ConfigureAwait(false);
+            : idlePriority
+                ? await RenderWorkScheduler.RunIdleFullAsync(
+                    cpuWork, cancellationToken).ConfigureAwait(false)
+                : await RenderWorkScheduler.RunFullAsync(
+                    cpuWork, cancellationToken).ConfigureAwait(false);
         var renderKey = new RenderKey(
             pageIndex, pageKey, rendered.Bitmap.Width, rendered.Bitmap.Height,
             visiblePageCount, context.Version);

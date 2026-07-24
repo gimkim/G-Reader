@@ -121,6 +121,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     };
     private readonly System.Windows.Forms.Timer _toastTimer = new() { Interval = 1500 };
     private readonly System.Windows.Forms.Timer _wheelDispatchTimer = new() { Interval = 8 };
+    private readonly System.Windows.Forms.Timer _thumbnailWarmSelectionTimer =
+        new() { Interval = 220 };
     private readonly ThumbnailGridView _thumbnailGrid = new();
     private readonly Panel _thumbnailModePanel = new()
     {
@@ -196,14 +198,16 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private int _randomOpenInProgress;
     private int _pdfPageDeleteInProgress;
     private int _requestedWarmCenter;
+    private int _pendingThumbnailWarmCenter = -1;
     private int _activePrecacheWorkerCount;
     private PageCache? _scheduledTrimCache;
     private PageCache? _pendingCacheUiCache;
     private string? _pendingCacheUiText;
-    private (int BehindStart, int AheadEnd) _pendingCacheUiRange;
+    private int[] _pendingCacheUiPages = [];
     private bool _cacheUiUpdatePending;
     private long _lastCacheStatusTick;
     private bool _bookPrecacheStarted;
+    private bool _warmUsesIdlePriority;
     private bool _viewerRendering;
     private bool _suppressPositionEvent;
     private bool _doublePage;
@@ -298,6 +302,16 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         {
             _wheelDispatchTimer.Stop();
             ProcessPendingWheel();
+        };
+        _thumbnailWarmSelectionTimer.Tick += (_, _) =>
+        {
+            _thumbnailWarmSelectionTimer.Stop();
+            var page = _pendingThumbnailWarmCenter;
+            _pendingThumbnailWarmCenter = -1;
+            if (!_thumbnailMode || page < 0 || _cache is not { } cache ||
+                _book is not { } book || page >= book.Pages.Count) return;
+            RequestCacheWarm(page, cache, book,
+                immediate: true, idlePriority: true);
         };
 
         _doublePage = _settings.DoublePage && !_forceInitialFullPage;
@@ -419,6 +433,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             DisposeFullscreenSliderOverlay(restoreBottomPanel: false);
             _toastTimer.Dispose();
             _wheelDispatchTimer.Dispose();
+            _thumbnailWarmSelectionTimer.Dispose();
             CancelAndDisposeInBackground(_monitorProfileCancellation);
             Application.RemoveMessageFilter(this);
         };
@@ -580,6 +595,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _thumbnailGrid.PageActivated += (_, page) =>
         {
             if (_book is null || _book.Pages.Count == 0) return;
+            CancelPendingThumbnailWarmCenter();
             _viewer.ReturnToFit();
             _pageIndex = Math.Clamp(page, 0, _book.Pages.Count - 1);
             UpdatePosition();
@@ -593,6 +609,11 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             {
                 UpdatePositionSlider(page);
                 _ = RefreshCurrentPageInfoAsync(page);
+                // Debounce keyboard navigation so only the final selection moves
+                // the full-view warm queue after rapid arrow-key repeats stop.
+                _pendingThumbnailWarmCenter = page;
+                _thumbnailWarmSelectionTimer.Stop();
+                _thumbnailWarmSelectionTimer.Start();
             }
         };
         _thumbnailGrid.BrowsePriorityChanged += (_, _) =>
@@ -810,7 +831,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _suppressPositionEvent = true;
         _positionSlider.Maximum = 0;
         _positionSlider.Value = 0;
-        _positionSlider.SetCacheRange(-1, -1);
+        _positionSlider.SetCachedPages([]);
         _suppressPositionEvent = false;
         var cancellation = new CancellationTokenSource();
         _bookCancellation = cancellation;
@@ -862,6 +883,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             }
             _viewer.ActivateBookCache(book.SourcePath);
             _bookPrecacheStarted = false;
+            _warmUsesIdlePriority = false;
             var preferredIndex = string.IsNullOrWhiteSpace(preferredPageName)
                 ? -1
                 : book.Pages.ToList().FindIndex(page => page.Name.Equals(
@@ -1459,23 +1481,35 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private void RequestCacheWarm(
         int center, PageCache cache, Book book, bool immediate = false,
-        bool rebuildRenderContext = false)
+        bool rebuildRenderContext = false, bool idlePriority = false)
     {
+        idlePriority |= _thumbnailMode;
         lock (_warmStateGate)
         {
             _requestedWarmCenter = center;
-            if (_bookPrecacheStarted) return;
+            if (_bookPrecacheStarted)
+            {
+                if (_warmUsesIdlePriority == idlePriority) return;
+                // The view mode changed. Preserve completed cache entries, stop
+                // only the pending/in-flight dispatcher, and immediately resume
+                // the remaining directional queue at the new priority.
+                CancelAndDisposeInBackground(_warmCancellation);
+                _warmCancellation = null;
+                _bookPrecacheStarted = false;
+            }
             _bookPrecacheStarted = true;
+            _warmUsesIdlePriority = idlePriority;
             var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_bookCancellation!.Token);
             _warmCancellation = cancellation;
             _ = WarmCacheAsync(
-                cache, book, cancellation, immediate, rebuildRenderContext);
+                cache, book, cancellation, immediate, rebuildRenderContext,
+                idlePriority);
         }
     }
 
     private async Task WarmCacheAsync(
         PageCache cache, Book book, CancellationTokenSource cancellation,
-        bool immediate, bool rebuildRenderContext)
+        bool immediate, bool rebuildRenderContext, bool idlePriority)
     {
         var cancellationToken = cancellation.Token;
         var id = 0;
@@ -1492,18 +1526,19 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 if (Volatile.Read(ref _requestedWarmCenter) != center) continue;
                 if (!rebuildRenderContext) ScheduleRelaxedCacheTrim(cache);
                 await WarmDirectionalPagesAsync(
-                    center, cache, book, rebuildRenderContext, cancellationToken).ConfigureAwait(false);
+                    center, cache, book, rebuildRenderContext, idlePriority,
+                    cancellationToken).ConfigureAwait(false);
                 cancellationToken.ThrowIfCancellationRequested();
                 lock (_warmStateGate)
                 {
+                    if (!ReferenceEquals(_warmCancellation, cancellation)) return;
                     if (_requestedWarmCenter != center) continue;
                     _bookPrecacheStarted = false;
                     break;
                 }
             }
             var cacheStatusText = BuildDirectionalCacheStatus(cache, "Cache ready");
-            PostCacheRange(cache, _viewer.GetCachedPageRange(
-                Volatile.Read(ref _requestedWarmCenter)));
+            PostCachedPages(cache, _viewer.GetCachedPages());
             EndCacheProgress(id, cacheStatusText);
             if (rebuildRenderContext)
             {
@@ -1527,6 +1562,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 {
                     _bookPrecacheStarted = false;
                     _warmCancellation = null;
+                    _warmUsesIdlePriority = false;
                 }
             }
             cancellation.Dispose();
@@ -1535,6 +1571,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private async Task WarmDirectionalPagesAsync(
         int center, PageCache cache, Book book, bool rebuildRenderContext,
+        bool idlePriority,
         CancellationToken cancellationToken)
     {
         var context = await CapturePreRenderContextAsync(cancellationToken).ConfigureAwait(false);
@@ -1544,11 +1581,12 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         var workerCount = PrecacheWorkerCount;
         // Keep idle warming incremental. A navigation/resize cancellation can
         // now drain at most four active renders instead of a full CPU-wide batch.
-        var dispatchCount = Math.Clamp(workerCount, 1, 4);
+        var dispatchCount = idlePriority ? 1 : Math.Clamp(workerCount, 1, 4);
         Volatile.Write(ref _activePrecacheWorkerCount, dispatchCount);
         using var genericDecodeSlots = new SemaphoreSlim(workerCount);
         await Parallel.ForEachAsync(
-            EnumerateDirectionalPages(center, book.Pages.Count),
+            EnumerateDirectionalPages(
+                center, book.Pages.Count, includeCenter: idlePriority),
             new ParallelOptions
             {
                 MaxDegreeOfParallelism = dispatchCount,
@@ -1560,6 +1598,9 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 try
                 {
                     if (Volatile.Read(ref _requestedWarmCenter) != center) return;
+                    if (idlePriority)
+                        await RenderWorkScheduler.WaitForIdleWorkToDrainAsync(
+                            workerToken).ConfigureAwait(false);
                     var pageKey = GetPageCacheKey(book, work.Index);
                     if (_landscapePages.TryGetValue(work.Index, out var knownLandscape))
                     {
@@ -1589,7 +1630,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                             await _viewer.PreRenderEncodedJpegAsync(
                                 work.Index, pageKey, page, visiblePageCount,
                                 _rotations.GetValueOrDefault(work.Index), context,
-                                generatePreview: true, workerToken).ConfigureAwait(false);
+                                generatePreview: !idlePriority, workerToken,
+                                idlePriority: idlePriority).ConfigureAwait(false);
                         }
                         if (staleCachedPages is null) ScheduleRelaxedCacheTrim(cache);
                         ReportDirectionalCacheStatus(cache, center);
@@ -1605,7 +1647,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                                  work.Index, decodedLandscape, book.Pages.Count))
                     {
                         await _viewer.PreRenderAsync(
-                            work.Index, pageKey, bitmap, visiblePageCount, context, workerToken);
+                            work.Index, pageKey, bitmap, visiblePageCount, context,
+                            workerToken, idlePriority);
                     }
                     if (staleCachedPages is null) ScheduleRelaxedCacheTrim(cache);
                     ReportDirectionalCacheStatus(cache, center);
@@ -1635,8 +1678,10 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     }
 
     private static IEnumerable<(int Index, bool Ahead)> EnumerateDirectionalPages(
-        int center, int pageCount)
+        int center, int pageCount, bool includeCenter = false)
     {
+        if (includeCenter && (uint)center < (uint)pageCount)
+            yield return (center, true);
         var ahead = center + 1;
         var behind = center - 1;
         while (ahead < pageCount || behind >= 0)
@@ -1763,23 +1808,22 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             return;
         var ahead = GetDirectionalCacheBytes(cache, center, true) / (1024 * 1024);
         var behind = GetDirectionalCacheBytes(cache, center, false) / (1024 * 1024);
-        var range = _viewer.GetCachedPageRange(center);
+        var cachedPages = _viewer.GetCachedPages();
         var text = $"Caching: ahead {ahead}/{_performance.CacheAheadMB} MB, behind {behind}/{_performance.CacheBehindMB} MB " +
             $"({Volatile.Read(ref _activePrecacheWorkerCount)} workers)";
-        PostCacheUiUpdate(cache, text, range);
+        PostCacheUiUpdate(cache, text, cachedPages);
     }
 
-    private void PostCacheRange(
-        PageCache cache, (int BehindStart, int AheadEnd) range) =>
-        PostCacheUiUpdate(cache, null, range);
+    private void PostCachedPages(PageCache cache, int[] cachedPages) =>
+        PostCacheUiUpdate(cache, null, cachedPages);
 
     private void PostCacheUiUpdate(
-        PageCache cache, string? text, (int BehindStart, int AheadEnd) range)
+        PageCache cache, string? text, int[] cachedPages)
     {
         if (IsDisposed || Disposing || !ReferenceEquals(Volatile.Read(ref _cache), cache)) return;
         if (!InvokeRequired)
         {
-            ApplyCacheUiUpdate(cache, text, range);
+            ApplyCacheUiUpdate(cache, text, cachedPages);
             return;
         }
 
@@ -1789,7 +1833,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 _pendingCacheUiText = null;
             _pendingCacheUiCache = cache;
             if (text is not null) _pendingCacheUiText = text;
-            _pendingCacheUiRange = range;
+            _pendingCacheUiPages = cachedPages;
             if (_cacheUiUpdatePending) return;
             _cacheUiUpdatePending = true;
         }
@@ -1804,23 +1848,23 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     {
         PageCache? cache;
         string? text;
-        (int BehindStart, int AheadEnd) range;
+        int[] cachedPages;
         lock (_cacheUiUpdateGate)
         {
             cache = _pendingCacheUiCache;
             text = _pendingCacheUiText;
-            range = _pendingCacheUiRange;
+            cachedPages = _pendingCacheUiPages;
             _pendingCacheUiText = null;
             _cacheUiUpdatePending = false;
         }
-        if (cache is not null) ApplyCacheUiUpdate(cache, text, range);
+        if (cache is not null) ApplyCacheUiUpdate(cache, text, cachedPages);
     }
 
     private void ApplyCacheUiUpdate(
-        PageCache cache, string? text, (int BehindStart, int AheadEnd) range)
+        PageCache cache, string? text, int[] cachedPages)
     {
         if (!ReferenceEquals(_cache, cache)) return;
-        _positionSlider.SetCacheRange(range.BehindStart, range.AheadEnd);
+        _positionSlider.SetCachedPages(cachedPages);
     }
 
     private string GetPageCacheKey(Book book, int index) =>
@@ -2145,6 +2189,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             if (_warmCancellation is not null)
                 CancelAndDisposeInBackground(_warmCancellation);
             _warmCancellation = null;
+            _warmUsesIdlePriority = false;
         }
         try
         {
@@ -2211,6 +2256,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
         async Task<bool> RunPassAsync(IEnumerable<int> phasePages, bool fastPreview)
         {
+            using var thumbnailPriority = fastPreview
+                ? null : RenderWorkScheduler.EnterThumbnailPriorityWork();
             var parallelism = fastPreview
                 ? RenderWorkScheduler.FastCodecConcurrency
                 : RenderWorkScheduler.BatchCodecConcurrency;
@@ -2374,6 +2421,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         async Task<bool> RunBrowseFullPassAsync(
             IEnumerable<ThumbnailPreviewWorkItem> phaseWork, bool priority)
         {
+            using var thumbnailPriority =
+                RenderWorkScheduler.EnterThumbnailPriorityWork();
             var browseWork = phaseWork.Where(work => work.IsBrowse).ToArray();
             try
             {
@@ -2432,6 +2481,12 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         if (!await RunUnifiedFastPassAsync(priorityWork, priority: true)) return;
         if (!await RunBrowseFullPassAsync(priorityWork, priority: true)) return;
         if (!await RunPassAsync(priorityPages, fastPreview: false)) return;
+        // Once visible and nearby cards have both preview stages, spend one
+        // lowest-priority worker on full-view cache warming. The idle scheduler
+        // yields before every new page whenever thumbnail work is pending.
+        if (_cache is { } idleCache && ReferenceEquals(_book, book) && _thumbnailMode)
+            RequestCacheWarm(_pageIndex, idleCache, book,
+                immediate: true, idlePriority: true);
         if (!await RunUnifiedFastPassAsync(remainingWork, priority: false)) return;
         if (!await RunBrowseFullPassAsync(remainingWork, priority: false)) return;
         if (!await RunPassAsync(remainingPages, fastPreview: false)) return;
@@ -2870,6 +2925,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private void SetThumbnailMode(bool enabled)
     {
+        if (!enabled) CancelPendingThumbnailWarmCenter();
         var layoutVersion = unchecked(++_viewModeLayoutVersion);
         ExtendedDiagnostics.Breadcrumb(
             $"View mode transition: from={(_thumbnailMode ? "thumbnail" : "full")}; " +
@@ -2899,7 +2955,9 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         if (enabled)
         {
             _viewer.ReturnToFit();
-            PauseFullPagePrecache();
+            if (_cache is { } idleCache && _book is { } idleBook)
+                RequestCacheWarm(_pageIndex, idleCache, idleBook,
+                    immediate: true, idlePriority: true);
             if (_thumbnailGrid.PageCount != (_book?.Pages.Count ?? 0))
                 BuildThumbnailPlaceholders();
             HighlightThumbnail();
@@ -2910,6 +2968,9 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         else
         {
             CancelThumbnailWork();
+            if (_cache is { } activeCache && _book is { } activeBook)
+                RequestCacheWarm(_pageIndex, activeCache, activeBook,
+                    immediate: true, idlePriority: false);
             _viewer.Focus();
             // Visibility changes post WinForms layout messages. Defer the one
             // and only page render until those messages have run; the version
@@ -2932,6 +2993,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             _bookPrecacheStarted = false;
             CancelAndDisposeInBackground(_warmCancellation);
             _warmCancellation = null;
+            _warmUsesIdlePriority = false;
         }
     }
 
@@ -3254,6 +3316,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private void CancelBookWork(bool retainPageCache = true)
     {
+        CancelPendingThumbnailWarmCenter();
         ClearRetainedAnimation();
         _viewerRendering = false;
         Interlocked.Increment(ref _fileInfoVersion);
@@ -3268,6 +3331,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             _bookPrecacheStarted = false;
             CancelAndDisposeInBackground(_warmCancellation);
             _warmCancellation = null;
+            _warmUsesIdlePriority = false;
         }
         CancelAndDisposeInBackground(_displayCancellation); _displayCancellation = null;
         CancelThumbnailWork();
@@ -3659,6 +3723,12 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             }
             Interlocked.Exchange(ref _pdfPageDeleteInProgress, 0);
         }
+    }
+
+    private void CancelPendingThumbnailWarmCenter()
+    {
+        _thumbnailWarmSelectionTimer.Stop();
+        _pendingThumbnailWarmCenter = -1;
     }
 
     private async Task CopySelectedThumbnailFileAsync()
@@ -4281,6 +4351,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                         CancelAndDisposeInBackground(_warmCancellation);
                     _warmCancellation = null;
                     _bookPrecacheStarted = false;
+                    _warmUsesIdlePriority = false;
                 }
                 CancelThumbnailWork();
                 return;
@@ -4421,6 +4492,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 if (_warmCancellation is not null)
                     CancelAndDisposeInBackground(_warmCancellation);
                 _warmCancellation = null;
+                _warmUsesIdlePriority = false;
                 _requestedWarmCenter = _pageIndex;
             }
             ScheduleRelaxedCacheTrim(cache);

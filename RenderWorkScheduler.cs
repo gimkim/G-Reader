@@ -2,6 +2,15 @@ namespace CDisplayEx.CSharp;
 
 internal static class RenderWorkScheduler
 {
+    private sealed class ThumbnailPriorityLease : IDisposable
+    {
+        private int _held = 1;
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _held, 0) != 0)
+                UnregisterThumbnailPriorityWork();
+        }
+    }
     private sealed class FastLane(int workerCount, int threadsPerWorker)
     {
         public SemaphoreSlim Slots { get; } = new(Math.Max(1, workerCount));
@@ -19,8 +28,12 @@ internal static class RenderWorkScheduler
     private static int _batchCodecConcurrency = 8;
     private static int _pendingFastWork;
     private static TaskCompletionSource _fastWorkDrained = CreateCompletedSignal();
+    private static int _pendingThumbnailPriorityWork;
+    private static TaskCompletionSource _thumbnailPriorityWorkDrained =
+        CreateCompletedSignal();
     private static readonly SemaphoreSlim InteractiveFullSlots = new(2, 2);
     private static readonly SemaphoreSlim UrgentViewportSlots = new(1, 1);
+    private static readonly SemaphoreSlim IdleFullSlots = new(1, 1);
 
     public static int FastCodecConcurrency =>
         Volatile.Read(ref _fastCodecConcurrency);
@@ -28,6 +41,20 @@ internal static class RenderWorkScheduler
     public static int BatchCodecConcurrency =>
         Volatile.Read(ref _batchCodecConcurrency);
     public static int PendingFastWork => Volatile.Read(ref _pendingFastWork);
+    private static bool HasIdleBlockingWork =>
+        Volatile.Read(ref _pendingFastWork) != 0 ||
+        Volatile.Read(ref _pendingThumbnailPriorityWork) != 0;
+
+    public static IDisposable EnterThumbnailPriorityWork()
+    {
+        lock (PriorityGate)
+        {
+            if (_pendingThumbnailPriorityWork++ == 0)
+                _thumbnailPriorityWorkDrained = new TaskCompletionSource(
+                    TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+        return new ThumbnailPriorityLease();
+    }
 
     public static void Configure(
         int globalFastPreviewConcurrency, int fastPreviewWorkers,
@@ -99,6 +126,73 @@ internal static class RenderWorkScheduler
                 cancellationToken).ConfigureAwait(false);
         }
         finally { lane.Slots.Release(); }
+    }
+
+    public static async Task<T> RunIdleFullAsync<T>(
+        Func<T> work, CancellationToken cancellationToken)
+    {
+        // Thumbnail-mode full-view warming may use one otherwise idle worker,
+        // but it must never enter while visible/fast thumbnail work is pending.
+        while (true)
+        {
+            await WaitForIdleWorkToDrainAsync(cancellationToken).ConfigureAwait(false);
+            await Task.Delay(75, cancellationToken).ConfigureAwait(false);
+            if (HasIdleBlockingWork) continue;
+
+            await IdleFullSlots.WaitAsync(cancellationToken).ConfigureAwait(false);
+            var lane = Volatile.Read(ref _fullLane);
+            var enteredLane = false;
+            try
+            {
+                if (HasIdleBlockingWork) continue;
+                await lane.Slots.WaitAsync(cancellationToken).ConfigureAwait(false);
+                enteredLane = true;
+                if (HasIdleBlockingWork) continue;
+                return await Task.Run(
+                    () => RunAtPriority(work, ThreadPriority.Lowest),
+                    cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                if (enteredLane) lane.Slots.Release();
+                IdleFullSlots.Release();
+            }
+        }
+    }
+
+    public static async Task WaitForFastWorkToDrainAsync(
+        CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            Task wait;
+            lock (PriorityGate)
+            {
+                if (_pendingFastWork == 0) return;
+                wait = _fastWorkDrained.Task;
+            }
+            await wait.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    public static async Task WaitForIdleWorkToDrainAsync(
+        CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            Task wait;
+            lock (PriorityGate)
+            {
+                if (_pendingFastWork == 0 &&
+                    _pendingThumbnailPriorityWork == 0) return;
+                var waits = new List<Task>(2);
+                if (_pendingFastWork != 0) waits.Add(_fastWorkDrained.Task);
+                if (_pendingThumbnailPriorityWork != 0)
+                    waits.Add(_thumbnailPriorityWorkDrained.Task);
+                wait = Task.WhenAll(waits);
+            }
+            await wait.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
     }
 
     public static async Task<T> RunInteractiveFullAsync<T>(
@@ -178,6 +272,17 @@ internal static class RenderWorkScheduler
         lock (PriorityGate)
         {
             if (--_pendingFastWork == 0) completed = _fastWorkDrained;
+        }
+        completed?.TrySetResult();
+    }
+
+    private static void UnregisterThumbnailPriorityWork()
+    {
+        TaskCompletionSource? completed = null;
+        lock (PriorityGate)
+        {
+            if (--_pendingThumbnailPriorityWork == 0)
+                completed = _thumbnailPriorityWorkDrained;
         }
         completed?.TrySetResult();
     }

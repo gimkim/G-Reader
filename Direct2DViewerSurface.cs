@@ -135,12 +135,24 @@ internal sealed class Direct2DViewerSurface : Control
     public void Present(Bitmap? left, Bitmap? right, Rectangle leftBounds, Rectangle rightBounds)
     {
         ReleaseAnimatedGpuPages();
-        EnsureRenderTarget();
-        _leftBitmap = GetOrCreateBitmap(left);
-        _rightBitmap = GetOrCreateBitmap(right);
-        _leftBounds = leftBounds;
-        _rightBounds = rightBounds;
-        DrawFrame();
+        try
+        {
+            EnsureRenderTarget();
+            var leftBitmap = GetOrCreateBitmap(left);
+            var rightBitmap = GetOrCreateBitmap(right);
+            _leftBitmap = leftBitmap;
+            _rightBitmap = rightBitmap;
+            _leftBounds = leftBounds;
+            _rightBounds = rightBounds;
+            DrawFrame();
+        }
+        catch (Exception exception)
+        {
+            ExtendedDiagnostics.LogException(
+                "Direct2D CPU bitmap import failed", exception);
+            HandleDeviceLoss("CPU bitmap import");
+            return;
+        }
         if (_gpuCacheBytes > GpuCacheLimitBytes + GpuCleanupHeadroomBytes)
         {
             // Device resources belong to this UI thread, so release them only
@@ -176,18 +188,44 @@ internal sealed class Direct2DViewerSurface : Control
         Rectangle leftBounds, Rectangle rightBounds)
     {
         ReleaseAnimatedGpuPages();
-        EnsureRenderTarget();
-        _leftBitmap = GetOrCreateGpuBitmap(left);
-        _rightBitmap = GetOrCreateGpuBitmap(right);
-        _leftBounds = leftBounds;
-        _rightBounds = rightBounds;
-        var presented = DrawFrame();
-        if (_gpuCacheBytes > GpuCacheLimitBytes + GpuCleanupHeadroomBytes)
+        try
         {
-            _gpuTrimTimer.Stop();
-            _gpuTrimTimer.Start();
+            EnsureRenderTarget();
+            // The HWND fallback can display CPU bitmaps, but cannot import a
+            // shared D3D texture. Do not replace the current frame with null
+            // bitmaps while the device-context target is being recovered.
+            if (_deviceContext is null)
+            {
+                ScheduleDeviceRecovery("GPU presentation target unavailable");
+                return false;
+            }
+            var leftBitmap = GetOrCreateGpuBitmap(left);
+            var rightBitmap = GetOrCreateGpuBitmap(right);
+            if ((left is not null && leftBitmap is null) ||
+                (right is not null && rightBitmap is null))
+            {
+                ScheduleDeviceRecovery("GPU bitmap import unavailable");
+                return false;
+            }
+            _leftBitmap = leftBitmap;
+            _rightBitmap = rightBitmap;
+            _leftBounds = leftBounds;
+            _rightBounds = rightBounds;
+            var presented = DrawFrame();
+            if (_gpuCacheBytes > GpuCacheLimitBytes + GpuCleanupHeadroomBytes)
+            {
+                _gpuTrimTimer.Stop();
+                _gpuTrimTimer.Start();
+            }
+            return presented;
         }
-        return presented;
+        catch (Exception exception)
+        {
+            ExtendedDiagnostics.LogException(
+                "Direct2D GPU bitmap import failed", exception);
+            HandleDeviceLoss("GPU bitmap import");
+            return false;
+        }
     }
 
     public void UpdateLayout(Rectangle leftBounds, Rectangle rightBounds)
@@ -682,6 +720,10 @@ internal sealed class Direct2DViewerSurface : Control
             EnsureRenderTarget();
             var target = (ID2D1RenderTarget?)_deviceContext ?? _renderTarget;
             if (target is null) return false;
+            // Direct2D retains context state between BeginDraw calls. Always
+            // begin from a known transform so one interrupted effect or rotated
+            // draw cannot contaminate every page presented afterward.
+            target.Transform = Matrix3x2.Identity;
             target.BeginDraw();
             target.Clear(new Color4(
                 _backgroundColor.R / 255f,
@@ -704,6 +746,7 @@ internal sealed class Direct2DViewerSurface : Control
                         ? _rightAnimationRotation : 0);
             }
             var result = target.EndDraw();
+            target.Transform = Matrix3x2.Identity;
             if (result.Failure)
             {
                 ExtendedDiagnostics.Breadcrumb(
@@ -757,8 +800,10 @@ internal sealed class Direct2DViewerSurface : Control
     private void ScheduleDeviceRecovery(string reason)
     {
         if (IsDisposed || Disposing || !IsHandleCreated) return;
+        // Navigation can request many frames while the GPU target is down. Do
+        // not keep postponing an already scheduled recovery on every request.
+        if (_deviceRecoveryTimer.Enabled) return;
         _deviceRecoveryAttempt = Math.Min(_deviceRecoveryAttempt + 1, 6);
-        _deviceRecoveryTimer.Stop();
         _deviceRecoveryTimer.Interval = Math.Min(
             1000, 50 << Math.Min(4, _deviceRecoveryAttempt - 1));
         ExtendedDiagnostics.Breadcrumb(
@@ -774,6 +819,22 @@ internal sealed class Direct2DViewerSurface : Control
         try
         {
             EnsureRenderTarget();
+            // A hardware-device loss can transiently prevent DXGI from creating
+            // a replacement swap chain for this HWND. EnsureRenderTarget then
+            // creates a CPU-capable HWND target, but that is not a completed GPU
+            // recovery. Remove the fallback and keep retrying until shared GPU
+            // textures can be imported again.
+            if (_deviceContext is null && GpuInteropDevice.Device is not null)
+            {
+                _renderTarget?.Dispose();
+                _renderTarget = null;
+                if (!TryCreateDeviceContextTarget())
+                {
+                    EnsureRenderTarget();
+                    ScheduleDeviceRecovery("device-context retry");
+                    return;
+                }
+            }
             if (_deviceContext is null && _renderTarget is null)
             {
                 ScheduleDeviceRecovery("target unavailable");
@@ -818,19 +879,25 @@ internal sealed class Direct2DViewerSurface : Control
             _deviceContext is { } context && TryGetColorEffect(bitmap, sourceProfile) is { } effect)
         {
             var previous = context.Transform;
-            context.Transform = Matrix3x2.CreateScale(
-                    drawWidth / bitmap.Size.Width, drawHeight / bitmap.Size.Height) *
-                Matrix3x2.CreateTranslation(drawLeft, drawTop) * rotationTransform;
-            using var output = effect.Output;
-            context.DrawImage(output, Vector2.Zero, null,
-                InterpolationMode.Linear, CompositeMode.SourceOver);
-            context.Transform = previous;
+            try
+            {
+                context.Transform = Matrix3x2.CreateScale(
+                        drawWidth / bitmap.Size.Width, drawHeight / bitmap.Size.Height) *
+                    Matrix3x2.CreateTranslation(drawLeft, drawTop) * rotationTransform;
+                using var output = effect.Output;
+                context.DrawImage(output, Vector2.Zero, null,
+                    InterpolationMode.Linear, CompositeMode.SourceOver);
+            }
+            finally { context.Transform = previous; }
             return;
         }
         var oldTransform = target.Transform;
-        target.Transform = rotationTransform;
-        target.DrawBitmap(bitmap, destination, 1f, BitmapInterpolationMode.Linear, null);
-        target.Transform = oldTransform;
+        try
+        {
+            target.Transform = rotationTransform;
+            target.DrawBitmap(bitmap, destination, 1f, BitmapInterpolationMode.Linear, null);
+        }
+        finally { target.Transform = oldTransform; }
     }
 
     private void ReleaseAnimatedGpuPages()

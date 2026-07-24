@@ -97,6 +97,7 @@ internal static class GpuContactSheetRenderer
                             Vortice.DCommon.AlphaMode.Premultiplied), 96f, 96f,
                             BitmapOptions.Target));
                     _context.Target = output;
+                    _context.Transform = Matrix3x2.Identity;
                     _context.BeginDraw();
                     _context.Clear(new Color4(0, 0, 0, 0));
                     _context.DrawBitmap(input, new RawRectF(0, 0,
@@ -104,7 +105,9 @@ internal static class GpuContactSheetRenderer
                         BitmapInterpolationMode.Linear, null);
                     var result = _context.EndDraw();
                     _context.Target = null;
-                    if (result.Failure) return null;
+                    if (result.Failure)
+                        throw new InvalidOperationException(
+                            $"Direct2D GPU scale EndDraw failed: {result.Code}");
                     var rendered = new GpuRenderedImage(texture, IntPtr.Zero,
                         targetSize.Width, targetSize.Height, _ => { }, _deviceUsage);
                     texture = null;
@@ -112,7 +115,13 @@ internal static class GpuContactSheetRenderer
                 }
                 finally { _context.Target = null; texture?.Dispose(); }
             }
-            catch { return null; }
+            catch (Exception exception)
+            {
+                ExtendedDiagnostics.LogException(
+                    "Direct2D GPU scale failed", exception);
+                DiscardContext();
+                return null;
+            }
             finally
             {
                 if (_deviceGeneration != GpuInteropDevice.Generation) DiscardContext();
@@ -157,6 +166,7 @@ internal static class GpuContactSheetRenderer
                                     96f, 96f, BitmapOptions.None)));
                         }
                         _context.Target = output;
+                        _context.Transform = Matrix3x2.Identity;
                         _context.BeginDraw();
                         _context.Clear(new Color4(0, 0, 0, 0));
                         // Use most of the preview area. The old 66% height cap left
@@ -196,7 +206,9 @@ internal static class GpuContactSheetRenderer
                         _context.Transform = Matrix3x2.Identity;
                         var result = _context.EndDraw();
                         _context.Target = null;
-                        if (result.Failure) { texture.Dispose(); return null; }
+                        if (result.Failure)
+                            throw new InvalidOperationException(
+                                $"Direct2D GPU composition EndDraw failed: {result.Code}");
                         var owned = new GpuRenderedImage(texture, IntPtr.Zero,
                             targetSize.Width, targetSize.Height, _ => { }, _deviceUsage);
                         texture = null;
@@ -210,7 +222,13 @@ internal static class GpuContactSheetRenderer
                 }
                 finally { texture?.Dispose(); }
             }
-            catch { return null; }
+            catch (Exception exception)
+            {
+                ExtendedDiagnostics.LogException(
+                    "Direct2D GPU composition failed", exception);
+                DiscardContext();
+                return null;
+            }
             finally
             {
                 if (_deviceGeneration != GpuInteropDevice.Generation) DiscardContext();
