@@ -33,8 +33,9 @@ internal static class BrowsePreviewRenderer
                             CopyToWithCancellation(source, memory, cancellationToken);
                         return memory.ToArray();
                     });
-                    return new PageEntry(captured.Key!, () =>
+                    var page = new PageEntry(captured.Key!, () =>
                         new MemoryStream(encoded.Value, writable: false));
+                    return page with { ExifRotation = Book.ReadExifRotation(page) };
                 }).ToArray();
             return CreateGpuFromPages(
                 pages, targetSize, fastPreview, quality, cancellationToken);
@@ -67,7 +68,8 @@ internal static class BrowsePreviewRenderer
                 if (EncodedJpegRenderer.Supports(page))
                 {
                     var result = EncodedJpegRenderer.RenderThumbnailGpu(page, cardTarget,
-                        0, fastPreview, jpegQuality: fastPreview ? 82 : 92,
+                        page.ExifRotation, fastPreview,
+                        jpegQuality: fastPreview ? 82 : 92,
                         cancellationToken);
                     if (result is not { } rendered) return null;
                     images.Add(rendered.Image);
@@ -120,8 +122,9 @@ internal static class BrowsePreviewRenderer
                         CopyToWithCancellation(source, memory, cancellationToken);
                     return memory.ToArray();
                 });
-                return new PageEntry(captured.Key!, () =>
+                var page = new PageEntry(captured.Key!, () =>
                     new MemoryStream(encoded.Value, writable: false));
+                return page with { ExifRotation = Book.ReadExifRotation(page) };
             }).ToArray();
             return CreateFromPages(
                 archivePages, targetSize, threads, fastPreview, quality,
@@ -208,7 +211,8 @@ internal static class BrowsePreviewRenderer
     {
         if (EncodedJpegRenderer.Supports(page))
             return EncodedJpegRenderer.RenderThumbnail(
-                page, targetSize, 0, quality, fastPreview, cancellationToken).Bitmap;
+                page, targetSize, page.ExifRotation, quality,
+                fastPreview, cancellationToken).Bitmap;
         return RenderGenericPage(
             page, targetSize, fastPreview, quality, cancellationToken);
     }

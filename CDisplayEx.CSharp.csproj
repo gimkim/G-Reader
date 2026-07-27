@@ -19,13 +19,13 @@
     <AssemblyTitle>Fast Reader/Viewer</AssemblyTitle>
     <Product>Fast Reader/Viewer</Product>
     <Description>Hardware-accelerated comic and image reader</Description>
-    <Version>1.7.0</Version>
-    <AssemblyVersion>1.7.0.0</AssemblyVersion>
-    <FileVersion>1.7.0.0</FileVersion>
+    <Version>1.8.0</Version>
+    <AssemblyVersion>1.8.0.0</AssemblyVersion>
+    <FileVersion>1.8.0.0</FileVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="Magick.NET-Q8-x64" Version="14.14.0" />
+    <PackageReference Include="Magick.NET-Q8-x64" Version="14.15.0" />
     <PackageReference Include="PDFiumCore" Version="152.0.7947" />
     <PackageReference Include="Imazen.WebP" Version="11.0.0" />
     <PackageReference Include="Imazen.WebP.NativeRuntime.win-x64" Version="1.6.1" />

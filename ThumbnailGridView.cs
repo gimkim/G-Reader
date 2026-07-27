@@ -59,6 +59,7 @@ internal sealed partial class ThumbnailGridView : Panel
     private long _lastScrollingViewportRefreshTick;
     private int _lastScrollingViewportFirstItem = -1;
     private int _lastScrollingViewportLastItem = -1;
+    private bool _nativeGpuSourcesEnabled = true;
 
     public event EventHandler<int>? PageActivated;
     public event EventHandler<string>? FolderActivated;
@@ -70,6 +71,7 @@ internal sealed partial class ThumbnailGridView : Panel
 
     public int PageCount => _pageCount;
     public int ContentGeneration => Volatile.Read(ref _contentGeneration);
+    public bool NativeGpuSourcesEnabled => Volatile.Read(ref _nativeGpuSourcesEnabled);
     public string? SelectedBrowsePath =>
         _selectedItem >= 0 && _selectedItem < _folders.Length
             ? _folders[_selectedItem].Path
@@ -494,6 +496,8 @@ internal sealed partial class ThumbnailGridView : Panel
     {
         lock (_contentGate)
         {
+            if (!NativeGpuSourcesEnabled)
+            { preview.Dispose(); return; }
             if (generation != ContentGeneration || item < 0 || item >= _folders.Length)
             { preview.Dispose(); return; }
             if (preview.DeviceGeneration != GpuInteropDevice.Generation)
@@ -522,6 +526,8 @@ internal sealed partial class ThumbnailGridView : Panel
     {
         lock (_contentGate)
         {
+            if (!NativeGpuSourcesEnabled)
+            { thumbnail.Dispose(); return; }
             if (generation != ContentGeneration || page < 0 || page >= _pageCount)
             { thumbnail.Dispose(); return; }
             if (thumbnail.DeviceGeneration != GpuInteropDevice.Generation)

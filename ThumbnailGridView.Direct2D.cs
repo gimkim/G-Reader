@@ -823,6 +823,7 @@ internal sealed partial class ThumbnailGridView
 
     private ID2D1Bitmap? GetOrCreateNativeGpuTexture(GpuRenderedImage source)
     {
+        if (!NativeGpuSourcesEnabled) return null;
         if (source.DeviceGeneration != GpuInteropDevice.Generation) return null;
         if (_thumbnailDeviceContext is null)
         {
@@ -1104,6 +1105,7 @@ internal sealed partial class ThumbnailGridView
 
     private void ScheduleGpuSourceRecovery()
     {
+        if (!NativeGpuSourcesEnabled) return;
         if (Interlocked.Exchange(ref _gpuSourceRecoveryPending, 1) != 0) return;
         if (IsDisposed || Disposing || !IsHandleCreated)
         {
@@ -1116,6 +1118,7 @@ internal sealed partial class ThumbnailGridView
             {
                 try
                 {
+                    if (!NativeGpuSourcesEnabled) return;
                     // A native D2D import or EndDraw failure can leave every cached
                     // CUDA/D3D image tied to a lost device. Drop those GPU sources
                     // after the active paint has released its leases, then request
@@ -1192,6 +1195,11 @@ internal sealed partial class ThumbnailGridView
                 _gpuFastPreviewCache.Clear(retirement);
                 _gpuBrowseFullPreviewCache.Clear(retirement);
                 _gpuBrowseFastPreviewCache.Clear(retirement);
+                // A removed device has already demonstrated that native
+                // CUDA/D3D thumbnail sharing is unstable for this session.
+                // Continue with CPU-owned previews uploaded by Direct2D; this
+                // keeps hardware presentation while avoiding a recovery loop.
+                Volatile.Write(ref _nativeGpuSourcesEnabled, false);
                 ExtendedDiagnostics.Breadcrumb(
                     $"Thumbnail shared D3D device reset: recreated={recreated}; " +
                     $"generation={GpuInteropDevice.Generation}");

@@ -10,9 +10,11 @@ namespace CDisplayEx.CSharp;
 
 internal sealed record PageEntry(
     string Name, Func<Stream> Open, Func<CancellationToken, Bitmap>? Decode = null,
-    Func<Size, float, CancellationToken, Bitmap>? DecodeThumbnail = null);
+    Func<Size, float, CancellationToken, Bitmap>? DecodeThumbnail = null,
+    int ExifRotation = 0);
 internal sealed record SortablePage(
-    string Name, long Size, DateTime Modified, DateTime? Taken, Func<Stream> Open);
+    string Name, long Size, DateTime Modified, DateTime? Taken, Func<Stream> Open,
+    int ExifRotation = 0);
 internal sealed record SortableBrowsePath(
     string Path, long Size, DateTime Modified, DateTime? Taken);
 
@@ -135,7 +137,8 @@ internal sealed class Book : IDisposable
                         cancellationToken.ThrowIfCancellationRequested();
                         var captured = file;
                         pages.Add(new PageEntry(Path.GetFileName(captured),
-                            () => File.OpenRead(captured)));
+                            () => File.OpenRead(captured),
+                            ExifRotation: TryReadExifRotation(captured)));
                         if (pages.Count == maximumPages) break;
                     }
                 }
@@ -173,7 +176,10 @@ internal sealed class Book : IDisposable
             return names.Select(name =>
             {
                 var captured = name;
-                return new PageEntry(captured, () => OpenArchiveEntry(path, captured));
+                using var orientationStream = OpenArchiveEntry(path, captured);
+                var exifRotation = TryReadExifRotation(orientationStream);
+                return new PageEntry(captured, () => OpenArchiveEntry(path, captured),
+                    ExifRotation: exifRotation);
             }).ToArray();
         }
         if (Path.GetExtension(path).Equals(".pdf", StringComparison.OrdinalIgnoreCase))
@@ -208,7 +214,7 @@ internal sealed class Book : IDisposable
                 Path.GetFileName(path), info?.Length ?? 0L,
                 info?.LastWriteTimeUtc ?? DateTime.MinValue,
                 sortMode == PageSortMode.DateTaken ? TryReadDateTaken(path) : null,
-                () => File.OpenRead(path));
+                () => File.OpenRead(path), TryReadExifRotation(path));
         }).ToArray();
         var sortedPages = SortPages(sortablePages, sortMode, descending).ToArray();
         if (preferredOrder is { Count: > 0 })
@@ -235,7 +241,8 @@ internal sealed class Book : IDisposable
             subfolders, sortMode, descending, directories: true).ToArray();
         containers = SortBrowsePaths(
             containers, sortMode, descending, directories: false).ToArray();
-        var pages = sortedPages.Select(page => new PageEntry(page.Name, page.Open)).ToArray();
+        var pages = sortedPages.Select(page => new PageEntry(
+            page.Name, page.Open, ExifRotation: page.ExifRotation)).ToArray();
         return new Book(folder, pages, subfolders, Directory.GetParent(folder)?.FullName,
             containers);
     }
@@ -312,6 +319,7 @@ internal sealed class Book : IDisposable
             {
                 var name = entry.Key!;
                 DateTime? taken = null;
+                var exifRotation = 0;
                 if (sortMode == PageSortMode.DateTaken)
                 {
                     try
@@ -321,9 +329,16 @@ internal sealed class Book : IDisposable
                     }
                     catch { }
                 }
+                try
+                {
+                    using var stream = entry.OpenEntryStream();
+                    exifRotation = TryReadExifRotation(stream);
+                }
+                catch { }
                 pages.Add(new SortablePage(
                     name, entry.Size, entry.LastModifiedTime ?? DateTime.MinValue, taken,
-                    () => throw new InvalidOperationException("Archive session is not initialized.")));
+                    () => throw new InvalidOperationException("Archive session is not initialized."),
+                    exifRotation));
             }
             sortedPages = SortPages(
                 pages, sortMode, descending, hierarchicalNames: true).ToArray();
@@ -332,7 +347,8 @@ internal sealed class Book : IDisposable
         var resultPages = sortedPages.Select(page =>
         {
             var name = page.Name;
-            return new PageEntry(name, () => sessions.OpenEntry(name));
+            return new PageEntry(name, () => sessions.OpenEntry(name),
+                ExifRotation: page.ExifRotation);
         }).ToArray();
         return new Book(archivePath, resultPages,
             parentFolder: Path.GetDirectoryName(archivePath), ownedResource: sessions);
@@ -604,6 +620,56 @@ internal sealed class Book : IDisposable
             return TryReadDateTaken(image);
         }
         catch { return null; }
+    }
+
+    private static int TryReadExifRotation(string path)
+    {
+        if (!Path.GetExtension(path).Equals(".jpg", StringComparison.OrdinalIgnoreCase) &&
+            !Path.GetExtension(path).Equals(".jpeg", StringComparison.OrdinalIgnoreCase))
+            return 0;
+        try
+        {
+            using var stream = File.OpenRead(path);
+            return TryReadExifRotation(stream);
+        }
+        catch { return 0; }
+    }
+
+    private static int TryReadExifRotation(Stream stream)
+    {
+        try
+        {
+            using var image = Image.FromStream(stream, false, false);
+            var value = image.GetPropertyItem(0x0112)?.Value;
+            if (value is not { Length: > 0 }) return 0;
+            // GDI+ normally exposes this SHORT in native little-endian order,
+            // while a few camera codecs preserve TIFF byte order. Orientation
+            // values are only 1..8, so accept the valid byte from either side.
+            var orientation = value[0] is >= 1 and <= 8
+                ? value[0]
+                : value.Length > 1 && value[1] is >= 1 and <= 8 ? value[1] : 1;
+            return orientation switch
+            {
+                3 or 4 => 180,
+                5 or 6 => 90,
+                7 or 8 => 270,
+                _ => 0
+            };
+        }
+        catch { return 0; }
+    }
+
+    internal static int ReadExifRotation(PageEntry page)
+    {
+        var extension = Path.GetExtension(page.Name);
+        if (!extension.Equals(".jpg", StringComparison.OrdinalIgnoreCase) &&
+            !extension.Equals(".jpeg", StringComparison.OrdinalIgnoreCase)) return 0;
+        try
+        {
+            using var stream = page.Open();
+            return TryReadExifRotation(stream);
+        }
+        catch { return 0; }
     }
 
     private static DateTime? TryReadDateTaken(Stream stream)

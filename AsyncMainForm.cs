@@ -179,6 +179,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private CancellationTokenSource? _bookCancellation;
     private CancellationTokenSource? _displayCancellation;
     private CancellationTokenSource? _warmCancellation;
+    private Task? _warmTask;
     private CancellationTokenSource? _thumbnailCancellation;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<BrowsePreviewKey, byte>
         _browsePreviewsInFlight = new();
@@ -850,7 +851,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             _book = book;
             ExtendedDiagnostics.Breadcrumb(
                 $"Open completed: {book.SourcePath}; pages={book.Pages.Count}; " +
-                $"folders={book.Subfolders.Count}; containers={book.Containers.Count}");
+                $"folders={book.Subfolders.Count}; containers={book.Containers.Count}; " +
+                $"exifOriented={book.Pages.Count(page => page.ExifRotation != 0)}");
             _rotations.Clear();
             _landscapePages.Clear();
             if (pdfReloadCache is not null)
@@ -1062,13 +1064,13 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 var context = _viewer.CapturePreRenderContext();
                 var firstRender = _viewer.PreRenderEncodedJpegAsync(
                     firstIndex, firstKey, book.Pages[firstIndex], visiblePageCount,
-                    _rotations.GetValueOrDefault(firstIndex), context,
+                    GetPageRotation(book, firstIndex), context,
                     generatePreview: false, cancellation.Token, interactiveFull: true);
                 var secondRender = directSecondIndex >= 0
                     ? _viewer.PreRenderEncodedJpegAsync(
                         directSecondIndex, GetPageCacheKey(book, directSecondIndex),
                         book.Pages[directSecondIndex], visiblePageCount,
-                        _rotations.GetValueOrDefault(directSecondIndex), context,
+                        GetPageRotation(book, directSecondIndex), context,
                         generatePreview: false, cancellation.Token, interactiveFull: true)
                     : Task.CompletedTask;
                 await Task.WhenAll(firstRender, secondRender);
@@ -1091,9 +1093,9 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 }
             }
 
-            var firstTask = LoadPageAsync(cache, firstIndex, cancellation.Token);
+            var firstTask = LoadPageAsync(cache, book, firstIndex, cancellation.Token);
             var secondTask = secondCandidate >= 0
-                ? LoadOptionalPageAsync(cache, secondCandidate, cancellation.Token)
+                ? LoadOptionalPageAsync(cache, book, secondCandidate, cancellation.Token)
                 : Task.FromResult<Bitmap?>(null);
             var first = await firstTask;
             UpdateProgress(progress, 1, total, "Page ready");
@@ -1192,7 +1194,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             {
                 AnimatedImageRenderer.DecodeProgressively(
                     book.Pages[pageIndex], clientSize, visiblePageCount,
-                    _rotations.GetValueOrDefault(pageIndex),
+                    GetPageRotation(book, pageIndex),
                     cancellationToken, frames =>
                     {
                         try
@@ -1248,13 +1250,15 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private string GetAnimationKey(Book book, int pageIndex, int visiblePageCount) =>
         string.Join("|", Path.GetFullPath(book.SourcePath), pageIndex,
-            visiblePageCount, _rotations.GetValueOrDefault(pageIndex));
+            visiblePageCount, GetPageRotation(book, pageIndex));
 
     private void AttachAnimation(string key, int pageIndex, AnimationFrameSet frames)
     {
         _activeAnimationKeys[frames] = key;
         _viewer.SetAnimationFrames(
-            pageIndex, frames, _rotations.GetValueOrDefault(pageIndex));
+            pageIndex, frames, _book is { } book
+                ? GetPageRotation(book, pageIndex)
+                : _rotations.GetValueOrDefault(pageIndex));
     }
 
     private void RetainAnimation(string key, AnimationFrameSet frames)
@@ -1288,10 +1292,10 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             var previewTasks = new[]
             {
                 DecodeFastPagePreviewAsync(book, firstIndex, bounds,
-                    _rotations.GetValueOrDefault(firstIndex), cancellationToken),
+                    GetPageRotation(book, firstIndex), cancellationToken),
                 secondIndex >= 0
                 ? DecodeFastPagePreviewAsync(book, secondIndex, bounds,
-                    _rotations.GetValueOrDefault(secondIndex), cancellationToken)
+                    GetPageRotation(book, secondIndex), cancellationToken)
                 : Task.FromResult<Bitmap?>(null)
             };
             var previews = await AwaitPreviewTasksOwnedAsync(previewTasks);
@@ -1346,12 +1350,12 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 ? Task.FromResult<Bitmap?>(first)
                 : LoadPersistentThumbnailPlaceholderAsync(
                     book, firstIndex, targetSize,
-                    _rotations.GetValueOrDefault(firstIndex), cancellationToken);
+                    GetPageRotation(book, firstIndex), cancellationToken);
             var secondTask = secondIndex < 0 || second is not null
                 ? Task.FromResult<Bitmap?>(second)
                 : LoadPersistentThumbnailPlaceholderAsync(
                     book, secondIndex, targetSize,
-                    _rotations.GetValueOrDefault(secondIndex), cancellationToken);
+                    GetPageRotation(book, secondIndex), cancellationToken);
             // The task array owns the RAM clones until WhenAll returns. This
             // prevents the exception cleanup path from disposing them twice.
             first = null;
@@ -1416,9 +1420,9 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             // Keep rapid navigation on the rendered-cache-only path. Full-size
             // source clones are attached only after the user pauses briefly.
             if (!attachImmediately) await Task.Delay(120, cancellation.Token);
-            var firstTask = LoadPageAsync(cache, firstIndex, cancellation.Token);
+            var firstTask = LoadPageAsync(cache, book, firstIndex, cancellation.Token);
             var secondTask = secondIndex >= 0
-                ? LoadOptionalPageAsync(cache, secondIndex, cancellation.Token)
+                ? LoadOptionalPageAsync(cache, book, secondIndex, cancellation.Token)
                 : Task.FromResult<Bitmap?>(null);
             first = await firstTask;
             second = await secondTask;
@@ -1435,18 +1439,21 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         }
     }
 
-    private async Task<Bitmap> LoadPageAsync(PageCache cache, int index, CancellationToken cancellationToken)
+    private async Task<Bitmap> LoadPageAsync(
+        PageCache cache, Book book, int index, CancellationToken cancellationToken)
     {
         // Keep clone finalization and optional full-size rotation off the UI
         // synchronization context. The caller resumes on UI only to present.
         var bitmap = await cache.GetCloneAsync(index, cancellationToken).ConfigureAwait(false);
-        if (_rotations.TryGetValue(index, out var rotation)) ApplyRotation(bitmap, rotation);
+        var rotation = GetPageRotation(book, index);
+        if (rotation != 0) ApplyRotation(bitmap, rotation);
         _landscapePages[index] = bitmap.Width > bitmap.Height;
         return bitmap;
     }
 
-    private async Task<Bitmap?> LoadOptionalPageAsync(PageCache cache, int index, CancellationToken cancellationToken) =>
-        await LoadPageAsync(cache, index, cancellationToken).ConfigureAwait(false);
+    private async Task<Bitmap?> LoadOptionalPageAsync(
+        PageCache cache, Book book, int index, CancellationToken cancellationToken) =>
+        await LoadPageAsync(cache, book, index, cancellationToken).ConfigureAwait(false);
 
     private static async Task DisposeWhenReadyAsync(Task<Bitmap?> task)
     {
@@ -1501,7 +1508,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             _warmUsesIdlePriority = idlePriority;
             var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_bookCancellation!.Token);
             _warmCancellation = cancellation;
-            _ = WarmCacheAsync(
+            _warmTask = WarmCacheAsync(
                 cache, book, cancellation, immediate, rebuildRenderContext,
                 idlePriority);
         }
@@ -1562,6 +1569,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 {
                     _bookPrecacheStarted = false;
                     _warmCancellation = null;
+                    _warmTask = null;
                     _warmUsesIdlePriority = false;
                 }
             }
@@ -1621,7 +1629,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                             ? cachedLandscape
                             : await RenderWorkScheduler.RunFastCodecAsync(
                                 () => EncodedJpegRenderer.ProbeLandscape(
-                                    page, _rotations.GetValueOrDefault(work.Index), workerToken),
+                                    page, GetPageRotation(book, work.Index), workerToken),
                                 workerToken).ConfigureAwait(false);
                         _landscapePages[work.Index] = landscape;
                         foreach (var visiblePageCount in GetPrecacheVisiblePageCounts(
@@ -1629,7 +1637,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                         {
                             await _viewer.PreRenderEncodedJpegAsync(
                                 work.Index, pageKey, page, visiblePageCount,
-                                _rotations.GetValueOrDefault(work.Index), context,
+                                GetPageRotation(book, work.Index), context,
                                 generatePreview: !idlePriority, workerToken,
                                 idlePriority: idlePriority).ConfigureAwait(false);
                         }
@@ -1640,7 +1648,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
                     await genericDecodeSlots.WaitAsync(workerToken).ConfigureAwait(false);
                     enteredGenericSlot = true;
-                    using var bitmap = await LoadPageAsync(cache, work.Index, workerToken);
+                    using var bitmap = await LoadPageAsync(
+                        cache, book, work.Index, workerToken);
                     if (Volatile.Read(ref _requestedWarmCenter) != center) return;
                     var decodedLandscape = bitmap.Width > bitmap.Height;
                     foreach (var visiblePageCount in GetPrecacheVisiblePageCounts(
@@ -1868,7 +1877,15 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     }
 
     private string GetPageCacheKey(Book book, int index) =>
-        $"{book.SourcePath}|{index}|{_rotations.GetValueOrDefault(index)}|pdf:1";
+        $"{book.SourcePath}|{index}|{GetPageRotation(book, index)}|pdf:1";
+
+    private int GetPageRotation(Book book, int index)
+    {
+        var rotation = _rotations.GetValueOrDefault(index) +
+            book.Pages[index].ExifRotation;
+        rotation %= 360;
+        return rotation < 0 ? rotation + 360 : rotation;
+    }
 
     private string GetEmbeddedProfileKey(Book book, int index) =>
         $"{book.SourcePath}|{book.Pages[index].Name}";
@@ -1986,7 +2003,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken, _bookCancellation?.Token ?? CancellationToken.None);
         var entry = book.Pages[pageIndex];
-        var rotation = _rotations.GetValueOrDefault(pageIndex);
+        var rotation = GetPageRotation(book, pageIndex);
         return await Task.Run(
             () => EncodedJpegRenderer.ProbeSize(entry, rotation, linked.Token),
             linked.Token).ConfigureAwait(false);
@@ -2002,7 +2019,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken, _bookCancellation?.Token ?? CancellationToken.None);
         var entry = book.Pages[pageIndex];
-        var rotation = _rotations.GetValueOrDefault(pageIndex);
+        var rotation = GetPageRotation(book, pageIndex);
         var renderSize = fastPreview
             ? new Size(Math.Max(1, outputSize.Width * 3 / 4),
                 Math.Max(1, outputSize.Height * 3 / 4))
@@ -2625,7 +2642,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         {
             cancellationToken.ThrowIfCancellationRequested();
             var entry = book.Pages[page];
-            var rotation = _rotations.GetValueOrDefault(page);
+            var rotation = GetPageRotation(book, page);
             var decodeTarget = rotation is 90 or 270
                 ? new Size(targetSize.Height, targetSize.Width)
                 : targetSize;
@@ -2670,7 +2687,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 }, cancellationToken).ConfigureAwait(false);
                 if (cached is not null) return new GeneratedThumbnail(cached, null);
 
-                if (fastPreview && !isPdf)
+                if (fastPreview && !isPdf && _thumbnailGrid.NativeGpuSourcesEnabled)
                 {
                     var gpu = await RenderWorkScheduler.RunFastCodecAsync(
                         () => BrowsePreviewRenderer.CreateGpu(
@@ -2725,7 +2742,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         CancellationToken cancellationToken)
     {
         var entry = book.Pages[page];
-        var rotation = _rotations.GetValueOrDefault(page);
+        var rotation = GetPageRotation(book, page);
         var persistentKind = fastPreview
             ? PersistentPreviewKind.ThumbnailFast
             : PersistentPreviewKind.ThumbnailFinal;
@@ -2773,7 +2790,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             // the thumbnail UI is presenting; the NVIDIA driver can AV under
             // that cross-context resource churn. The UI still uploads and draws
             // these previews as paced Direct2D GPU textures.
-            if (entry.DecodeThumbnail is null && fastPreview &&
+            if (_thumbnailGrid.NativeGpuSourcesEnabled &&
+                entry.DecodeThumbnail is null && fastPreview &&
                 ImagePipelineTuning.UseGenericGpuFastPreview &&
                 sourceBytes <= ImagePipelineTuning.GenericGpuFastMaximumSourceBytes)
             {
@@ -2794,7 +2812,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                     return new GeneratedThumbnail(null, gpu);
                 }
             }
-            if (entry.DecodeThumbnail is null && !fastPreview &&
+            if (_thumbnailGrid.NativeGpuSourcesEnabled &&
+                entry.DecodeThumbnail is null && !fastPreview &&
                 ImagePipelineTuning.UseGenericGpuLanczos &&
                 sourceBytes >= ImagePipelineTuning.GenericGpuMinimumSourceBytes)
             {
@@ -2932,6 +2951,15 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             $"to={(enabled ? "thumbnail" : "full")}; page={_pageIndex}; " +
             $"gpuRetirements={GpuInteropDevice.PendingRetirements}; " +
             $"gpuRetirementBytes={GpuInteropDevice.PendingRetirementBytes}");
+        Task? fullViewWarmTask = null;
+        if (enabled)
+        {
+            // Cancelling a warm full-view cache can retire many D3D textures at
+            // once. Keep the thumbnail GPU surface idle until that work and its
+            // NVIDIA driver releases have drained.
+            GpuInteropDevice.DeferRetirements(350);
+            fullViewWarmTask = PauseFullPagePrecache();
+        }
         CancelAndDisposeInBackground(_displayCancellation);
         _displayCancellation = null;
         _viewModeChangedAfterStartup = true;
@@ -2955,15 +2983,13 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         if (enabled)
         {
             _viewer.ReturnToFit();
-            if (_cache is { } idleCache && _book is { } idleBook)
-                RequestCacheWarm(_pageIndex, idleCache, idleBook,
-                    immediate: true, idlePriority: true);
             if (_thumbnailGrid.PageCount != (_book?.Pages.Count ?? 0))
                 BuildThumbnailPlaceholders();
             HighlightThumbnail();
             _thumbnailGrid.RefreshVirtualLayoutAfterShow();
             _thumbnailGrid.Focus();
-            _ = LoadThumbnailsProgressivelyAsync();
+            _ = ActivateThumbnailWorkAfterFullViewDrainAsync(
+                layoutVersion, fullViewWarmTask);
         }
         else
         {
@@ -2986,14 +3012,38 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         }
     }
 
-    private void PauseFullPagePrecache()
+    private async Task ActivateThumbnailWorkAfterFullViewDrainAsync(
+        int layoutVersion, Task? fullViewWarmTask)
+    {
+        try
+        {
+            if (fullViewWarmTask is not null)
+                await fullViewWarmTask.ConfigureAwait(true);
+            var cancellationToken = _bookCancellation?.Token ?? CancellationToken.None;
+            await GpuInteropDevice.WaitForRetirementsAsync(cancellationToken)
+                .ConfigureAwait(true);
+        }
+        catch (OperationCanceledException) { return; }
+        catch (Exception exception)
+        {
+            ExtendedDiagnostics.LogException(
+                "Full-view GPU drain before thumbnails failed", exception);
+        }
+        if (IsDisposed || Disposing || !_thumbnailMode ||
+            layoutVersion != _viewModeLayoutVersion) return;
+        _ = LoadThumbnailsProgressivelyAsync();
+    }
+
+    private Task? PauseFullPagePrecache()
     {
         lock (_warmStateGate)
         {
+            var task = _warmTask;
             _bookPrecacheStarted = false;
             CancelAndDisposeInBackground(_warmCancellation);
             _warmCancellation = null;
             _warmUsesIdlePriority = false;
+            return task;
         }
     }
 
@@ -3214,7 +3264,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                     bytes = new FileInfo(book.SourcePath).Length;
                 }
 
-                var rotation = _rotations.GetValueOrDefault(page);
+                var rotation = GetPageRotation(book, page);
                 var cachedResolution = _cache?.TryGetLoadedSize(page);
                 var resolution = cachedResolution ??
                     EncodedJpegRenderer.ProbeSize(entry, rotation, cancellationToken);

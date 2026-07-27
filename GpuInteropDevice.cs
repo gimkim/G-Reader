@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
@@ -56,10 +57,46 @@ internal static class GpuInteropDevice
     private static long _generation;
     private static int _pendingRetirements;
     private static long _pendingRetirementBytes;
+    private static long _retirementsNotBefore;
+    private static long _pacedRetirementsUntil;
 
     public static long Generation => Volatile.Read(ref _generation);
     public static int PendingRetirements => Volatile.Read(ref _pendingRetirements);
     public static long PendingRetirementBytes => Volatile.Read(ref _pendingRetirementBytes);
+
+    public static void DeferRetirements(int milliseconds)
+    {
+        var deadline = Stopwatch.GetTimestamp() + Math.Max(1L,
+            Stopwatch.Frequency * Math.Max(1, milliseconds) / 1000);
+        ExtendDeadline(ref _retirementsNotBefore, deadline);
+        ExtendDeadline(ref _pacedRetirementsUntil,
+            deadline + Stopwatch.Frequency * 5L);
+    }
+
+    private static void ExtendDeadline(ref long target, long deadline)
+    {
+        while (true)
+        {
+            var previous = Volatile.Read(ref target);
+            if (previous >= deadline || Interlocked.CompareExchange(
+                    ref target, deadline, previous) == previous) return;
+        }
+    }
+
+    public static async Task WaitForRetirementsAsync(CancellationToken cancellationToken)
+    {
+        // A retiring render can enqueue its texture just after another one
+        // drains, so require a short stable empty interval before returning.
+        await WaitForRetirementWindowAsync().WaitAsync(cancellationToken)
+            .ConfigureAwait(false);
+        while (true)
+        {
+            while (PendingRetirements != 0)
+                await Task.Delay(20, cancellationToken).ConfigureAwait(false);
+            await Task.Delay(40, cancellationToken).ConfigureAwait(false);
+            if (PendingRetirements == 0) return;
+        }
+    }
 
     public static bool TryGetDeviceRemovalReason(out int code)
     {
@@ -125,6 +162,7 @@ internal static class GpuInteropDevice
             _ = WatchRetirementAsync(item, completed.Task);
             try
             {
+                await WaitForRetirementWindowAsync().ConfigureAwait(false);
                 item.Release();
             }
             catch (Exception exception)
@@ -141,6 +179,25 @@ internal static class GpuInteropDevice
                     ExtendedDiagnostics.Breadcrumb(
                         $"GPU retirement queue drained: bytes={Math.Max(0, bytes)}");
             }
+            // COM Release can return before NVIDIA finishes its internal
+            // destruction work. Pace large texture retirements so a cancelled
+            // full-view cache cannot flood the driver during a mode change.
+            if (item.Bytes > 0 &&
+                Stopwatch.GetTimestamp() < Volatile.Read(ref _pacedRetirementsUntil))
+                await Task.Delay(20).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task WaitForRetirementWindowAsync()
+    {
+        while (true)
+        {
+            var remainingTicks = Volatile.Read(ref _retirementsNotBefore) -
+                Stopwatch.GetTimestamp();
+            if (remainingTicks <= 0) return;
+            var delay = (int)Math.Clamp(
+                Math.Ceiling(remainingTicks * 1000d / Stopwatch.Frequency), 1, 1000);
+            await Task.Delay(delay).ConfigureAwait(false);
         }
     }
 
