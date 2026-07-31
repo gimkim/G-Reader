@@ -10,6 +10,7 @@ internal static class ToolbarHotkeyCatalog
     public const string OpenFile = "open_file";
     public const string OpenFolder = "open_folder";
     public const string OpenRandom = "open_random";
+    public const string History = "history";
     public const string OpenInExplorer = "open_in_explorer";
     public const string MoveUp = "move_up";
     public const string PreviousContainer = "previous_container";
@@ -30,6 +31,8 @@ internal static class ToolbarHotkeyCatalog
         new(OpenFile, "Open file", "Files & library", Keys.Control | Keys.L),
         new(OpenFolder, "Open folder", "Files & library", Keys.Control | Keys.O),
         new(OpenRandom, "Open random", "Files & library", Keys.Control | Keys.R),
+        new(History, "Recently opened history", "Files & library",
+            Keys.Control | Keys.Shift | Keys.H),
         new(OpenInExplorer, "Open in Explorer", "Files & library", Keys.Control | Keys.Shift | Keys.E),
         new(MoveUp, "Move up", "Files & library", Keys.Alt | Keys.Up),
         new(PreviousContainer, "Previous folder / archive", "Files & library", Keys.Control | Keys.Up),

@@ -2,6 +2,12 @@ using System.Text.Json;
 
 namespace CDisplayEx.CSharp;
 
+internal sealed class HistoryEntry
+{
+    public string Path { get; set; } = string.Empty;
+    public DateTime LastOpenedUtc { get; set; }
+}
+
 internal sealed class UserSettings
 {
     private static string NewPersistentCachePath => Path.Combine(
@@ -98,6 +104,9 @@ internal sealed class UserSettings
     // Source path -> page entry name. Names survive sorting changes better than indexes.
     public Dictionary<string, string> RememberedReadingPositions { get; set; } =
         new(StringComparer.OrdinalIgnoreCase);
+    public bool HistoryEnabled { get; set; } = true;
+    public int HistoryMaximumItems { get; set; } = 100;
+    public List<HistoryEntry> HistoryEntries { get; set; } = [];
     public string RandomLibraryPath { get; set; } = string.Empty;
     public bool HasWindowBounds { get; set; }
     public bool WindowMaximized { get; set; }
@@ -136,6 +145,16 @@ internal sealed class UserSettings
                 settings.GlobalFastPreviewConcurrency = Math.Clamp(
                     settings.FastPreviewWorkerCount * settings.FastPreviewThreadsPerWorker,
                     1, Math.Clamp(Environment.ProcessorCount, 1, 64));
+            settings.HistoryMaximumItems = Math.Clamp(
+                settings.HistoryMaximumItems, 1, 1000);
+            settings.HistoryEntries = (settings.HistoryEntries ?? [])
+                .Where(entry => !string.IsNullOrWhiteSpace(entry.Path))
+                .GroupBy(entry => NormalizeHistoryPath(entry.Path),
+                    StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.OrderByDescending(entry => entry.LastOpenedUtc).First())
+                .OrderByDescending(entry => entry.LastOpenedUtc)
+                .Take(settings.HistoryMaximumItems)
+                .ToList();
             return settings;
         }
         catch { return CreateFirstRunDefaults(); }
@@ -153,5 +172,11 @@ internal sealed class UserSettings
         var folder = Path.GetDirectoryName(FilePath)!;
         Directory.CreateDirectory(folder);
         File.WriteAllText(FilePath, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
+    }
+
+    private static string NormalizeHistoryPath(string path)
+    {
+        try { return Path.TrimEndingDirectorySeparator(Path.GetFullPath(path)); }
+        catch { return path.Trim(); }
     }
 }

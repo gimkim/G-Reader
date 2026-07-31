@@ -40,6 +40,17 @@ internal static class ToolbarIconFactory
         g.DrawLine(accent, 21, 6, 18, 9);
     });
 
+    public static Image History() => Draw(g =>
+    {
+        using var pen = Pen(Ink, 1.9f);
+        using var accent = Pen(Accent, 2.2f);
+        g.DrawArc(pen, 4, 4, 16, 16, -65, 300);
+        g.DrawLine(accent, 4, 5, 4, 11);
+        g.DrawLine(accent, 4, 5, 10, 5);
+        g.DrawLine(pen, 12, 7, 12, 13);
+        g.DrawLine(pen, 12, 13, 17, 16);
+    });
+
     public static Image OpenInExplorer() => Draw(g =>
     {
         using var pen = Pen(Ink, 1.8f);

@@ -78,6 +78,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private readonly record struct BrowsePreviewKey(
         string Path, int Width, int Height, bool FastPreview);
     private const int BottomBarHeight = 40;
+    private const double FullscreenEdgeActivationRatio = 0.04d;
+    private const int FullscreenBottomHideDelayMs = 700;
     private int PrecacheWorkerCount => Math.Clamp(_performance.PrecacheWorkerCount, 1, 64);
     private const long Megabyte = 1024L * 1024;
     private long AheadCacheLimitBytes => Math.Max(0L, _performance.CacheAheadMB) * Megabyte;
@@ -123,6 +125,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private readonly System.Windows.Forms.Timer _wheelDispatchTimer = new() { Interval = 8 };
     private readonly System.Windows.Forms.Timer _thumbnailWarmSelectionTimer =
         new() { Interval = 220 };
+    private readonly System.Windows.Forms.Timer _fullscreenChromeTimer =
+        new() { Interval = 50 };
     private readonly ThumbnailGridView _thumbnailGrid = new();
     private readonly Panel _thumbnailModePanel = new()
     {
@@ -233,10 +237,13 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private Rectangle _savedBounds;
     private bool _savedTopMost;
     private bool _savedToolbarVisible;
+    private bool _savedToolbarAutoSize;
     private bool _savedBottomVisible;
     private bool _savedThumbnailControlsVisible;
     private bool _savedThumbnailAddressVisible;
-    private FullscreenSliderOverlay? _fullscreenSliderOverlay;
+    private int _fullscreenToolbarHeight;
+    private int _fullscreenBottomHeight;
+    private long _fullscreenBottomHideDeadline;
     private ToolStripMenuItem? _doublePageItem;
     private ToolStripMenuItem? _autoSingleLandscapeItem;
     private ToolStripMenuItem? _directionItem;
@@ -314,6 +321,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             RequestCacheWarm(page, cache, book,
                 immediate: true, idlePriority: true);
         };
+        _fullscreenChromeTimer.Tick += (_, _) =>
+            UpdateFullscreenChromeVisibility();
 
         _doublePage = _settings.DoublePage && !_forceInitialFullPage;
         _doublePageOffset = _settings.DoublePageOffset && _doublePage;
@@ -409,12 +418,14 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             UpdateBottomInfoWidth();
             PositionToastOverlay();
             PositionFullscreenSliderOverlay();
+            PositionFullscreenToolbarOverlay();
             if (!_fullScreen && WindowState != FormWindowState.Minimized)
                 _lastNonMinimizedState = WindowState;
         };
         LocationChanged += (_, _) =>
         {
             PositionFullscreenSliderOverlay();
+            PositionFullscreenToolbarOverlay();
             QueueMonitorColorProfileRefresh();
         };
         Application.AddMessageFilter(this);
@@ -432,9 +443,11 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         FormClosed += (_, _) =>
         {
             DisposeFullscreenSliderOverlay(restoreBottomPanel: false);
+            DisposeFullscreenToolbarOverlay(restoreToolbar: false);
             _toastTimer.Dispose();
             _wheelDispatchTimer.Dispose();
             _thumbnailWarmSelectionTimer.Dispose();
+            _fullscreenChromeTimer.Dispose();
             CancelAndDisposeInBackground(_monitorProfileCancellation);
             Application.RemoveMessageFilter(this);
         };
@@ -524,6 +537,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         AddActionTool(ToolbarIconFactory.OpenFile(), "Open file", ToolbarHotkeyCatalog.OpenFile);
         AddActionTool(ToolbarIconFactory.OpenFolder(), "Open folder", ToolbarHotkeyCatalog.OpenFolder);
         AddActionTool(ToolbarIconFactory.OpenRandom(), "Open random", ToolbarHotkeyCatalog.OpenRandom);
+        AddActionTool(ToolbarIconFactory.History(), "Recently opened history",
+            ToolbarHotkeyCatalog.History);
         AddActionTool(ToolbarIconFactory.OpenInExplorer(), "Open in Explorer", ToolbarHotkeyCatalog.OpenInExplorer);
         AddActionTool(ToolbarIconFactory.MoveUp(), "Move up", ToolbarHotkeyCatalog.MoveUp);
         _folderSortButton = AddSortDropDown(
@@ -552,6 +567,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             case ToolbarHotkeyCatalog.OpenFile: OpenFiles(); break;
             case ToolbarHotkeyCatalog.OpenFolder: OpenFolder(); break;
             case ToolbarHotkeyCatalog.OpenRandom: OpenRandomBook(); break;
+            case ToolbarHotkeyCatalog.History: ShowHistory(); break;
             case ToolbarHotkeyCatalog.OpenInExplorer: RevealCurrentInExplorer(); break;
             case ToolbarHotkeyCatalog.MoveUp: MoveUp(); break;
             case ToolbarHotkeyCatalog.PreviousContainer: OpenAdjacentContainer(-1); break;
@@ -849,6 +865,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             cancellation.Token.ThrowIfCancellationRequested();
             if (_bookCancellation != cancellation) return;
             _book = book;
+            RecordHistory(book.SourcePath);
             ExtendedDiagnostics.Breadcrumb(
                 $"Open completed: {book.SourcePath}; pages={book.Pages.Count}; " +
                 $"folders={book.Subfolders.Count}; containers={book.Containers.Count}; " +
@@ -973,6 +990,53 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         // Keep settings lightweight even for very large libraries.
         while (positions.Count > 4096)
             positions.Remove(positions.Keys.First());
+    }
+
+    private void RecordHistory(string sourcePath)
+    {
+        if (!_settings.HistoryEnabled) return;
+        var path = GetReadingPositionKey(sourcePath);
+        if (!Directory.Exists(path) &&
+            !Book.IsSupportedArchive(path) &&
+            !Path.GetExtension(path).Equals(
+                ".pdf", StringComparison.OrdinalIgnoreCase)) return;
+        var history = _settings.HistoryEntries ??= [];
+        history.RemoveAll(entry => PathsEqual(entry.Path, path));
+        history.Insert(0, new HistoryEntry
+        {
+            Path = path,
+            LastOpenedUtc = DateTime.UtcNow
+        });
+        TrimHistory();
+    }
+
+    private void TrimHistory()
+    {
+        var history = _settings.HistoryEntries ??= [];
+        var maximum = Math.Clamp(_settings.HistoryMaximumItems, 1, 1000);
+        history.Sort((left, right) =>
+            right.LastOpenedUtc.CompareTo(left.LastOpenedUtc));
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        history.RemoveAll(entry => string.IsNullOrWhiteSpace(entry.Path) ||
+            !seen.Add(GetReadingPositionKey(entry.Path)));
+        if (history.Count > maximum)
+            history.RemoveRange(maximum, history.Count - maximum);
+    }
+
+    private void ShowHistory()
+    {
+        TrimHistory();
+        using var dialog = new HistoryPopupForm(
+            _settings.HistoryEnabled ? _settings.HistoryEntries : [],
+            _settings.HistoryEnabled,
+            _settings.LanczosQuality,
+            Math.Clamp(_settings.ImageMagickThreadsPerImage, 1, 64))
+        {
+            Icon = Icon
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK ||
+            string.IsNullOrWhiteSpace(dialog.SelectedPath)) return;
+        _ = TryOpenAsync(dialog.SelectedPath);
     }
 
     private async Task OpenThumbnailBrowseEntryAsync(string path)
@@ -4000,6 +4064,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             _savedBounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
             _savedTopMost = TopMost;
             _savedToolbarVisible = _toolbar.Visible;
+            _savedToolbarAutoSize = _toolbar.AutoSize;
             _savedBottomVisible = _bottomPanel.Visible;
             _savedThumbnailControlsVisible = _thumbnailControls.Visible;
             _savedThumbnailAddressVisible = _thumbnailAddressPanel.Visible;
@@ -4016,7 +4081,11 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             // to the final fullscreen handle instead of relying on the timing
             // of OnHandleCreated during that transition.
             if (IsHandleCreated) RawMouseWheelInput.Register(Handle);
+            ShowFullscreenToolbarOverlay();
             ShowFullscreenSliderOverlay();
+            _fullscreenBottomHideDeadline = 0;
+            UpdateFullscreenChromeVisibility();
+            _fullscreenChromeTimer.Start();
             RestoreFullscreenKeyboardFocus();
             BeginInvoke(new Action(() =>
             {
@@ -4027,7 +4096,9 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         else
         {
             _fullScreen = false;
+            _fullscreenChromeTimer.Stop();
             DisposeFullscreenSliderOverlay(restoreBottomPanel: true);
+            DisposeFullscreenToolbarOverlay(restoreToolbar: true);
             TopMost = _savedTopMost;
             WindowState = FormWindowState.Normal;
             FormBorderStyle = _savedBorder;
@@ -4044,21 +4115,32 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         if (!_thumbnailMode) _ = ShowPageAsync();
     }
 
+    private void ShowFullscreenToolbarOverlay()
+    {
+        DisposeFullscreenToolbarOverlay(restoreToolbar: true);
+        if (!_savedToolbarVisible) return;
+
+        _fullscreenToolbarHeight = Math.Max(1,
+            Math.Max(_toolbar.Height, _toolbar.PreferredSize.Height));
+        if (!Controls.Contains(_toolbar)) Controls.Add(_toolbar);
+        _toolbar.Dock = DockStyle.None;
+        _toolbar.AutoSize = false;
+        _toolbar.Visible = false;
+        PositionFullscreenToolbarOverlay();
+        _toolbar.BringToFront();
+    }
+
     private void ShowFullscreenSliderOverlay()
     {
         DisposeFullscreenSliderOverlay(restoreBottomPanel: true);
         if (!_savedBottomVisible) return;
 
-        Controls.Remove(_bottomPanel);
-        _bottomPanel.Dock = DockStyle.Fill;
-        _bottomPanel.Visible = true;
-        var overlay = new FullscreenSliderOverlay();
-        overlay.Controls.Add(_bottomPanel);
-        _fullscreenSliderOverlay = overlay;
+        _fullscreenBottomHeight = Math.Max(1, _bottomPanel.Height);
+        if (!Controls.Contains(_bottomPanel)) Controls.Add(_bottomPanel);
+        _bottomPanel.Dock = DockStyle.None;
+        _bottomPanel.Visible = false;
         PositionFullscreenSliderOverlay();
-        overlay.Show(this);
-        PositionFullscreenSliderOverlay();
-        RestoreFullscreenKeyboardFocus();
+        _bottomPanel.BringToFront();
     }
 
     private void RestoreFullscreenKeyboardFocus()
@@ -4079,38 +4161,95 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private void PositionFullscreenSliderOverlay()
     {
-        var overlay = _fullscreenSliderOverlay;
-        if (!_fullScreen || overlay is null || overlay.IsDisposed ||
-            !IsHandleCreated) return;
-        try
+        if (!_fullScreen || IsDisposed || Disposing) return;
+        var height = Math.Max(1, _fullscreenBottomHeight);
+        _bottomPanel.Bounds = new Rectangle(
+            0, Math.Max(0, ClientSize.Height - height),
+            Math.Max(1, ClientSize.Width), height);
+    }
+
+    private void PositionFullscreenToolbarOverlay()
+    {
+        if (!_fullScreen || IsDisposed || Disposing) return;
+        var height = Math.Max(1, _fullscreenToolbarHeight);
+        _toolbar.Bounds = new Rectangle(
+            0, 0, Math.Max(1, ClientSize.Width), height);
+    }
+
+    private void UpdateFullscreenChromeVisibility()
+    {
+        if (!_fullScreen || IsDisposed || Disposing) return;
+        Point cursor;
+        try { cursor = PointToClient(Cursor.Position); }
+        catch (InvalidOperationException) { return; }
+        var horizontallyInside = cursor.X >= 0 && cursor.X < ClientSize.Width;
+        var verticallyInside = cursor.Y >= 0 && cursor.Y < ClientSize.Height;
+        var activationHeight = Math.Max(1,
+            (int)Math.Ceiling(ClientSize.Height * FullscreenEdgeActivationRatio));
+        var topDropDownOpen = _toolbar.Items
+            .OfType<ToolStripDropDownItem>()
+            .Any(item => item.DropDown.Visible);
+        var topActive = _savedToolbarVisible &&
+            ((horizontallyInside && verticallyInside &&
+                cursor.Y < activationHeight) ||
+             (_toolbar.Visible && _toolbar.Bounds.Contains(cursor)) ||
+             topDropDownOpen);
+        SetFullscreenOverlayVisible(_toolbar, topActive);
+
+        var bottomActive = _savedBottomVisible &&
+            ((horizontallyInside && verticallyInside &&
+                cursor.Y >= ClientSize.Height - activationHeight) ||
+             (_bottomPanel.Visible && _bottomPanel.Bounds.Contains(cursor)));
+        if (bottomActive)
         {
-            var client = RectangleToScreen(ClientRectangle);
-            // The panel is Dock.Fill inside the layered form, so its current
-            // Height equals the overlay's previous client height and must never
-            // be used to size that overlay (it caused a self-sustaining ~300 px bar).
-            var height = LogicalToDeviceUnits(BottomBarHeight);
-            overlay.Bounds = new Rectangle(
-                client.Left, client.Bottom - height, client.Width, height);
+            _fullscreenBottomHideDeadline = 0;
+            SetFullscreenOverlayVisible(_bottomPanel, true);
         }
-        catch (InvalidOperationException) { }
+        else if (_bottomPanel.Visible)
+        {
+            if (_fullscreenBottomHideDeadline == 0)
+                _fullscreenBottomHideDeadline = Environment.TickCount64 +
+                    FullscreenBottomHideDelayMs;
+            if (Environment.TickCount64 >= _fullscreenBottomHideDeadline)
+            {
+                SetFullscreenOverlayVisible(_bottomPanel, false);
+                _fullscreenBottomHideDeadline = 0;
+            }
+        }
+    }
+
+    private void SetFullscreenOverlayVisible(Control control, bool visible)
+    {
+        if (control.IsDisposed || control.Visible == visible) return;
+        if (visible)
+        {
+            if (ReferenceEquals(control, _toolbar))
+                PositionFullscreenToolbarOverlay();
+            else
+                PositionFullscreenSliderOverlay();
+            control.Visible = true;
+            control.BringToFront();
+        }
+        else control.Visible = false;
     }
 
     private void DisposeFullscreenSliderOverlay(bool restoreBottomPanel)
     {
-        var overlay = _fullscreenSliderOverlay;
-        _fullscreenSliderOverlay = null;
-        if (overlay is not null)
-        {
-            if (overlay.Controls.Contains(_bottomPanel))
-                overlay.Controls.Remove(_bottomPanel);
-            overlay.Hide();
-            overlay.Dispose();
-        }
         if (!restoreBottomPanel || IsDisposed || Disposing) return;
         if (!Controls.Contains(_bottomPanel)) Controls.Add(_bottomPanel);
         _bottomPanel.Dock = DockStyle.Bottom;
         _bottomPanel.Height = BottomBarHeight;
         _bottomPanel.BringToFront();
+    }
+
+    private void DisposeFullscreenToolbarOverlay(bool restoreToolbar)
+    {
+        if (!restoreToolbar || IsDisposed || Disposing) return;
+        if (!Controls.Contains(_toolbar)) Controls.Add(_toolbar);
+        _toolbar.AutoSize = _savedToolbarAutoSize;
+        _toolbar.Dock = DockStyle.Top;
+        _toolbar.Visible = _savedToolbarVisible;
+        _toolbar.BringToFront();
     }
 
     private void ScrollViewer(int dx, int dy)
@@ -4196,10 +4335,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         const int WmMouseWheel = 0x020A;
         if (message.Msg != WmMouseWheel || _book is null) return false;
 
-        // Fullscreen owns the monitor area but may have two top-level HWNDs
-        // (the reader and its translucent slider). Do not depend on focus or
-        // WindowFromPoint parentage here: either can briefly report the owned
-        // overlay as unrelated and silently consume every wheel message.
+        // Fullscreen owns the monitor area, including its child overlay bars.
+        // Do not depend on the focused child HWND when routing wheel input.
         if (_fullScreen && IsPointOverFullscreenReader(Cursor.Position))
         {
             // Use the regular wheel message while focused. This preserves
@@ -4272,26 +4409,20 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         QueueWheelDispatch();
     }
 
-    private bool HasReaderInputFocus() => ContainsFocus || Form.ActiveForm == this ||
-        _fullscreenSliderOverlay is { IsDisposed: false } overlay &&
-        Form.ActiveForm == overlay;
+    private bool HasReaderInputFocus() =>
+        ContainsFocus || Form.ActiveForm == this;
 
     private bool IsPointOverReader(Point screenPoint)
     {
         if (IsHandleCreated && RectangleToScreen(ClientRectangle).Contains(screenPoint) &&
             RawMouseWheelInput.IsWindowOrChildAtPoint(Handle, screenPoint)) return true;
-        var overlay = _fullscreenSliderOverlay;
-        return _fullScreen && overlay is { IsDisposed: false, IsHandleCreated: true } &&
-            overlay.Bounds.Contains(screenPoint) &&
-            RawMouseWheelInput.IsWindowOrChildAtPoint(overlay.Handle, screenPoint);
+        return false;
     }
 
     private bool IsPointOverFullscreenReader(Point screenPoint)
     {
         if (!_fullScreen) return false;
-        if (Bounds.Contains(screenPoint)) return true;
-        var overlay = _fullscreenSliderOverlay;
-        return overlay is { IsDisposed: false } && overlay.Bounds.Contains(screenPoint);
+        return Bounds.Contains(screenPoint);
     }
 
     private void QueueWheelDispatch()
@@ -4311,11 +4442,10 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     {
         var delta = Interlocked.Exchange(ref _pendingWheelDelta, 0);
         var columnDelta = Interlocked.Exchange(ref _pendingThumbnailColumnWheelDelta, 0);
-        // The translucent fullscreen slider is an owned form for z-order only;
-        // it must not be treated as a modal popup. Previously this condition
-        // discarded every queued wheel delta for the entire fullscreen session.
+        // Child overlay bars are part of this form; only actual owned windows
+        // such as Settings or History should block reader navigation.
         var hasBlockingOwnedWindow = OwnedForms.Any(form =>
-            form.Visible && !ReferenceEquals(form, _fullscreenSliderOverlay));
+            form.Visible);
         if (_book is not null && !hasBlockingOwnedWindow)
         {
             if (_thumbnailMode)
@@ -4495,6 +4625,9 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _settings.BackgroundArgb = dialog.ReaderBackground.ToArgb();
         _settings.AutoMoveMode = dialog.AutoMoveMode;
         _settings.RememberReadingPosition = dialog.RememberReadingPosition;
+        _settings.HistoryEnabled = dialog.HistoryEnabled;
+        _settings.HistoryMaximumItems = dialog.HistoryMaximumItems;
+        TrimHistory();
         _settings.ExtendedLoggingEnabled = dialog.ExtendedLoggingEnabled;
         ExtendedDiagnostics.Configure(_settings.ExtendedLoggingEnabled);
         if (dialog.ClearRememberedReadingPositionsRequested)

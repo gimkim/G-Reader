@@ -91,6 +91,10 @@ internal sealed class ReaderSettingsDialog : Form
         Text = "Remember the last page separately for each folder, archive, and PDF",
         AutoSize = true, Dock = DockStyle.Fill
     };
+    private readonly CheckBox _historyEnabled = CreateOption(
+        "Remember recently opened folders, archives, and PDFs");
+    private readonly NumericUpDown _historyMaximumItems =
+        CreateCountInput(1, 1000);
     private readonly CheckBox _extendedLogging = CreateOption(
         "Collect detailed error, crash, and UI-hang diagnostics (creates dump files)");
     private readonly Panel _colorPreview = new() { Width = 92, Height = 28, BorderStyle = BorderStyle.FixedSingle };
@@ -155,6 +159,8 @@ internal sealed class ReaderSettingsDialog : Form
     public Color ReaderBackground { get; private set; }
     public int AutoMoveMode => _autoMove.SelectedIndex;
     public bool RememberReadingPosition => _rememberReadingPosition.Checked;
+    public bool HistoryEnabled => _historyEnabled.Checked;
+    public int HistoryMaximumItems => (int)_historyMaximumItems.Value;
     public bool ExtendedLoggingEnabled => _extendedLogging.Checked;
     public bool ClearRememberedReadingPositionsRequested { get; private set; }
     public string RandomLibraryPath => _randomLibraryPath.Text.Trim();
@@ -285,6 +291,13 @@ internal sealed class ReaderSettingsDialog : Form
         ]);
         _autoMove.SelectedIndex = Math.Clamp(settings.AutoMoveMode, 0, 3);
         _rememberReadingPosition.Checked = settings.RememberReadingPosition;
+        _historyEnabled.Checked = settings.HistoryEnabled;
+        _historyMaximumItems.Value = Math.Clamp(settings.HistoryMaximumItems,
+            (int)_historyMaximumItems.Minimum,
+            (int)_historyMaximumItems.Maximum);
+        _historyMaximumItems.Enabled = _historyEnabled.Checked;
+        _historyEnabled.CheckedChanged += (_, _) =>
+            _historyMaximumItems.Enabled = _historyEnabled.Checked;
         _extendedLogging.Checked = settings.ExtendedLoggingEnabled;
         _randomLibraryPath.Text = settings.RandomLibraryPath ?? string.Empty;
         ReaderBackground = Color.FromArgb(settings.BackgroundArgb);
@@ -583,6 +596,8 @@ internal sealed class ReaderSettingsDialog : Form
                 ("Automatic move", _autoMove),
                 ("Resume reading", _rememberReadingPosition),
                 ("Saved positions", clearReadingPositionsRow),
+                ("Recent history", _historyEnabled),
+                ("History item limit", _historyMaximumItems),
                 ("Random library path", randomPathRow)),
             CreateSection("Windows integration",
                 isPackaged
