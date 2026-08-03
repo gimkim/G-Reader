@@ -65,6 +65,10 @@ every corresponding render and cache path.
   pointer is near the corresponding edge by a viewport percentage, so they do
   not resize the image area and work across DPI/scaling settings. History is a
   recent folder/archive popup with configurable enable/retention count.
+- PDF cover generation should probe only the first few pages (the configured
+  four-page cover window) and stop as soon as a usable cover is available; for
+  a folder containing only archives/PDFs, use the first supported entry rather
+  than leaving the folder cover empty.
 - When a folder/archive has no supported items, stay in thumbnail mode with a
   parent card and an in-page message; do not block the user with an OK dialog.
 
@@ -78,6 +82,13 @@ every corresponding render and cache path.
   dispose archive/native resources outside shared scheduler locks. Do not create
   unbounded PDFium/native worker processes. Use the PDFium watchdog and extended
   diagnostics to detect crashes, hangs, and stalled heartbeats.
+- The automatic global fast-preview worker default is approximately half of the
+  logical CPU cores, then bounded by the codec/GPU gates and memory budget. A
+  setting explanation must show effective limits and products of interacting
+  values instead of silently accepting an impossible number.
+- JPEG should prefer nvJPEG/NPP on a supported NVIDIA setup (staged GPU paths
+  for background work); ImageMagick/CPU is the explicit fallback when the GPU
+  codec is unavailable or has been retired for the session.
 - Direct2D resources must have clear ownership and a safe end-draw/device-loss
   barrier. Do not run competing per-thumbnail background Direct2D render-target
   operations against the UI target. Prefer staged GPU/NPP/nvJPEG work and paced
@@ -104,6 +115,11 @@ every corresponding render and cache path.
 - Keep runtime settings, caches, dumps, and generated release artifacts out of
   source control unless a release asset is intentionally attached to GitHub.
   Preserve all historical `versions\` content listed above.
+- Settings pages must remain readable at different resolutions and Windows DPI
+  scaling levels: use responsive layout/anchoring, avoid clipped explanatory
+  text, and keep performance/codec relationships visible. The update checker
+  compares GitHub release versions and always asks before downloading and
+  relaunching a newer build.
 
 ## Microsoft Store/package identity
 
