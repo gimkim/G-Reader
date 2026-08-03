@@ -197,6 +197,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private int _pendingThumbnailColumnWheelDelta;
     private int _wheelDispatchPending;
     private int _viewModeLayoutVersion;
+    private bool _thumbnailActivationPending;
     private bool _visibleThumbnailRefreshRunning;
     private bool _visibleThumbnailRefreshPending;
     private int _adjacentBookOpening;
@@ -448,6 +449,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             _wheelDispatchTimer.Dispose();
             _thumbnailWarmSelectionTimer.Dispose();
             _fullscreenChromeTimer.Dispose();
+            _slideTimer.Dispose();
             CancelAndDisposeInBackground(_monitorProfileCancellation);
             Application.RemoveMessageFilter(this);
         };
@@ -635,7 +637,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         };
         _thumbnailGrid.BrowsePriorityChanged += (_, _) =>
         {
-            if (_thumbnailMode) _ = LoadThumbnailsProgressivelyAsync();
+            if (_thumbnailMode && !_thumbnailActivationPending)
+                _ = LoadThumbnailsProgressivelyAsync();
         };
         _thumbnailGrid.ThumbnailInteractionStarted += (_, _) =>
         {
@@ -643,7 +646,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         };
         _thumbnailGrid.ThumbnailRefreshRequested += (_, _) =>
         {
-            if (_thumbnailMode) _ = LoadThumbnailsProgressivelyAsync();
+            if (_thumbnailMode && !_thumbnailActivationPending)
+                _ = LoadThumbnailsProgressivelyAsync();
         };
         _thumbnailGrid.VisiblePreviewRefreshRequested += (_, _) =>
         {
@@ -861,9 +865,18 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 NormalizeSortMode(_settings.FolderPageSort),
                 NormalizeSortMode(_settings.ArchivePageSort),
                 _settings.FolderPageSortDescending,
-                _settings.ArchivePageSortDescending), cancellation.Token);
-            cancellation.Token.ThrowIfCancellationRequested();
-            if (_bookCancellation != cancellation) return;
+                _settings.ArchivePageSortDescending,
+                cancellation.Token), cancellation.Token);
+            if (cancellation.IsCancellationRequested ||
+                _bookCancellation != cancellation)
+            {
+                // The open may have completed at the same instant another drag,
+                // history selection, or shutdown cancelled it. It was never
+                // adopted by the form, so release its archive/PDF handles here.
+                book.Dispose();
+                cancellation.Token.ThrowIfCancellationRequested();
+                return;
+            }
             _book = book;
             RecordHistory(book.SourcePath);
             ExtendedDiagnostics.Breadcrumb(
@@ -938,6 +951,10 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             }
             else if (_thumbnailMode)
             {
+                // Opening a new book establishes a new resource generation. It
+                // must not inherit an activation gate from a cancelled mode
+                // transition belonging to the previous book.
+                _thumbnailActivationPending = false;
                 if (!browseEntrySelected) HighlightThumbnail();
                 _thumbnailGrid.Focus();
                 _ = LoadThumbnailsProgressivelyAsync();
@@ -1465,12 +1482,14 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         cancellationToken.ThrowIfCancellationRequested();
         if (PersistentPreviewCache.TryLoad(
                 PersistentPreviewKind.ThumbnailFinal, book, pageIndex,
-                targetSize, rotation, _settings.LanczosQuality, out var final))
+                targetSize, rotation, _settings.LanczosQuality, out var final,
+                cancellationToken))
             return final;
         cancellationToken.ThrowIfCancellationRequested();
         return PersistentPreviewCache.TryLoad(
             PersistentPreviewKind.ThumbnailFast, book, pageIndex,
-            targetSize, rotation, quality: 0, out var fast) ? fast : null;
+            targetSize, rotation, quality: 0, out var fast,
+            cancellationToken) ? fast : null;
     }, cancellationToken);
 
     private async Task AttachCachedPageSourcesAsync(
@@ -2048,7 +2067,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 System.Diagnostics.Debug.WriteLine($"libwebp poster decode failed: {exception}");
             }
         }
-        using var stream = page.Open();
+        using var stream = page.OpenStream(cancellationToken);
         try { using var source = Image.FromStream(stream); return new Bitmap(source); }
         catch (ArgumentException)
         {
@@ -2145,7 +2164,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 cancellationToken.ThrowIfCancellationRequested();
                 if (PersistentPreviewCache.TryLoad(
                         PersistentPreviewKind.FullView, book, pageIndex,
-                        bounds, rotation, quality: 0, out var cached))
+                        bounds, rotation, quality: 0, out var cached,
+                        cancellationToken))
                     return cached;
                 Bitmap? preview;
                 if (EncodedJpegRenderer.Supports(page))
@@ -2294,7 +2314,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private async Task LoadThumbnailsProgressivelyAsync()
     {
-        if (_book is null || !_thumbnailMode) return;
+        if (_book is null || !_thumbnailMode || _thumbnailActivationPending) return;
         PersistentPreviewCache.NotifyUserActivity();
         CancelThumbnailWork();
         var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_bookCancellation!.Token);
@@ -2747,7 +2767,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                     cancellationToken.ThrowIfCancellationRequested();
                     return PersistentPreviewCache.TryLoadBrowse(
                         path, targetSize, fastPreview, _settings.LanczosQuality,
-                        out var bitmap) ? bitmap : null;
+                        out var bitmap, cancellationToken) ? bitmap : null;
                 }, cancellationToken).ConfigureAwait(false);
                 if (cached is not null) return new GeneratedThumbnail(cached, null);
 
@@ -2816,7 +2836,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             cancellationToken.ThrowIfCancellationRequested();
             return PersistentPreviewCache.TryLoad(
                 persistentKind, book, page, targetSize, rotation,
-                persistentQuality, out var bitmap) ? bitmap : null;
+                persistentQuality, out var bitmap, cancellationToken) ? bitmap : null;
         }, cancellationToken).ConfigureAwait(false);
         if (cached is not null) return new GeneratedThumbnail(cached, null);
 
@@ -2881,14 +2901,20 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 ImagePipelineTuning.UseGenericGpuLanczos &&
                 sourceBytes >= ImagePipelineTuning.GenericGpuMinimumSourceBytes)
             {
-                var gpu = await RenderWorkScheduler.RunFullAsync(() =>
+                var stagedGpu = await RenderWorkScheduler.RunFullAsync(() =>
                 {
                     using var lease = ImagePipelineTuning.EnterGenericGpu(cancellationToken);
-                    return NvJpegNativeDecoder.TryResizeBitmapToGpu(
+                    return NvJpegNativeDecoder.TryResizeBitmapStagedGpu(
                         image, targetSize, fastPreview: false, cancellationToken,
                         out var rendered) ? rendered : null;
                 }, cancellationToken).ConfigureAwait(false);
-                if (gpu is not null) return new GeneratedThumbnail(null, gpu);
+                if (stagedGpu is not null)
+                {
+                    PersistentPreviewCache.StoreCopyInBackground(
+                        persistentKind, book, page, targetSize, rotation,
+                        persistentQuality, stagedGpu);
+                    return new GeneratedThumbnail(stagedGpu, null);
+                }
             }
             Bitmap? thumbnail = null;
             try
@@ -3023,6 +3049,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             // NVIDIA driver releases have drained.
             GpuInteropDevice.DeferRetirements(350);
             fullViewWarmTask = PauseFullPagePrecache();
+            _thumbnailActivationPending = true;
         }
         CancelAndDisposeInBackground(_displayCancellation);
         _displayCancellation = null;
@@ -3057,6 +3084,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         }
         else
         {
+            _thumbnailActivationPending = false;
             CancelThumbnailWork();
             if (_cache is { } activeCache && _book is { } activeBook)
                 RequestCacheWarm(_pageIndex, activeCache, activeBook,
@@ -3079,13 +3107,52 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private async Task ActivateThumbnailWorkAfterFullViewDrainAsync(
         int layoutVersion, Task? fullViewWarmTask)
     {
+        var bookCancellationToken = _bookCancellation?.Token ?? CancellationToken.None;
         try
         {
             if (fullViewWarmTask is not null)
-                await fullViewWarmTask.ConfigureAwait(true);
-            var cancellationToken = _bookCancellation?.Token ?? CancellationToken.None;
-            await GpuInteropDevice.WaitForRetirementsAsync(cancellationToken)
-                .ConfigureAwait(true);
+            {
+                try
+                {
+                    // Cancellation is cooperative. Archive and codec work can be
+                    // inside a native call which does not observe it until that
+                    // call returns. Never let such a detached full-view task keep
+                    // the thumbnail grid empty indefinitely.
+                    await fullViewWarmTask.WaitAsync(
+                        TimeSpan.FromMilliseconds(750), bookCancellationToken)
+                        .ConfigureAwait(true);
+                }
+                catch (TimeoutException)
+                {
+                    ExtendedDiagnostics.Breadcrumb(
+                        "Full-view warm drain timed out before thumbnails; " +
+                        $"continuing after cancellation grace; page={_pageIndex}; " +
+                        $"gpuRetirements={GpuInteropDevice.PendingRetirements}; " +
+                        $"gpuRetirementBytes={GpuInteropDevice.PendingRetirementBytes}");
+                }
+            }
+
+            // Texture retirement should normally complete during the warm-task
+            // grace period. Bound this wait as well: a failed driver callback must
+            // not permanently prevent cached CPU previews from being uploaded and
+            // presented by the Direct2D thumbnail surface.
+            using var retirementCancellation =
+                CancellationTokenSource.CreateLinkedTokenSource(bookCancellationToken);
+            retirementCancellation.CancelAfter(TimeSpan.FromSeconds(2));
+            try
+            {
+                await GpuInteropDevice.WaitForRetirementsAsync(
+                        retirementCancellation.Token)
+                    .ConfigureAwait(true);
+            }
+            catch (OperationCanceledException) when (
+                !bookCancellationToken.IsCancellationRequested)
+            {
+                ExtendedDiagnostics.Breadcrumb(
+                    "GPU retirement drain timed out before thumbnails; " +
+                    $"pending={GpuInteropDevice.PendingRetirements}; " +
+                    $"bytes={GpuInteropDevice.PendingRetirementBytes}");
+            }
         }
         catch (OperationCanceledException) { return; }
         catch (Exception exception)
@@ -3095,6 +3162,11 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         }
         if (IsDisposed || Disposing || !_thumbnailMode ||
             layoutVersion != _viewModeLayoutVersion) return;
+        _thumbnailActivationPending = false;
+        ExtendedDiagnostics.Breadcrumb(
+            $"Thumbnail work activated after full-view drain; page={_pageIndex}; " +
+            $"gpuRetirements={GpuInteropDevice.PendingRetirements}; " +
+            $"gpuRetirementBytes={GpuInteropDevice.PendingRetirementBytes}");
         _ = LoadThumbnailsProgressivelyAsync();
     }
 
@@ -3957,7 +4029,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         var folder = Path.Combine(Path.GetTempPath(), "Fast Reader Viewer", "Clipboard");
         Directory.CreateDirectory(folder);
         var path = Path.Combine(folder, $"{stem}-{Guid.NewGuid():N}{extension}");
-        using var source = entry.Open();
+        using var source = entry.OpenStream(token);
         using var destination = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
         source.CopyToAsync(destination, 81920, token).GetAwaiter().GetResult();
         return path;

@@ -24,6 +24,7 @@ internal static class RenderWorkScheduler
     private static readonly object PriorityGate = new();
     private static FastLane _fastLane = new(4, 2);
     private static FullLane _fullLane = new(3);
+    private static SemaphoreSlim _fastCodecSlots = new(8, 8);
     private static int _fastCodecConcurrency = 8;
     private static int _batchCodecConcurrency = 8;
     private static int _pendingFastWork;
@@ -67,9 +68,16 @@ internal static class RenderWorkScheduler
         Volatile.Write(ref _fullLane, new FullLane(
             Math.Clamp(batchWorkers, 1, 64)));
         var logicalCpu = Math.Clamp(Environment.ProcessorCount, 1, 64);
-        Volatile.Write(ref _fastCodecConcurrency, Math.Clamp(
-            globalFastPreviewConcurrency,
-            1, logicalCpu));
+        var fastCodecConcurrency = Math.Clamp(
+            globalFastPreviewConcurrency, 1, logicalCpu);
+        Volatile.Write(ref _fastCodecConcurrency, fastCodecConcurrency);
+        // Each caller used to apply this limit independently. A progressive
+        // thumbnail pass, visible-row refresh and history popup could therefore
+        // queue several times the configured number of blocking native decodes
+        // onto the thread pool. Capture-and-replace keeps existing leases valid
+        // while enforcing one process-wide admission ceiling for new work.
+        Volatile.Write(ref _fastCodecSlots,
+            new SemaphoreSlim(fastCodecConcurrency, fastCodecConcurrency));
         Volatile.Write(ref _batchCodecConcurrency, Math.Clamp(
             checked(batchWorkers * batchThreadsPerImage),
             1, logicalCpu));
@@ -224,13 +232,21 @@ internal static class RenderWorkScheduler
         // inside one image. Its outer caller uses FastCodecConcurrency to turn
         // that otherwise-idle per-image budget into parallel image decodes.
         RegisterFastWork();
+        var slots = Volatile.Read(ref _fastCodecSlots);
+        var entered = false;
         try
         {
+            await slots.WaitAsync(cancellationToken).ConfigureAwait(false);
+            entered = true;
             return await Task.Run(
                 () => RunAtPriority(work, ThreadPriority.BelowNormal),
                 cancellationToken).ConfigureAwait(false);
         }
-        finally { UnregisterFastWork(); }
+        finally
+        {
+            if (entered) slots.Release();
+            UnregisterFastWork();
+        }
     }
 
     public static async Task<T> RunUrgentAsync<T>(

@@ -13,7 +13,7 @@ internal static class ColorProfileService
         token.ThrowIfCancellationRequested();
         try
         {
-            using var stream = page.Open();
+            using var stream = page.OpenStream(token);
             using var image = new MagickImage();
             image.Ping(stream);
             token.ThrowIfCancellationRequested();

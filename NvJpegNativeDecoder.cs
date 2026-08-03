@@ -374,6 +374,32 @@ internal static unsafe class NvJpegNativeDecoder
         }
     }
 
+    public static bool TryResizeBitmapStagedGpu(
+        Bitmap source, Size bounds, bool fastPreview,
+        CancellationToken cancellationToken, out Bitmap? bitmap)
+    {
+        bitmap = null;
+        if (!_genericGpuEnabled || Volatile.Read(ref _state) != Ready ||
+            !GpuSlots.Wait(0)) return false;
+        var configuredGate = Volatile.Read(ref _configuredGpuSlots);
+        if (!configuredGate.Wait(0)) { GpuSlots.Release(); return false; }
+        Worker? worker = null;
+        try
+        {
+            if (!Workers.TryTake(out worker)) return false;
+            return worker.TryResizeBitmapStagedGpu(
+                source, bounds, fastPreview, cancellationToken, out bitmap);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { bitmap?.Dispose(); bitmap = null; return false; }
+        finally
+        {
+            if (worker is not null) Workers.Add(worker);
+            configuredGate.Release();
+            GpuSlots.Release();
+        }
+    }
+
     private static void Initialize()
     {
         lock (InitializationGate)
@@ -622,6 +648,70 @@ internal static unsafe class NvJpegNativeDecoder
                         _nppContext.Value) != 0) return false;
                 return CopyBgraToSharedTexture(
                     _bgraDevice, targetPitch, target, cancellationToken, out image);
+            }
+            finally { converted?.Dispose(); }
+        }
+
+        public bool TryResizeBitmapStagedGpu(
+            Bitmap source, Size bounds, bool fastPreview,
+            CancellationToken cancellationToken, out Bitmap? bitmap)
+        {
+            bitmap = null;
+            if (_nppContext is null || _api.NppiResizeC4 is null) return false;
+            Bitmap? converted = null;
+            var input = source;
+            if (source.PixelFormat != PixelFormat.Format32bppPArgb)
+            {
+                converted = new Bitmap(source.Width, source.Height,
+                    PixelFormat.Format32bppPArgb);
+                using var graphics = Graphics.FromImage(converted);
+                graphics.DrawImageUnscaled(source, 0, 0);
+                input = converted;
+            }
+            try
+            {
+                var scale = Math.Min(1d, Math.Min(
+                    Math.Max(1, bounds.Width) / (double)Math.Max(1, input.Width),
+                    Math.Max(1, bounds.Height) / (double)Math.Max(1, input.Height)));
+                var target = new Size(
+                    Math.Max(1, (int)Math.Round(input.Width * scale)),
+                    Math.Max(1, (int)Math.Round(input.Height * scale)));
+                var sourcePitch = checked(input.Width * 4);
+                if (!EnsureDeviceBuffer(ref _decodedDevice, ref _decodedCapacity,
+                        checked((long)sourcePitch * input.Height))) return false;
+                var data = input.LockBits(new Rectangle(0, 0, input.Width, input.Height),
+                    ImageLockMode.ReadOnly, PixelFormat.Format32bppPArgb);
+                try
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (_api.CudaMemcpy2DAsync(_decodedDevice, (nuint)sourcePitch,
+                            data.Scan0, (nuint)Math.Abs(data.Stride), (nuint)sourcePitch,
+                            (nuint)input.Height, CudaMemcpyHostToDevice, _stream) != 0)
+                        return false;
+                }
+                finally { input.UnlockBits(data); }
+
+                var targetPitch = checked(target.Width * 4);
+                var targetBytes = checked((long)targetPitch * target.Height);
+                if (!EnsureDeviceBuffer(ref _bgraDevice, ref _bgraCapacity, targetBytes) ||
+                    !EnsurePinnedBuffer(ref _outputHost, ref _outputCapacity, targetBytes))
+                    return false;
+                if (_api.NppiResizeC4(_decodedDevice, sourcePitch,
+                        new NppiSize(input.Width, input.Height),
+                        new NppiRect(0, 0, input.Width, input.Height),
+                        _bgraDevice, targetPitch, new NppiSize(target.Width, target.Height),
+                        new NppiRect(0, 0, target.Width, target.Height),
+                        fastPreview ? NppiInterpolationLinear : NppiInterpolationLanczos,
+                        _nppContext.Value) != 0 ||
+                    _api.CudaMemcpy2DAsync(_outputHost, (nuint)targetPitch,
+                        _bgraDevice, (nuint)targetPitch, (nuint)targetPitch,
+                        (nuint)target.Height, CudaMemcpyDeviceToHost, _stream) != 0 ||
+                    _api.CudaStreamSynchronize(_stream) != 0)
+                    return false;
+                cancellationToken.ThrowIfCancellationRequested();
+                bitmap = CopyPinnedBgraToBitmap(
+                    _outputHost, target.Width, target.Height, targetPitch);
+                return true;
             }
             finally { converted?.Dispose(); }
         }
@@ -1032,7 +1122,7 @@ internal static unsafe class NvJpegNativeDecoder
 
         private int ReadIntoPinnedBuffer(PageEntry page, CancellationToken cancellationToken)
         {
-            using var source = page.Open();
+            using var source = page.OpenStream(cancellationToken);
             var expected = 0;
             try
             {
@@ -1155,6 +1245,32 @@ internal static unsafe class NvJpegNativeDecoder
             try
             {
                 var rowBytes = checked(width * 3);
+                for (var row = 0; row < height; row++)
+                    Buffer.MemoryCopy((byte*)source + (long)row * sourcePitch,
+                        (byte*)data.Scan0 + (long)row * data.Stride,
+                        Math.Abs(data.Stride), rowBytes);
+            }
+            finally { bitmap.UnlockBits(data); }
+            return bitmap;
+        }
+        catch
+        {
+            bitmap.Dispose();
+            throw;
+        }
+    }
+
+    private static Bitmap CopyPinnedBgraToBitmap(
+        IntPtr source, int width, int height, int sourcePitch)
+    {
+        var bitmap = new Bitmap(width, height, PixelFormat.Format32bppPArgb);
+        try
+        {
+            var data = bitmap.LockBits(new Rectangle(0, 0, width, height),
+                ImageLockMode.WriteOnly, PixelFormat.Format32bppPArgb);
+            try
+            {
+                var rowBytes = checked(width * 4);
                 for (var row = 0; row < height; row++)
                     Buffer.MemoryCopy((byte*)source + (long)row * sourcePitch,
                         (byte*)data.Scan0 + (long)row * data.Stride,

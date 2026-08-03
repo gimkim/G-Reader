@@ -60,10 +60,13 @@ internal static class PersistentPreviewCache
     private const long Megabyte = 1024L * 1024;
     private const long MaximumQuotaMB = 1024L * 1024;
     private const int WriterConcurrency = 2;
+    private const int ReaderConcurrency = 8;
     private const int WriterQueueCapacity = 96;
     private const long MaximumQueuedWriteBytes = 256L * Megabyte;
     private static readonly SemaphoreSlim Writers = new(
         WriterConcurrency, WriterConcurrency);
+    private static readonly SemaphoreSlim Readers = new(
+        ReaderConcurrency, ReaderConcurrency);
     private static readonly Channel<CacheWrite> WriterQueue =
         Channel.CreateBounded<CacheWrite>(new BoundedChannelOptions(WriterQueueCapacity)
         {
@@ -255,13 +258,18 @@ internal static class PersistentPreviewCache
 
     public static bool TryLoad(
         PersistentPreviewKind kind, Book book, int pageIndex, Size bounds,
-        int rotation, int quality, out Bitmap? bitmap)
+        int rotation, int quality, out Bitmap? bitmap,
+        CancellationToken cancellationToken = default)
     {
         bitmap = null;
         var configuration = Volatile.Read(ref _configuration);
         if (GetLimit(configuration, kind) <= 0) return false;
+        var entered = false;
         try
         {
+            Readers.Wait(cancellationToken);
+            entered = true;
+            cancellationToken.ThrowIfCancellationRequested();
             var path = GetPath(configuration, kind, book, pageIndex,
                 bounds, rotation, quality);
             if (!File.Exists(path)) return false;
@@ -273,12 +281,19 @@ internal static class PersistentPreviewCache
             bitmap = new Bitmap(image);
             return true;
         }
+        catch (OperationCanceledException)
+        {
+            bitmap?.Dispose();
+            bitmap = null;
+            throw;
+        }
         catch
         {
             bitmap?.Dispose();
             bitmap = null;
             return false;
         }
+        finally { if (entered) Readers.Release(); }
     }
 
     public static void StoreCopyInBackground(
@@ -405,13 +420,17 @@ internal static class PersistentPreviewCache
 
     public static bool TryLoadBrowse(
         string sourcePath, Size bounds, bool fastPreview, int quality,
-        out Bitmap? bitmap)
+        out Bitmap? bitmap, CancellationToken cancellationToken = default)
     {
         bitmap = null;
         var configuration = Volatile.Read(ref _configuration);
         if (configuration.ThumbnailLimitBytes <= 0) return false;
+        var entered = false;
         try
         {
+            Readers.Wait(cancellationToken);
+            entered = true;
+            cancellationToken.ThrowIfCancellationRequested();
             var path = GetBrowsePath(
                 configuration, sourcePath, bounds, fastPreview, quality);
             if (!File.Exists(path)) return false;
@@ -423,12 +442,19 @@ internal static class PersistentPreviewCache
             bitmap = new Bitmap(image);
             return true;
         }
+        catch (OperationCanceledException)
+        {
+            bitmap?.Dispose();
+            bitmap = null;
+            throw;
+        }
         catch
         {
             bitmap?.Dispose();
             bitmap = null;
             return false;
         }
+        finally { if (entered) Readers.Release(); }
     }
 
     public static void StoreBrowseCopyInBackground(

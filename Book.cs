@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Collections.Concurrent;
+using System.Buffers;
 using SharpCompress.Archives;
 
 namespace CDisplayEx.CSharp;
@@ -11,7 +12,17 @@ namespace CDisplayEx.CSharp;
 internal sealed record PageEntry(
     string Name, Func<Stream> Open, Func<CancellationToken, Bitmap>? Decode = null,
     Func<Size, float, CancellationToken, Bitmap>? DecodeThumbnail = null,
-    int ExifRotation = 0);
+    int ExifRotation = 0,
+    Func<CancellationToken, Stream>? OpenCancellable = null)
+{
+    public Stream OpenStream(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return OpenCancellable is null
+            ? Open()
+            : OpenCancellable(cancellationToken);
+    }
+}
 internal sealed record SortablePage(
     string Name, long Size, DateTime Modified, DateTime? Taken, Func<Stream> Open,
     int ExifRotation = 0);
@@ -66,22 +77,27 @@ internal sealed class Book : IDisposable
         PageSortMode folderSort = PageSortMode.NameNumeric,
         PageSortMode archiveSort = PageSortMode.NameNumeric,
         bool folderSortDescending = false,
-        bool archiveSortDescending = false)
+        bool archiveSortDescending = false,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         path = Path.GetFullPath(path);
         if (Directory.Exists(path))
-            return OpenFolder(path, null, folderSort, folderSortDescending);
+            return OpenFolder(path, null, folderSort, folderSortDescending,
+                cancellationToken);
         if (!File.Exists(path)) throw new FileNotFoundException("Book not found.", path);
 
         if (IsSupportedArchive(path))
-            return OpenArchive(path, archiveSort, archiveSortDescending);
-        if (Path.GetExtension(path).Equals(".pdf", StringComparison.OrdinalIgnoreCase)) return OpenPdf(path);
+            return OpenArchive(path, archiveSort, archiveSortDescending,
+                cancellationToken);
+        if (Path.GetExtension(path).Equals(".pdf", StringComparison.OrdinalIgnoreCase))
+            return OpenPdf(path, cancellationToken);
 
         if (IsSupportedImage(path))
         {
             var folderBook = OpenFolder(
                 Path.GetDirectoryName(path)!, folderOrder,
-                folderSort, folderSortDescending);
+                folderSort, folderSortDescending, cancellationToken);
             return folderBook;
         }
 
@@ -175,11 +191,18 @@ internal sealed class Book : IDisposable
                     .Take(maximumPages).ToArray();
             return names.Select(name =>
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var captured = name;
-                using var orientationStream = OpenArchiveEntry(path, captured);
-                var exifRotation = TryReadExifRotation(orientationStream);
+                var exifRotation = 0;
+                if (IsJpegPath(captured))
+                {
+                    using var orientationStream = OpenArchiveEntry(
+                        path, captured, cancellationToken);
+                    exifRotation = TryReadExifRotation(orientationStream);
+                }
                 return new PageEntry(captured, () => OpenArchiveEntry(path, captured),
-                    ExifRotation: exifRotation);
+                    ExifRotation: exifRotation,
+                    OpenCancellable: token => OpenArchiveEntry(path, captured, token));
             }).ToArray();
         }
         if (Path.GetExtension(path).Equals(".pdf", StringComparison.OrdinalIgnoreCase))
@@ -189,12 +212,14 @@ internal sealed class Book : IDisposable
 
     private static Book OpenFolder(string folder, IReadOnlyList<string>? preferredOrder = null,
         PageSortMode sortMode = PageSortMode.NameNumeric,
-        bool descending = false)
+        bool descending = false,
+        CancellationToken cancellationToken = default)
     {
         var discovered = new List<string>();
         var containerList = new List<string>();
         foreach (var path in Directory.EnumerateFiles(folder))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (IsSupportedImage(path)) discovered.Add(path);
             else if (IsSupportedArchive(path) || Path.GetExtension(path).Equals(
                          ".pdf", StringComparison.OrdinalIgnoreCase))
@@ -203,6 +228,7 @@ internal sealed class Book : IDisposable
         var discoveredFiles = discovered.ToArray();
         var sortablePages = discoveredFiles.Select(path =>
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var needsFileInfo = sortMode is PageSortMode.Size or PageSortMode.DateModified;
             FileInfo? info = null;
             if (needsFileInfo)
@@ -272,11 +298,14 @@ internal sealed class Book : IDisposable
         return ordered.ToArray();
     }
 
-    private static Book OpenPdf(string pdfPath)
+    private static Book OpenPdf(
+        string pdfPath, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var renderer = PdfRendering.Open(pdfPath);
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var pages = Enumerable.Range(0, renderer.PageCount)
                 .Select(index => new PageEntry(
                     $"Page {index + 1}",
@@ -308,8 +337,10 @@ internal sealed class Book : IDisposable
     }
 
     private static Book OpenArchive(
-        string archivePath, PageSortMode sortMode, bool descending)
+        string archivePath, PageSortMode sortMode, bool descending,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         SortablePage[] sortedPages;
         using (var archive = ArchiveFactory.Open(archivePath))
         {
@@ -317,6 +348,7 @@ internal sealed class Book : IDisposable
             foreach (var entry in archive.Entries.Where(entry =>
                          !entry.IsDirectory && IsSupportedImage(entry.Key ?? string.Empty)))
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var name = entry.Key!;
                 DateTime? taken = null;
                 var exifRotation = 0;
@@ -331,8 +363,14 @@ internal sealed class Book : IDisposable
                 }
                 try
                 {
-                    using var stream = entry.OpenEntryStream();
-                    exifRotation = TryReadExifRotation(stream);
+                    // Only JPEG stores EXIF orientation that this reader uses.
+                    // Opening every PNG/WebP/GIF entry made large archives do a
+                    // needless decode-like pass before the first card appeared.
+                    if (IsJpegPath(name))
+                    {
+                        using var stream = entry.OpenEntryStream();
+                        exifRotation = TryReadExifRotation(stream);
+                    }
                 }
                 catch { }
                 pages.Add(new SortablePage(
@@ -347,22 +385,53 @@ internal sealed class Book : IDisposable
         var resultPages = sortedPages.Select(page =>
         {
             var name = page.Name;
-            return new PageEntry(name, () => sessions.OpenEntry(name),
-                ExifRotation: page.ExifRotation);
+            return new PageEntry(name,
+                () => sessions.OpenEntry(name, CancellationToken.None),
+                ExifRotation: page.ExifRotation,
+                OpenCancellable: token => sessions.OpenEntry(name, token));
         }).ToArray();
         return new Book(archivePath, resultPages,
             parentFolder: Path.GetDirectoryName(archivePath), ownedResource: sessions);
     }
 
-    private static Stream OpenArchiveEntry(string archivePath, string name)
+    private static Stream OpenArchiveEntry(
+        string archivePath, string name,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         using var archive = ArchiveFactory.Open(archivePath);
         var entry = archive.Entries.FirstOrDefault(e => !e.IsDirectory && e.Key == name)
             ?? throw new InvalidDataException($"Missing archive entry: {name}");
         var memory = new MemoryStream();
-        using (var source = entry.OpenEntryStream()) source.CopyTo(memory);
-        memory.Position = 0;
-        return memory;
+        try
+        {
+            using (var source = entry.OpenEntryStream())
+                CopyStreamCancellable(source, memory, cancellationToken);
+            memory.Position = 0;
+            return memory;
+        }
+        catch
+        {
+            memory.Dispose();
+            throw;
+        }
+    }
+
+    private static void CopyStreamCancellable(
+        Stream source, Stream destination, CancellationToken cancellationToken)
+    {
+        var buffer = ArrayPool<byte>.Shared.Rent(128 * 1024);
+        try
+        {
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var read = source.Read(buffer, 0, buffer.Length);
+                if (read <= 0) return;
+                destination.Write(buffer, 0, read);
+            }
+        }
+        finally { ArrayPool<byte>.Shared.Return(buffer); }
     }
 
     private sealed class ArchiveSessionPool : IDisposable
@@ -380,40 +449,74 @@ internal sealed class Book : IDisposable
             _slots = new SemaphoreSlim(_maximumSessions, _maximumSessions);
         }
 
-        public Stream OpenEntry(string name)
+        public Stream OpenEntry(string name, CancellationToken cancellationToken)
         {
-            _slots.Wait();
+            _slots.Wait(cancellationToken);
             ArchiveSession? session = null;
             var reusable = false;
             try
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 lock (_poolGate)
                 {
                     ObjectDisposedException.ThrowIf(_disposed != 0, this);
-                    if (!_available.TryTake(out session))
-                        session = new ArchiveSession(_archivePath);
+                    _available.TryTake(out session);
+                }
+                if (session is null)
+                {
+                    // ArchiveFactory.Open may parse a large central directory.
+                    // Never do that while holding the pool lock because book
+                    // disposal is initiated by the UI during rapid navigation.
+                    var created = new ArchiveSession(_archivePath);
+                    lock (_poolGate)
+                    {
+                        if (_disposed == 0) session = created;
+                    }
+                    if (session is null)
+                    {
+                        created.Dispose();
+                        throw new ObjectDisposedException(nameof(ArchiveSessionPool));
+                    }
                 }
                 if (!session.Entries.TryGetValue(name, out var entry))
                     throw new InvalidDataException($"Missing archive entry: {name}");
+                // Pre-size ordinary image entries, but do not trust an archive's
+                // declared uncompressed size enough to reserve a multi-gigabyte
+                // contiguous array before the first byte has been read.
+                const int maximumInitialCapacity = 16 * 1024 * 1024;
                 var memory = entry.Size is > 0 and <= int.MaxValue
-                    ? new MemoryStream((int)entry.Size)
+                    ? new MemoryStream((int)Math.Min(entry.Size, maximumInitialCapacity))
                     : new MemoryStream();
-                using (var source = entry.OpenEntryStream()) source.CopyTo(memory);
-                memory.Position = 0;
-                reusable = true;
-                return memory;
+                try
+                {
+                    using (var source = entry.OpenEntryStream())
+                        CopyStreamCancellable(source, memory, cancellationToken);
+                    memory.Position = 0;
+                    reusable = true;
+                    return memory;
+                }
+                catch
+                {
+                    memory.Dispose();
+                    throw;
+                }
             }
             finally
             {
                 if (session is not null)
                 {
+                    var disposeSession = false;
                     lock (_poolGate)
                     {
                         if (reusable && _disposed == 0)
                             _available.Add(session);
                         else
-                            session.Dispose();
+                            disposeSession = true;
                     }
+                    // Native decompressor teardown can flush buffers and close a
+                    // network-backed file. Keep it outside the pool lock so other
+                    // readers and UI-driven disposal never wait behind it.
+                    if (disposeSession) session.Dispose();
                 }
                 _slots.Release();
             }
@@ -421,6 +524,7 @@ internal sealed class Book : IDisposable
 
         public void Dispose()
         {
+            List<ArchiveSession> idle = [];
             lock (_poolGate)
             {
                 if (_disposed != 0) return;
@@ -430,11 +534,15 @@ internal sealed class Book : IDisposable
                 // itself, so rapid book switching cannot dispose a native archive
                 // object while another thread is reading from it.
                 while (_available.TryTake(out var session))
-                {
-                    try { session.Dispose(); }
-                    catch { }
-                }
+                    idle.Add(session);
             }
+            if (idle.Count > 0)
+                _ = Task.Run(() =>
+                {
+                    foreach (var session in idle)
+                        try { session.Dispose(); }
+                        catch { }
+                });
         }
 
         private sealed class ArchiveSession : IDisposable
@@ -624,9 +732,7 @@ internal sealed class Book : IDisposable
 
     private static int TryReadExifRotation(string path)
     {
-        if (!Path.GetExtension(path).Equals(".jpg", StringComparison.OrdinalIgnoreCase) &&
-            !Path.GetExtension(path).Equals(".jpeg", StringComparison.OrdinalIgnoreCase))
-            return 0;
+        if (!IsJpegPath(path)) return 0;
         try
         {
             using var stream = File.OpenRead(path);
@@ -661,15 +767,20 @@ internal sealed class Book : IDisposable
 
     internal static int ReadExifRotation(PageEntry page)
     {
-        var extension = Path.GetExtension(page.Name);
-        if (!extension.Equals(".jpg", StringComparison.OrdinalIgnoreCase) &&
-            !extension.Equals(".jpeg", StringComparison.OrdinalIgnoreCase)) return 0;
+        if (!IsJpegPath(page.Name)) return 0;
         try
         {
             using var stream = page.Open();
             return TryReadExifRotation(stream);
         }
         catch { return 0; }
+    }
+
+    private static bool IsJpegPath(string path)
+    {
+        var extension = Path.GetExtension(path);
+        return extension.Equals(".jpg", StringComparison.OrdinalIgnoreCase) ||
+               extension.Equals(".jpeg", StringComparison.OrdinalIgnoreCase);
     }
 
     private static DateTime? TryReadDateTaken(Stream stream)

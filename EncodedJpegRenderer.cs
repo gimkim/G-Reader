@@ -21,7 +21,7 @@ internal static class EncodedJpegRenderer
         PageEntry page, int rotation, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        using var stream = page.Open();
+        using var stream = page.OpenStream(cancellationToken);
         var info = new MagickImageInfo(stream);
         var rotated = Math.Abs(NormalizeRotation(rotation)) % 180 == 90;
         return rotated ? info.Height > info.Width : info.Width > info.Height;
@@ -31,7 +31,7 @@ internal static class EncodedJpegRenderer
         PageEntry page, int rotation, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        using var stream = page.Open();
+        using var stream = page.OpenStream(cancellationToken);
         var info = new MagickImageInfo(stream);
         var width = checked((int)info.Width);
         var height = checked((int)info.Height);
@@ -46,7 +46,7 @@ internal static class EncodedJpegRenderer
     {
         cancellationToken.ThrowIfCancellationRequested();
         Size rawSize;
-        using (var infoStream = page.Open())
+        using (var infoStream = page.OpenStream(cancellationToken))
         {
             var info = new MagickImageInfo(infoStream);
             rawSize = new Size(checked((int)info.Width), checked((int)info.Height));
@@ -64,7 +64,7 @@ internal static class EncodedJpegRenderer
             ExtractArea = new MagickGeometry(
                 rawCrop.X, rawCrop.Y, (uint)rawCrop.Width, (uint)rawCrop.Height)
         };
-        using var stream = page.Open();
+        using var stream = page.OpenStream(cancellationToken);
         using var image = new MagickImage(stream, readSettings);
         image.ResetPage();
         if (normalizedRotation != 0) image.Rotate(normalizedRotation);
@@ -190,7 +190,7 @@ internal static class EncodedJpegRenderer
         var decodeScale = fastPreview ? 1u : 2u;
         var decodeWidth = (uint)Math.Min(ushort.MaxValue, (long)width * decodeScale);
         var decodeHeight = (uint)Math.Min(ushort.MaxValue, (long)height * decodeScale);
-        using var stream = page.Open();
+        using var stream = page.OpenStream(cancellationToken);
         using var image = new MagickImage(stream, new MagickReadSettings(new JpegReadDefines
             {
                 Size = new MagickGeometry(decodeWidth, decodeHeight),

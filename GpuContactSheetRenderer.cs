@@ -30,44 +30,66 @@ internal static class GpuContactSheetRenderer
         var target = new System.Drawing.Size(
             Math.Max(1, (int)Math.Round(source.Width * scale)),
             Math.Max(1, (int)Math.Round(source.Height * scale)));
-        var converted = source.PixelFormat == DrawingPixelFormat.Format32bppPArgb
-            ? source : null;
-        using var owned = converted is null ? new Bitmap(source.Width, source.Height,
-            DrawingPixelFormat.Format32bppPArgb) : null;
-        if (owned is not null)
+        Bitmap? resized = null;
+        try
         {
-            using var graphics = Graphics.FromImage(owned);
-            graphics.DrawImageUnscaled(source, 0, 0);
-            converted = owned;
+            if (target.Width != source.Width || target.Height != source.Height)
+            {
+                // Do not use a second background Direct2D context for every
+                // thumbnail. The UI surface calls EndDraw on the same shared GPU
+                // device; hundreds of concurrent D2D scale jobs can make that
+                // EndDraw block inside the NVIDIA driver. NPP keeps the resize on
+                // the GPU while staging only the small result through host memory.
+                if (!NvJpegNativeDecoder.TryResizeBitmapStagedGpu(
+                        source, target, fastPreview: true, cancellationToken,
+                        out resized) || resized is null)
+                    return null;
+            }
+            else
+            {
+                resized = source.PixelFormat == DrawingPixelFormat.Format32bppPArgb
+                    ? new Bitmap(source)
+                    : ConvertToPArgb(source);
+            }
+            cancellationToken.ThrowIfCancellationRequested();
+            return UploadBitmap(resized);
         }
-        var stride = checked(converted!.Width * 4);
-        var pixels = new byte[checked(stride * converted.Height)];
-        var data = converted.LockBits(new Rectangle(0, 0, converted.Width, converted.Height),
+        finally { resized?.Dispose(); }
+    }
+
+    private static Bitmap ConvertToPArgb(Bitmap source)
+    {
+        var converted = new Bitmap(source.Width, source.Height,
+            DrawingPixelFormat.Format32bppPArgb);
+        try
+        {
+            using var graphics = Graphics.FromImage(converted);
+            graphics.DrawImageUnscaled(source, 0, 0);
+            return converted;
+        }
+        catch
+        {
+            converted.Dispose();
+            throw;
+        }
+    }
+
+    internal static GpuRenderedImage? Upload(Bitmap source) => UploadBitmap(source);
+
+    private static GpuRenderedImage? UploadBitmap(Bitmap source)
+    {
+        var stride = checked(source.Width * 4);
+        var pixels = new byte[checked(stride * source.Height)];
+        var data = source.LockBits(new Rectangle(0, 0, source.Width, source.Height),
             DrawingImageLockMode.ReadOnly, DrawingPixelFormat.Format32bppPArgb);
         try
         {
-            for (var y = 0; y < converted.Height; y++)
+            for (var y = 0; y < source.Height; y++)
                 Marshal.Copy(data.Scan0 + y * data.Stride, pixels, y * stride, stride);
         }
-        finally { converted.UnlockBits(data); }
-        cancellationToken.ThrowIfCancellationRequested();
-        var uploaded = GpuInteropDevice.CreateImageFromBgra(
-            pixels, converted.Width, converted.Height);
-        if (uploaded is null) return null;
-
-        // WIC normally decodes fast previews at their final dimensions already.
-        // Keep that texture directly instead of submitting another Direct2D job on
-        // the process-wide D3D device.  Apart from avoiding a redundant copy, this
-        // prevents background thumbnail workers from holding the driver while the
-        // UI's Direct2D surface is presenting a frame.
-        if (uploaded.Width == target.Width && uploaded.Height == target.Height)
-            return uploaded;
-
-        using (uploaded)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            return TryScale(uploaded, target);
-        }
+        finally { source.UnlockBits(data); }
+        return GpuInteropDevice.CreateImageFromBgra(
+            pixels, source.Width, source.Height);
     }
 
     private static GpuRenderedImage? TryScale(

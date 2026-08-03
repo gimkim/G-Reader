@@ -212,7 +212,7 @@ internal sealed class HistoryPopupForm : Form
                 var path = _entries[item].Path;
                 if (PersistentPreviewCache.TryLoadBrowse(
                         path, targetSize, fastPreview, _quality,
-                        out var cached) && cached is not null)
+                        out var cached, cancellationToken) && cached is not null)
                     return cached;
                 var generated = BrowsePreviewRenderer.Create(
                     path, targetSize, _threads,

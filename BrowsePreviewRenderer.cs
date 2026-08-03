@@ -226,7 +226,7 @@ internal static class BrowsePreviewRenderer
                 page, targetSize, cancellationToken, out var wic) && wic is not null)
             return wic;
         using var formatLease = ImagePipelineTuning.EnterFormat(page.Name, cancellationToken);
-        using var stream = page.Open();
+        using var stream = page.OpenStream(cancellationToken);
         using var image = new MagickImage(stream);
         if (image.GetColorProfile() is not null)
             image.TransformColorSpace(ColorProfiles.SRGB);

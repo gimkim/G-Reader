@@ -962,7 +962,12 @@ internal sealed class AsyncViewerPanel : Panel
                 gpuPreview = await RenderWorkScheduler.RunFastCodecAsync(() =>
                 {
                     using var lease = ImagePipelineTuning.EnterGenericGpu(cancellationToken);
-                    return GpuContactSheetRenderer.TryScale(source, size, cancellationToken);
+                    if (!NvJpegNativeDecoder.TryResizeBitmapStagedGpu(
+                            source, size, fastPreview: true, cancellationToken,
+                            out var resized) || resized is null)
+                        return null;
+                    using (resized)
+                        return GpuContactSheetRenderer.Upload(resized);
                 }, cancellationToken);
             if (gpuPreview is not null)
             {
@@ -984,7 +989,7 @@ internal sealed class AsyncViewerPanel : Panel
             var gpuWork = () =>
             {
                 using var lease = ImagePipelineTuning.EnterGenericGpu(cancellationToken);
-                return NvJpegNativeDecoder.TryResizeBitmapToGpu(
+                return NvJpegNativeDecoder.TryResizeBitmapStagedGpu(
                     source, size, fastPreview: false, cancellationToken,
                     out var image) ? image : null;
             };
@@ -993,7 +998,7 @@ internal sealed class AsyncViewerPanel : Panel
                 : await RenderWorkScheduler.RunFullAsync(gpuWork, cancellationToken);
             if (gpuRendered is not null)
             {
-                if (!AddGpuRenderOwned(key, gpuRendered)) gpuRendered.Dispose();
+                if (!AddRenderOwned(key, gpuRendered)) gpuRendered.Dispose();
                 return;
             }
         }
@@ -1022,21 +1027,10 @@ internal sealed class AsyncViewerPanel : Panel
 
         if (generatePreview && Volatile.Read(ref _previewCacheLimitBytes) > 0)
         {
-            var gpuPreview = await RenderWorkScheduler.RunFastCodecAsync(
-                () => EncodedJpegRenderer.RenderReaderGpu(
-                    page, context.ClientSize, visiblePageCount, rotation,
-                    fastPreview: true, cancellationToken),
-                cancellationToken).ConfigureAwait(false);
-            if (gpuPreview is { } directPreview)
-            {
-                var directKey = new RenderKey(
-                    pageIndex, pageKey, directPreview.Image.Width, directPreview.Image.Height,
-                    visiblePageCount, context.Version);
-                if (!AddGpuPreviewOwned(directKey, directPreview.Image))
-                    directPreview.Image.Dispose();
-            }
-            else
-            {
+            // Background preview batches retain many pages and evict them as the
+            // directional window moves. Keep nvJPEG/NPP on the GPU, but stage the
+            // small result through pinned host memory instead of registering a
+            // short-lived CUDA-D3D texture for every preview.
             var preview = await RenderWorkScheduler.RunFastCodecAsync(
                 () => EncodedJpegRenderer.RenderReader(
                     page, context.ClientSize, visiblePageCount, rotation,
@@ -1046,28 +1040,28 @@ internal sealed class AsyncViewerPanel : Panel
                 pageIndex, pageKey, preview.Bitmap.Width, preview.Bitmap.Height,
                 visiblePageCount, context.Version);
             if (!AddPreviewOwned(previewKey, preview.Bitmap)) preview.Bitmap.Dispose();
-            }
         }
 
-        var gpuWork = () => EncodedJpegRenderer.RenderReaderGpu(
-            page, context.ClientSize, visiblePageCount, rotation,
-            fastPreview: false, cancellationToken);
-        var gpuRendered = interactiveFull
-            ? await RenderWorkScheduler.RunInteractiveFullAsync(
-                gpuWork, cancellationToken).ConfigureAwait(false)
-            : idlePriority
-                ? await RenderWorkScheduler.RunIdleFullAsync(
-                    gpuWork, cancellationToken).ConfigureAwait(false)
-                : await RenderWorkScheduler.RunFullAsync(
-                    gpuWork, cancellationToken).ConfigureAwait(false);
-        if (gpuRendered is { } directRendered)
+        // Direct CUDA-D3D handoff is valuable for the page requested by the user
+        // because it avoids a host copy. Background warming instead uses the
+        // staged nvJPEG path below: it keeps GPU decode/resize performance while
+        // avoiding hundreds of register/unregister operations and driver churn.
+        if (interactiveFull)
         {
-            var directKey = new RenderKey(
-                pageIndex, pageKey, directRendered.Image.Width, directRendered.Image.Height,
-                visiblePageCount, context.Version);
-            if (!AddGpuRenderOwned(directKey, directRendered.Image))
-                directRendered.Image.Dispose();
-            return;
+            var gpuRendered = await RenderWorkScheduler.RunInteractiveFullAsync(
+                () => EncodedJpegRenderer.RenderReaderGpu(
+                    page, context.ClientSize, visiblePageCount, rotation,
+                    fastPreview: false, cancellationToken), cancellationToken)
+                .ConfigureAwait(false);
+            if (gpuRendered is { } directRendered)
+            {
+                var directKey = new RenderKey(
+                    pageIndex, pageKey, directRendered.Image.Width,
+                    directRendered.Image.Height, visiblePageCount, context.Version);
+                if (!AddGpuRenderOwned(directKey, directRendered.Image))
+                    directRendered.Image.Dispose();
+                return;
+            }
         }
 
         var cpuWork = () => EncodedJpegRenderer.RenderReader(
