@@ -26,13 +26,10 @@ internal static class Program
         // persisted user setting before any image work begins.
         ImageMagick.ResourceLimits.Thread = (ulong)UserSettings.DefaultImageMagickThreadsPerImage;
         var request = CommandLineOptions.GetInitialRequest(args);
-        var explorerOrder = request.ForceFullPage
-            ? ExplorerViewOrder.TryCaptureFor(request.Path)
-            : null;
         try
         {
             Application.Run(new AsyncMainForm(
-                request.Path, request.ForceFullPage, explorerOrder));
+                request.Path, request.ForceFullPage));
         }
         catch (Exception exception)
         {

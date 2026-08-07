@@ -104,7 +104,7 @@ internal sealed class PositionSlider : Control
         var textWidth = PositionTextWidth;
         var bar = GetBarRectangle(textWidth);
         using var track = Rounded(bar, 4);
-        using var trackBrush = new SolidBrush(Color.FromArgb(68, 72, 80));
+        using var trackBrush = new SolidBrush(Color.FromArgb(39, 57, 78));
         e.Graphics.FillPath(trackBrush, track);
 
         var ratio = _maximum == 0 ? 0f : (float)_value / _maximum;
@@ -114,7 +114,8 @@ internal sealed class PositionSlider : Control
             ? new Rectangle(bar.Right - fillWidth, bar.Y, fillWidth, bar.Height)
             : new Rectangle(bar.X, bar.Y, fillWidth, bar.Height);
         using var fillPath = Rounded(fill, 4);
-        using var gradient = new LinearGradientBrush(fill, Color.FromArgb(63, 169, 245), Color.FromArgb(123, 92, 246), 0f);
+        using var gradient = new LinearGradientBrush(fill,
+            ModernUiTheme.Accent, Color.FromArgb(75, 133, 221), 0f);
         e.Graphics.FillPath(gradient, fillPath);
 
         // Show every render-ready page. Adjacent pages are coalesced into one
@@ -125,8 +126,8 @@ internal sealed class PositionSlider : Control
         var thumbX = _reverseDirection
             ? bar.Right - (int)Math.Round(bar.Width * ratio)
             : bar.X + (int)Math.Round(bar.Width * ratio);
-        using var thumbBrush = new SolidBrush(Color.White);
-        using var thumbPen = new Pen(Color.FromArgb(60, 120, 220), 2);
+        using var thumbBrush = new SolidBrush(ModernUiTheme.Text);
+        using var thumbPen = new Pen(ModernUiTheme.AccentPressed, 2);
         e.Graphics.FillEllipse(thumbBrush, thumbX - 7, Height / 2 - 7, 14, 14);
         e.Graphics.DrawEllipse(thumbPen, thumbX - 7, Height / 2 - 7, 14, 14);
 
@@ -139,7 +140,7 @@ internal sealed class PositionSlider : Control
             : new Rectangle(Width - textWidth, 0, textWidth - 8, Height);
         var alignment = _reverseDirection ? TextFormatFlags.Left : TextFormatFlags.Right;
         TextRenderer.DrawText(e.Graphics, text, Font, textBounds,
-            Color.Gainsboro, TextFormatFlags.VerticalCenter | alignment);
+            ModernUiTheme.MutedText, TextFormatFlags.VerticalCenter | alignment);
     }
 
     protected override void OnMouseDown(MouseEventArgs e)

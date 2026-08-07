@@ -5,6 +5,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Collections.Concurrent;
 using System.Buffers;
+using System.Diagnostics;
 using SharpCompress.Archives;
 
 namespace CDisplayEx.CSharp;
@@ -23,6 +24,8 @@ internal sealed record PageEntry(
             : OpenCancellable(cancellationToken);
     }
 }
+internal readonly record struct BookOpenProgress(
+    string Phase, int ItemsProcessed, string? CurrentName);
 internal sealed record SortablePage(
     string Name, long Size, DateTime Modified, DateTime? Taken, Func<Stream> Open,
     int ExifRotation = 0);
@@ -43,6 +46,8 @@ internal sealed class Book : IDisposable
     public string? ParentFolder { get; }
     private readonly IDisposable? _ownedResource;
     private readonly ConcurrentDictionary<int, CacheSourceIdentity> _cacheSourceIdentities = [];
+    private readonly ConcurrentDictionary<int, int> _lazyExifRotations = [];
+    private readonly ConcurrentDictionary<int, byte> _lazyExifResolved = [];
     private readonly string _cacheSourcePath;
     private readonly bool _sourceIsDirectory;
     private int _disposed;
@@ -78,18 +83,19 @@ internal sealed class Book : IDisposable
         PageSortMode archiveSort = PageSortMode.NameNumeric,
         bool folderSortDescending = false,
         bool archiveSortDescending = false,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        IProgress<BookOpenProgress>? progress = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
         path = Path.GetFullPath(path);
         if (Directory.Exists(path))
             return OpenFolder(path, null, folderSort, folderSortDescending,
-                cancellationToken);
+                cancellationToken, progress);
         if (!File.Exists(path)) throw new FileNotFoundException("Book not found.", path);
 
         if (IsSupportedArchive(path))
             return OpenArchive(path, archiveSort, archiveSortDescending,
-                cancellationToken);
+                cancellationToken, progress);
         if (Path.GetExtension(path).Equals(".pdf", StringComparison.OrdinalIgnoreCase))
             return OpenPdf(path, cancellationToken);
 
@@ -97,7 +103,7 @@ internal sealed class Book : IDisposable
         {
             var folderBook = OpenFolder(
                 Path.GetDirectoryName(path)!, folderOrder,
-                folderSort, folderSortDescending, cancellationToken);
+                folderSort, folderSortDescending, cancellationToken, progress);
             return folderBook;
         }
 
@@ -110,6 +116,23 @@ internal sealed class Book : IDisposable
         for (var i = 0; i < Pages.Count; i++)
             if (Path.GetFileName(Pages[i].Name).Equals(name, StringComparison.OrdinalIgnoreCase)) return i;
         return 0;
+    }
+
+    public int GetExifRotation(int pageIndex)
+    {
+        if ((uint)pageIndex >= (uint)Pages.Count) return 0;
+        var page = Pages[pageIndex];
+        if (page.ExifRotation != 0 || !IsJpegPath(page.Name))
+            return page.ExifRotation;
+        if (_lazyExifResolved.ContainsKey(pageIndex))
+            return _lazyExifRotations.GetValueOrDefault(pageIndex);
+
+        var rotation = 0;
+        try { rotation = ReadExifRotation(page); }
+        catch { }
+        _lazyExifRotations[pageIndex] = rotation;
+        _lazyExifResolved.TryAdd(pageIndex, 0);
+        return rotation;
     }
 
     internal CacheSourceIdentity GetCacheSourceIdentity(int pageIndex) =>
@@ -213,10 +236,13 @@ internal sealed class Book : IDisposable
     private static Book OpenFolder(string folder, IReadOnlyList<string>? preferredOrder = null,
         PageSortMode sortMode = PageSortMode.NameNumeric,
         bool descending = false,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        IProgress<BookOpenProgress>? progress = null)
     {
         var discovered = new List<string>();
         var containerList = new List<string>();
+        var scanCount = 0;
+        var lastProgressTick = 0L;
         foreach (var path in Directory.EnumerateFiles(folder))
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -224,10 +250,16 @@ internal sealed class Book : IDisposable
             else if (IsSupportedArchive(path) || Path.GetExtension(path).Equals(
                          ".pdf", StringComparison.OrdinalIgnoreCase))
                 containerList.Add(path);
+            ReportOpenProgress(progress, "Listing files", ++scanCount,
+                Path.GetFileName(path), ref lastProgressTick);
         }
         var discoveredFiles = discovered.ToArray();
-        var sortablePages = discoveredFiles.Select(path =>
+        progress?.Report(new BookOpenProgress(
+            "Reading file metadata", 0, null));
+        var sortablePages = new List<SortablePage>(discoveredFiles.Length);
+        for (var index = 0; index < discoveredFiles.Length; index++)
         {
+            var path = discoveredFiles[index];
             cancellationToken.ThrowIfCancellationRequested();
             var needsFileInfo = sortMode is PageSortMode.Size or PageSortMode.DateModified;
             FileInfo? info = null;
@@ -236,12 +268,20 @@ internal sealed class Book : IDisposable
                 try { info = new FileInfo(path); }
                 catch { }
             }
-            return new SortablePage(
+            // EXIF orientation is loaded lazily when a page is actually used.
+            // Reading every JPEG header here makes opening a 40,000-file folder
+            // needlessly expensive, especially when sorting by modified time.
+            sortablePages.Add(new SortablePage(
                 Path.GetFileName(path), info?.Length ?? 0L,
                 info?.LastWriteTimeUtc ?? DateTime.MinValue,
                 sortMode == PageSortMode.DateTaken ? TryReadDateTaken(path) : null,
-                () => File.OpenRead(path), TryReadExifRotation(path));
-        }).ToArray();
+                () => File.OpenRead(path)));
+            ReportOpenProgress(progress, "Reading file metadata", index + 1,
+                Path.GetFileName(path), ref lastProgressTick);
+        }
+        progress?.Report(new BookOpenProgress(
+            $"Sorting files ({SortModeDescription(sortMode, descending)})",
+            discoveredFiles.Length, null));
         var sortedPages = SortPages(sortablePages, sortMode, descending).ToArray();
         if (preferredOrder is { Count: > 0 })
         {
@@ -273,6 +313,18 @@ internal sealed class Book : IDisposable
             containers);
     }
 
+    private static string SortModeDescription(PageSortMode mode, bool descending) =>
+        mode switch
+        {
+            PageSortMode.DateModified => descending
+                ? "modified newest first" : "modified oldest first",
+            PageSortMode.Size => descending ? "size largest first" : "size smallest first",
+            PageSortMode.DateTaken => descending ? "date taken newest first" : "date taken oldest first",
+            PageSortMode.Extension => descending ? "extension descending" : "extension ascending",
+            PageSortMode.NameAlphabetical => descending ? "name Z-A" : "name A-Z",
+            _ => descending ? "name descending" : "name numeric"
+        };
+
     private static string[] ApplyPreferredOrder(string folder, string[] discoveredFiles,
         IReadOnlyList<string>? preferredOrder)
     {
@@ -296,6 +348,18 @@ internal sealed class Book : IDisposable
         // reader's normal deterministic ordering after the captured view items.
         ordered.AddRange(discoveredFiles.Where(file => available.ContainsKey(Path.GetFullPath(file))));
         return ordered.ToArray();
+    }
+
+    private static void ReportOpenProgress(
+        IProgress<BookOpenProgress>? progress, string phase, int itemsProcessed,
+        string? currentName, ref long lastProgressTick)
+    {
+        if (progress is null) return;
+        var now = Stopwatch.GetTimestamp();
+        var interval = Stopwatch.Frequency / 12;
+        if (itemsProcessed != 1 && now - lastProgressTick < interval) return;
+        lastProgressTick = now;
+        progress.Report(new BookOpenProgress(phase, itemsProcessed, currentName));
     }
 
     private static Book OpenPdf(
@@ -338,13 +402,16 @@ internal sealed class Book : IDisposable
 
     private static Book OpenArchive(
         string archivePath, PageSortMode sortMode, bool descending,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        IProgress<BookOpenProgress>? progress = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
         SortablePage[] sortedPages;
         using (var archive = ArchiveFactory.Open(archivePath))
         {
             var pages = new List<SortablePage>();
+            var entryCount = 0;
+            var lastProgressTick = 0L;
             foreach (var entry in archive.Entries.Where(entry =>
                          !entry.IsDirectory && IsSupportedImage(entry.Key ?? string.Empty)))
             {
@@ -361,23 +428,16 @@ internal sealed class Book : IDisposable
                     }
                     catch { }
                 }
-                try
-                {
-                    // Only JPEG stores EXIF orientation that this reader uses.
-                    // Opening every PNG/WebP/GIF entry made large archives do a
-                    // needless decode-like pass before the first card appeared.
-                    if (IsJpegPath(name))
-                    {
-                        using var stream = entry.OpenEntryStream();
-                        exifRotation = TryReadExifRotation(stream);
-                    }
-                }
-                catch { }
                 pages.Add(new SortablePage(
                     name, entry.Size, entry.LastModifiedTime ?? DateTime.MinValue, taken,
                     () => throw new InvalidOperationException("Archive session is not initialized."),
                     exifRotation));
+                ReportOpenProgress(progress, "Listing archive entries", ++entryCount,
+                    name, ref lastProgressTick);
             }
+            progress?.Report(new BookOpenProgress(
+                $"Sorting archive ({SortModeDescription(sortMode, descending)})",
+                pages.Count, null));
             sortedPages = SortPages(
                 pages, sortMode, descending, hierarchicalNames: true).ToArray();
         }

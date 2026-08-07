@@ -155,7 +155,7 @@ internal sealed partial class ThumbnailGridView : Panel
         AutoScroll = false;
         DoubleBuffered = false;
         ResizeRedraw = true;
-        BackColor = System.Drawing.Color.FromArgb(26, 28, 33);
+        BackColor = ModernUiTheme.WindowBackground;
         TabStop = true;
         InitializeDirect2D();
         Resize += (_, _) => UpdateVirtualLayout();
@@ -867,7 +867,7 @@ internal sealed partial class ThumbnailGridView : Panel
         _cellWidth = unconstrainedCellWidth;
         _cellHeight = CalculateCellHeight(_cellWidth);
         UpdateRenderTargetSize();
-        var virtualHeight = rows * _cellHeight + 8;
+        var virtualHeight = rows * _cellHeight + 6;
         if (requiresVerticalScroll)
             virtualHeight = Math.Max(virtualHeight, ClientSize.Height + 1);
         _showOverlayScrollBar = requiresVerticalScroll;
@@ -913,8 +913,8 @@ internal sealed partial class ThumbnailGridView : Panel
     {
         var column = item % _imagesPerRow;
         var row = item / _imagesPerRow;
-        return new Rectangle(column * _cellWidth + 5, row * _cellHeight + 5,
-            Math.Max(20, _cellWidth - 10), Math.Max(30, _cellHeight - 10));
+        return new Rectangle(column * _cellWidth + 3, row * _cellHeight + 3,
+            Math.Max(20, _cellWidth - 6), Math.Max(30, _cellHeight - 6));
     }
 
     private int HitTestItem(Point location)

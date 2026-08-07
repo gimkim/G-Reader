@@ -77,7 +77,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     }
     private readonly record struct BrowsePreviewKey(
         string Path, int Width, int Height, bool FastPreview);
-    private const int BottomBarHeight = 40;
+    private const int BottomBarHeight = 34;
     private const double FullscreenEdgeActivationRatio = 0.04d;
     private const int FullscreenBottomHideDelayMs = 700;
     private int PrecacheWorkerCount => Math.Clamp(_performance.PrecacheWorkerCount, 1, 64);
@@ -103,22 +103,22 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private readonly ToolStrip _toolbar = new ClickThroughToolStrip
     {
         GripStyle = ToolStripGripStyle.Hidden, Dock = DockStyle.Top,
-        ImageScalingSize = new Size(24, 24), AutoSize = true,
-        Padding = new Padding(6, 4, 6, 4), BackColor = Color.FromArgb(39, 42, 49),
-        ForeColor = Color.FromArgb(232, 236, 244)
+        ImageScalingSize = new Size(20, 20), AutoSize = true,
+        Padding = new Padding(5, 2, 5, 2), BackColor = ModernUiTheme.HeaderBackground,
+        ForeColor = ModernUiTheme.Text
     };
-    private readonly Panel _bottomPanel = new() { Height = BottomBarHeight, Dock = DockStyle.Bottom, BackColor = Color.FromArgb(36, 38, 44) };
+    private readonly Panel _bottomPanel = new() { Height = BottomBarHeight, Dock = DockStyle.Bottom, BackColor = ModernUiTheme.HeaderBackground };
     private readonly PositionSlider _positionSlider = new() { Dock = DockStyle.Fill };
     private readonly Label _loadStatus = new()
     {
         Dock = DockStyle.Left, Width = 620, TextAlign = ContentAlignment.MiddleLeft,
-        ForeColor = Color.Gainsboro, Padding = new Padding(10, 0, 8, 0),
+        ForeColor = ModernUiTheme.MutedText, Padding = new Padding(8, 0, 6, 0),
         Text = "No file open", AutoEllipsis = true
     };
     private readonly Label _toastOverlay = new()
     {
         AutoSize = true, Visible = false, ForeColor = Color.White,
-        BackColor = Color.FromArgb(48, 52, 61), Padding = new Padding(14, 8, 14, 8),
+        BackColor = Color.FromArgb(29, 54, 82), Padding = new Padding(12, 6, 12, 6),
         Font = new Font("Segoe UI Semibold", 10f)
     };
     private readonly System.Windows.Forms.Timer _toastTimer = new() { Interval = 1500 };
@@ -130,26 +130,26 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private readonly ThumbnailGridView _thumbnailGrid = new();
     private readonly Panel _thumbnailModePanel = new()
     {
-        Dock = DockStyle.Fill, BackColor = Color.FromArgb(26, 28, 33), Visible = false
+        Dock = DockStyle.Fill, BackColor = ModernUiTheme.WindowBackground, Visible = false
     };
     private readonly Panel _thumbnailControls = new()
     {
-        Dock = DockStyle.Top, Height = 46, BackColor = Color.FromArgb(36, 38, 44), Padding = new Padding(10, 3, 12, 3)
+        Dock = DockStyle.Top, Height = 38, BackColor = ModernUiTheme.HeaderBackground, Padding = new Padding(6, 2, 8, 2)
     };
     private readonly Panel _thumbnailAddressPanel = new()
     {
-        Dock = DockStyle.Top, Height = 42, BackColor = Color.FromArgb(31, 34, 40),
-        Padding = new Padding(10, 6, 12, 6)
+        Dock = DockStyle.Top, Height = 34, BackColor = ModernUiTheme.WindowBackground,
+        Padding = new Padding(6, 4, 8, 4)
     };
     private readonly TextBox _thumbnailAddressBox = new()
     {
         Dock = DockStyle.Fill, BorderStyle = BorderStyle.FixedSingle,
-        BackColor = Color.FromArgb(49, 53, 62), ForeColor = Color.White,
-        Font = new Font("Segoe UI", 9.5f)
+        BackColor = ModernUiTheme.ControlRaised, ForeColor = ModernUiTheme.Text,
+        Font = new Font("Segoe UI", 9f)
     };
     private readonly Label _thumbnailColumnsLabel = new()
     {
-        Dock = DockStyle.Left, Width = 160, ForeColor = Color.Gainsboro,
+        Dock = DockStyle.Left, Width = 150, ForeColor = ModernUiTheme.MutedText,
         TextAlign = ContentAlignment.MiddleLeft
     };
     private readonly TrackBar _thumbnailColumnsSlider = new()
@@ -215,6 +215,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private bool _bookPrecacheStarted;
     private bool _warmUsesIdlePriority;
     private bool _viewerRendering;
+    private long _lastProgressUiTick;
     private bool _suppressPositionEvent;
     private bool _doublePage;
     private bool _doublePageOffset;
@@ -291,6 +292,9 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         KeyPreview = true;
         AllowDrop = true;
         Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? SystemIcons.Application;
+        ModernUiTheme.Apply(this, _menu, _toolbar, _bottomPanel, _loadStatus,
+            _thumbnailModePanel, _thumbnailControls, _thumbnailAddressPanel,
+            _thumbnailAddressBox, _thumbnailColumnsLabel, _thumbnailColumnsSlider);
 
         BuildToolbar();
         BuildBottomPanel();
@@ -662,7 +666,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         var addressLabel = new Label
         {
             Text = "Path", Dock = DockStyle.Left, Width = 48,
-            ForeColor = Color.Gainsboro, TextAlign = ContentAlignment.MiddleLeft
+            ForeColor = ModernUiTheme.MutedText, TextAlign = ContentAlignment.MiddleLeft,
+            Font = new Font("Segoe UI", 9f, FontStyle.Regular)
         };
         _thumbnailAddressPanel.Controls.Add(_thumbnailAddressBox);
         _thumbnailAddressPanel.Controls.Add(addressLabel);
@@ -857,16 +862,36 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         var cancellation = new CancellationTokenSource();
         _bookCancellation = cancellation;
         var progress = BeginProgress("Scanning book...", 0, true);
+        var openProgress = new Progress<BookOpenProgress>(status =>
+        {
+            var count = status.ItemsProcessed > 0
+                ? $" ({status.ItemsProcessed:N0})"
+                : string.Empty;
+            var current = string.IsNullOrWhiteSpace(status.CurrentName)
+                ? $"{status.Phase}{count}"
+                : $"{status.Phase}{count}: {status.CurrentName}";
+            UpdateProgress(progress, status.ItemsProcessed, 0, current);
+        });
         try
         {
             var folderOrder = PathsEqual(path, _initialPath) ? _initialFolderOrder : null;
+            if (folderOrder is null && _forceInitialFullPage &&
+                PathsEqual(path, _initialPath) && File.Exists(path) &&
+                Book.IsSupportedImage(path))
+            {
+                UpdateProgress(progress, 0, 0, "Reading Explorer folder order...");
+                folderOrder = await ExplorerViewOrder.CaptureAsync(
+                    path, cancellation.Token);
+            }
+            UpdateProgress(progress, 0, 0,
+                Directory.Exists(path) ? "Listing folder files..." : "Opening file...");
             var book = await Task.Run(() => Book.Open(
                 path, folderOrder,
                 NormalizeSortMode(_settings.FolderPageSort),
                 NormalizeSortMode(_settings.ArchivePageSort),
                 _settings.FolderPageSortDescending,
                 _settings.ArchivePageSortDescending,
-                cancellation.Token), cancellation.Token);
+                cancellation.Token, openProgress), cancellation.Token);
             if (cancellation.IsCancellationRequested ||
                 _bookCancellation != cancellation)
             {
@@ -1965,7 +1990,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private int GetPageRotation(Book book, int index)
     {
         var rotation = _rotations.GetValueOrDefault(index) +
-            book.Pages[index].ExifRotation;
+            book.GetExifRotation(index);
         rotation %= 360;
         return rotation < 0 ? rotation + 360 : rotation;
     }
@@ -3342,23 +3367,60 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private int BeginProgress(string text, int maximum, bool marquee)
     {
-        return ++_progressVersion;
+        var version = Interlocked.Increment(ref _progressVersion);
+        PostProgressUi(() =>
+        {
+            if (version != Volatile.Read(ref _progressVersion) ||
+                IsDisposed || Disposing) return;
+            _loadStatus.Text = text;
+        });
+        return version;
     }
 
     private void UpdateProgress(int version, int value, int maximum, string text)
     {
-        if (version != _progressVersion) return;
+        if (version != Volatile.Read(ref _progressVersion)) return;
+        PostProgressUi(() =>
+        {
+            if (version != Volatile.Read(ref _progressVersion) ||
+                IsDisposed || Disposing) return;
+            _loadStatus.Text = text;
+        });
     }
 
     private void ReportThumbnailProgress(int version, int value, int maximum, string text)
     {
-        // The visible progress/status UI was intentionally removed. Do not
-        // enqueue no-op UI callbacks from high-volume thumbnail completion.
+        var now = Environment.TickCount64;
+        var previous = Interlocked.Read(ref _lastProgressUiTick);
+        if (value < maximum && now - previous < 80) return;
+        Interlocked.Exchange(ref _lastProgressUiTick, now);
+        UpdateProgress(version, value, maximum, text);
     }
 
     private void EndProgress(int version, string text = "Ready")
     {
-        if (version != _progressVersion) return;
+        if (version != Volatile.Read(ref _progressVersion)) return;
+        PostProgressUi(() =>
+        {
+            if (version != Volatile.Read(ref _progressVersion)) return;
+            if (string.Equals(text, "Ready", StringComparison.OrdinalIgnoreCase))
+                UpdateFileInfoLabel();
+            else
+                _loadStatus.Text = text;
+        });
+    }
+
+    private void PostProgressUi(Action action)
+    {
+        if (IsDisposed || Disposing) return;
+        try
+        {
+            if (InvokeRequired)
+                BeginInvoke(action);
+            else
+                action();
+        }
+        catch (InvalidOperationException) { }
     }
 
     private void RestoreCacheStatus() => UpdateFileInfoLabel();
@@ -4901,11 +4963,12 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         {
             DisplayStyle = ToolStripItemDisplayStyle.Text,
             AutoToolTip = true,
-            ForeColor = Color.FromArgb(232, 236, 244),
+            ForeColor = ModernUiTheme.Text,
             ToolTipText = $"Sort {sourceLabel.ToLowerInvariant()} by",
             AccessibleName = $"Sort {sourceLabel.ToLowerInvariant()} by",
-            Margin = new Padding(4, 2, 2, 2),
-            Padding = new Padding(3)
+            Margin = new Padding(3, 0, 2, 0),
+            Padding = new Padding(5, 3, 5, 3),
+            BackColor = ModernUiTheme.HeaderBackground
         };
         foreach (var (mode, label) in SortChoices())
         {
@@ -4913,8 +4976,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             {
                 Tag = mode,
                 Checked = mode == selectedMode,
-                BackColor = Color.White,
-                ForeColor = Color.FromArgb(31, 36, 44)
+                BackColor = ModernUiTheme.ControlBackground,
+                ForeColor = ModernUiTheme.Text
             };
             item.Click += (_, _) => ChangeSortMode(mode, archive);
             button.DropDownItems.Add(item);
@@ -4930,8 +4993,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             {
                 Tag = tag,
                 Checked = descending == isDescending,
-                BackColor = Color.White,
-                ForeColor = Color.FromArgb(31, 36, 44)
+                BackColor = ModernUiTheme.ControlBackground,
+                ForeColor = ModernUiTheme.Text
             };
             item.Click += (_, _) => ChangeSortDirection(isDescending, archive);
             button.DropDownItems.Add(item);
@@ -5033,7 +5096,9 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         {
             Image = image, Text = tooltip, AccessibleName = tooltip, ToolTipText = tooltip,
             DisplayStyle = ToolStripItemDisplayStyle.Image,
-            AutoToolTip = true, Margin = new Padding(2), Padding = new Padding(3)
+            AutoToolTip = true, Margin = new Padding(1, 0, 1, 0),
+            Padding = new Padding(4, 3, 4, 3),
+            BackColor = ModernUiTheme.HeaderBackground, ForeColor = ModernUiTheme.Text
         };
         button.Click += click;
         _toolbar.Items.Add(button);

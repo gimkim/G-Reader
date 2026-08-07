@@ -24,12 +24,8 @@ For setting up another development machine, follow `MIGRATION.md`. Runtime
 settings and preview caches live outside the repository and should never be
 committed.
 
-## Preservation rules
+## Responsiveness invariants
 
-- Do not modify or regenerate anything under `versions\1.0-unlimited-cache-smooth`.
-- Do not modify or regenerate anything under `versions\2.0-ui-responsive`.
-- Do not modify or regenerate anything under `versions\3.0` or `versions\G-Reader-3.0.zip`.
-- Keep the corresponding version ZIP archives unchanged.
 - Preserve UI responsiveness: image decoding, resizing, cache discovery, and filesystem enumeration must not block the UI thread.
 - Preserve Direct2D rendering and the responsive page-navigation path.
 
@@ -114,7 +110,6 @@ every corresponding render and cache path.
   not claim that a real GPU/PDF/archive UI reproduction was completed.
 - Keep runtime settings, caches, dumps, and generated release artifacts out of
   source control unless a release asset is intentionally attached to GitHub.
-  Preserve all historical `versions\` content listed above.
 - Settings pages must remain readable at different resolutions and Windows DPI
   scaling levels: use responsive layout/anchoring, avoid clipped explanatory
   text, and keep performance/codec relationships visible. The update checker

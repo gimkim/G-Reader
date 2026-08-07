@@ -4,8 +4,48 @@ namespace CDisplayEx.CSharp;
 
 internal static class ExplorerViewOrder
 {
-    public static IReadOnlyList<string>? TryCaptureFor(string? openedPath)
+    public static async Task<IReadOnlyList<string>?> CaptureAsync(
+        string? openedPath, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!OperatingSystem.IsWindows()) return null;
+
+        // Shell.Application is an STA automation object. Keep its potentially
+        // large Items enumeration away from the WinForms thread, while still
+        // preserving the apartment that made the old synchronous capture work.
+        var completion = new TaskCompletionSource<IReadOnlyList<string>?>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var worker = new Thread(() =>
+        {
+            try
+            {
+                completion.TrySetResult(TryCaptureFor(openedPath, cancellationToken));
+            }
+            catch (OperationCanceledException)
+            {
+                completion.TrySetCanceled(cancellationToken);
+            }
+            catch (Exception exception)
+            {
+                completion.TrySetException(exception);
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "Explorer view order capture"
+        };
+        worker.SetApartmentState(ApartmentState.STA);
+        worker.Start();
+
+        using var cancellation = cancellationToken.Register(() =>
+            completion.TrySetCanceled(cancellationToken));
+        return await completion.Task.ConfigureAwait(false);
+    }
+
+    public static IReadOnlyList<string>? TryCaptureFor(
+        string? openedPath, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
         if (!OperatingSystem.IsWindows() || string.IsNullOrWhiteSpace(openedPath) ||
             !File.Exists(openedPath) || !Book.IsSupportedImage(openedPath))
             return null;
@@ -29,6 +69,7 @@ internal static class ExplorerViewOrder
 
             foreach (var windowObject in (dynamic)windows)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 object? document = null;
                 object? folder = null;
                 object? items = null;
@@ -50,6 +91,7 @@ internal static class ExplorerViewOrder
                     var files = new List<string>();
                     foreach (var itemObject in (dynamic)items)
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         try
                         {
                             dynamic item = itemObject;
@@ -87,6 +129,10 @@ internal static class ExplorerViewOrder
                 .OrderByDescending(candidate => candidate.Foreground)
                 .Select(candidate => candidate.Files)
                 .FirstOrDefault(files => files.Any(file => PathsEqual(file, openedPath)));
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch
         {

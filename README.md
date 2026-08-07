@@ -267,7 +267,7 @@ dotnet publish .\CDisplayEx.CSharp.csproj `
   -o .\release
 ```
 
-The repository contains source code and project assets. Local release output and preserved development snapshots are excluded from Git.
+The repository contains source code and project assets. Local release output is excluded from Git.
 
 ### Microsoft Store package
 

@@ -2,8 +2,8 @@
 
 This repository contains the complete source, project assets, dependency
 declarations, license notices, and Codex project notes needed to continue work
-on another machine. Build output, local settings, disk caches, and preserved
-binary snapshots are intentionally not stored in Git.
+on another machine. Build output, local settings, and disk caches are
+intentionally not stored in Git.
 
 ## 1. Install prerequisites
 
@@ -30,8 +30,7 @@ Set-Location "Fast Reader Viewer"
 ```
 
 Open that `Fast Reader Viewer` directory as the workspace in Codex. `AGENTS.md` contains
-the project map, validation commands, responsiveness requirements, and rules
-for preserved versions.
+the project map, validation commands, and responsiveness requirements.
 
 ## 3. Restore, validate, and publish
 
@@ -78,7 +77,6 @@ The following local directories are excluded from Git and are not restored by
 cloning:
 
 - `bin`, `obj`, and `release` build output
-- `versions` and local preserved binary snapshots
 - `%APPDATA%` settings and `%LOCALAPPDATA%` preview caches
 - Codex conversation history
 

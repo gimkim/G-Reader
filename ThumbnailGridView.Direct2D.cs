@@ -146,10 +146,11 @@ internal sealed partial class ThumbnailGridView
             Vortice.Direct2D1.FactoryType.SingleThreaded, DebugLevel.None);
         _thumbnailWriteFactory = Vortice.DirectWrite.DWrite.DWriteCreateFactory<IDWriteFactory>(
             Vortice.DirectWrite.FactoryType.Shared);
-        _thumbnailNameFormat = CreateTextFormat(14f, FontWeight.Normal, noWrap: false);
-        _thumbnailNumberFormat = CreateTextFormat(11f, FontWeight.Bold, noWrap: true);
-        _thumbnailIconFormat = CreateTextFormat(13f, FontWeight.Bold, noWrap: true);
-        _thumbnailPlaceholderFormat = CreateTextFormat(12f, FontWeight.Normal, noWrap: false);
+        _thumbnailNameFormat = CreateTextFormat(13f, FontWeight.Bold, noWrap: false);
+        _thumbnailNameFormat.TextAlignment = Vortice.DirectWrite.TextAlignment.Leading;
+        _thumbnailNumberFormat = CreateTextFormat(10f, FontWeight.Bold, noWrap: true);
+        _thumbnailIconFormat = CreateTextFormat(12f, FontWeight.Bold, noWrap: true);
+        _thumbnailPlaceholderFormat = CreateTextFormat(11f, FontWeight.Normal, noWrap: false);
 
         _thumbnailGpuUploadTimer.Tick += (_, _) =>
         {
@@ -340,16 +341,16 @@ internal sealed partial class ThumbnailGridView
     private void CreateThumbnailDeviceBrushes()
     {
         if (ThumbnailTarget is not { } target) return;
-        _normalTileBrush = target.CreateSolidColorBrush(Color(42, 45, 52));
-        _selectedTileBrush = target.CreateSolidColorBrush(Color(65, 103, 170));
-        _tileBorderBrush = target.CreateSolidColorBrush(Color(78, 82, 92));
-        _selectedBorderBrush = target.CreateSolidColorBrush(Color(107, 166, 255));
-        _textBrush = target.CreateSolidColorBrush(Color(220, 220, 220));
-        _mutedTextBrush = target.CreateSolidColorBrush(Color(170, 180, 196));
-        _badgeBrush = target.CreateSolidColorBrush(Color(20, 22, 27, 205));
-        _badgeBorderBrush = target.CreateSolidColorBrush(Color(160, 170, 190, 125));
-        _placeholderBrushD2D = target.CreateSolidColorBrush(Color(34, 37, 44));
-        _placeholderBorderBrushD2D = target.CreateSolidColorBrush(Color(82, 89, 103));
+        _normalTileBrush = target.CreateSolidColorBrush(Color(23, 34, 51));
+        _selectedTileBrush = target.CreateSolidColorBrush(Color(29, 60, 96));
+        _tileBorderBrush = target.CreateSolidColorBrush(Color(42, 59, 80));
+        _selectedBorderBrush = target.CreateSolidColorBrush(Color(111, 178, 255));
+        _textBrush = target.CreateSolidColorBrush(Color(231, 239, 249));
+        _mutedTextBrush = target.CreateSolidColorBrush(Color(145, 168, 193));
+        _badgeBrush = target.CreateSolidColorBrush(Color(10, 21, 35, 225));
+        _badgeBorderBrush = target.CreateSolidColorBrush(Color(111, 178, 255, 145));
+        _placeholderBrushD2D = target.CreateSolidColorBrush(Color(20, 32, 51));
+        _placeholderBorderBrushD2D = target.CreateSolidColorBrush(Color(47, 67, 91));
         _folderBrushD2D = target.CreateSolidColorBrush(Color(224, 174, 65));
         _parentFolderBrushD2D = target.CreateSolidColorBrush(Color(111, 151, 205));
         _archiveBrushD2D = target.CreateSolidColorBrush(Color(103, 137, 188));
@@ -361,9 +362,9 @@ internal sealed partial class ThumbnailGridView
         _cb7BrushD2D = target.CreateSolidColorBrush(Color(86, 154, 92));
         _pdfBrushD2D = target.CreateSolidColorBrush(Color(198, 72, 72));
         _iconBorderBrushD2D = target.CreateSolidColorBrush(Color(235, 238, 244));
-        _scrollTrackBrush = target.CreateSolidColorBrush(Color(8, 10, 14, 48));
-        _scrollThumbBrush = target.CreateSolidColorBrush(Color(170, 188, 218, 155));
-        _scrollThumbActiveBrush = target.CreateSolidColorBrush(Color(185, 202, 231, 220));
+        _scrollTrackBrush = target.CreateSolidColorBrush(Color(7, 13, 23, 90));
+        _scrollThumbBrush = target.CreateSolidColorBrush(Color(111, 178, 255, 150));
+        _scrollThumbActiveBrush = target.CreateSolidColorBrush(Color(137, 193, 255, 220));
     }
 
     private void DrawDirect2DThumbnailFrame()
@@ -378,7 +379,7 @@ internal sealed partial class ThumbnailGridView
         try
         {
             target.BeginDraw();
-            target.Clear(Color(26, 28, 33));
+            target.Clear(Color(13, 19, 30));
             if (ItemCount > 0)
             {
                 var scrollY = ScrollOffset;
@@ -488,16 +489,20 @@ internal sealed partial class ThumbnailGridView
         var target = ThumbnailTarget!;
         var selected = IsItemSelected(item);
         var active = item == _selectedItem;
-        target.FillRectangle(ToRect(bounds), selected ? _selectedTileBrush! : _normalTileBrush!);
-        target.DrawRectangle(ToRect(bounds), selected ? _selectedBorderBrush! : _tileBorderBrush!,
-            active ? 3f : selected ? 2f : 1f);
+        var card = new RoundedRectangle(
+            new RectangleF(bounds.X, bounds.Y, bounds.Width, bounds.Height), 8f, 8f);
+        target.FillRoundedRectangle(card,
+            selected ? _selectedTileBrush! : _normalTileBrush!);
+        target.DrawRoundedRectangle(card,
+            selected ? _selectedBorderBrush! : _tileBorderBrush!,
+            active ? 2.5f : selected ? 1.8f : 1f);
 
         var browseItem = item < _folders.Length;
         // Browse entries still allow several wrapped filename lines, but avoid
         // reserving a tall empty strip between the preview and its label.
-        var labelHeight = browseItem ? 48 : 34;
-        var imageArea = Rectangle.Inflate(bounds, browseItem ? -4 : -8,
-            browseItem ? -4 : -8);
+        var labelHeight = browseItem ? 42 : 30;
+        var imageArea = Rectangle.Inflate(bounds, browseItem ? -5 : -7,
+            browseItem ? -5 : -7);
         imageArea.Height -= labelHeight;
         if (browseItem)
         {
@@ -547,8 +552,8 @@ internal sealed partial class ThumbnailGridView
             }
             DrawDirect2DBrowseIcon(iconArea, _folders[item]);
             var label = new Rectangle(
-                bounds.X + 6, bounds.Bottom - labelHeight,
-                bounds.Width - 12, labelHeight);
+                bounds.X + 9, bounds.Bottom - labelHeight + 1,
+                bounds.Width - 18, labelHeight - 3);
             DrawDirect2DText(_folders[item].Label, label, _thumbnailNameFormat, _textBrush!);
             return;
         }
@@ -623,24 +628,30 @@ internal sealed partial class ThumbnailGridView
         finally { fast?.Dispose(); gpuFast?.Dispose(); }
 
         var nameBounds = new Rectangle(
-            bounds.X + 6, bounds.Bottom - labelHeight, bounds.Width - 12, labelHeight - 2);
+            bounds.X + 9, bounds.Bottom - labelHeight + 1,
+            bounds.Width - 18, labelHeight - 3);
         DrawDirect2DText(_pageNames[page], nameBounds, _thumbnailNameFormat, _textBrush!);
 
         var number = (page + 1).ToString();
         var badgeWidth = Math.Max(20, 10 + number.Length * 8);
-        var badge = new Rectangle(bounds.Right - badgeWidth - 5, bounds.Bottom - 23,
-            badgeWidth, 19);
-        target.FillRectangle(ToRect(badge), _badgeBrush!);
-        target.DrawRectangle(ToRect(badge), _badgeBorderBrush!, 1f);
+        var badge = new Rectangle(bounds.Right - badgeWidth - 7, bounds.Top + 7,
+            badgeWidth, 17);
+        var roundedBadge = new RoundedRectangle(
+            new RectangleF(badge.X, badge.Y, badge.Width, badge.Height), 4f, 4f);
+        target.FillRoundedRectangle(roundedBadge, _badgeBrush!);
+        target.DrawRoundedRectangle(roundedBadge, _badgeBorderBrush!, 1f);
         DrawDirect2DText(number, badge, _thumbnailNumberFormat, _textBrush!);
     }
 
     private void DrawDirect2DPlaceholder(Rectangle area, string text)
     {
         var placeholder = Rectangle.Inflate(area, -10, -10);
-        ThumbnailTarget!.FillRectangle(ToRect(placeholder), _placeholderBrushD2D!);
-        ThumbnailTarget.DrawRectangle(
-            ToRect(placeholder), _placeholderBorderBrushD2D!, 1.2f);
+        var rounded = new RoundedRectangle(
+            new RectangleF(placeholder.X, placeholder.Y,
+                placeholder.Width, placeholder.Height), 5f, 5f);
+        ThumbnailTarget!.FillRoundedRectangle(rounded, _placeholderBrushD2D!);
+        ThumbnailTarget.DrawRoundedRectangle(rounded,
+            _placeholderBorderBrushD2D!, 1.2f);
         DrawDirect2DText(text, placeholder, _thumbnailPlaceholderFormat, _mutedTextBrush!);
     }
 
