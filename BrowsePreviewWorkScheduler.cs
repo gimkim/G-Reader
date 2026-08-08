@@ -8,9 +8,13 @@ namespace CDisplayEx.CSharp;
 /// </summary>
 internal static class BrowsePreviewWorkScheduler
 {
-    // Match the render scheduler's supported range. This semaphore coordinates
-    // viewport priority but does not reduce configured codec/GPU concurrency.
-    private const int MaximumConcurrentWork = 64;
+    // One cover expands into as many as four archive/PDF page decodes.  Letting
+    // the outer queue inherit a 32/64-worker image setting multiplies native
+    // decoder, file-handle, and GPU pressure enough to hang the display device
+    // in very large libraries. Keep the cover layer bounded while the codec
+    // schedulers still use their configured concurrency inside each job.
+    private static readonly int MaximumConcurrentWork = Math.Clamp(
+        Environment.ProcessorCount / 4, 2, 8);
     private static readonly SemaphoreSlim Slots = new(
         MaximumConcurrentWork, MaximumConcurrentWork);
     private static readonly object PriorityGate = new();

@@ -135,6 +135,8 @@ internal sealed partial class ThumbnailGridView
     private long _retiredGpuNotBeforeTick;
     private int _gpuSourceRecoveryPending;
     private int _thumbnailDeviceRecoveryAttempt;
+    private int _thumbnailPresentBusyCount;
+    private long _thumbnailPresentBusySince;
     private bool _thumbnailSharedDeviceResetRequired;
     private long _thumbnailDeviceGeneration = -1;
     private double _measuredUploadBytesPerSecond = 2.0 * 1024 * 1024 * 1024;
@@ -429,10 +431,33 @@ internal sealed partial class ThumbnailGridView
                 var presentResult = _thumbnailSwapChain.Present(0, PresentFlags.DoNotWait);
                 if (presentResult == Vortice.DXGI.ResultCode.WasStillDrawing)
                 {
+                    if (_thumbnailPresentBusyCount++ == 0)
+                        _thumbnailPresentBusySince = Stopwatch.GetTimestamp();
+                    var busyMilliseconds = (Stopwatch.GetTimestamp() -
+                        _thumbnailPresentBusySince) * 1000d / Stopwatch.Frequency;
+                    if (_thumbnailPresentBusyCount >= 16 && busyMilliseconds >= 750d)
+                    {
+                        var deviceRemoved = GpuInteropDevice.TryGetDeviceRemovalReason(
+                            out var removalReason);
+                        ExtendedDiagnostics.Breadcrumb(
+                            $"Thumbnail DXGI Present remained busy: " +
+                            $"retries={_thumbnailPresentBusyCount}; " +
+                            $"elapsedMs={busyMilliseconds:F0}; " +
+                            $"deviceRemoved={deviceRemoved}; " +
+                            $"removalReason={removalReason}");
+                        _thumbnailPresentBusyCount = 0;
+                        _thumbnailPresentBusySince = 0;
+                        DiscardThumbnailDeviceResources();
+                        ScheduleThumbnailDeviceRecovery(
+                            "Present remained busy", recreateSharedDevice: deviceRemoved);
+                        return;
+                    }
                     _thumbnailPresentRetryTimer.Stop();
                     _thumbnailPresentRetryTimer.Start();
                     return;
                 }
+                _thumbnailPresentBusyCount = 0;
+                _thumbnailPresentBusySince = 0;
                 if (presentResult.Failure)
                 {
                     var deviceRemoved = GpuInteropDevice.TryGetDeviceRemovalReason(
@@ -1251,6 +1276,8 @@ internal sealed partial class ThumbnailGridView
 
     private void DiscardThumbnailDeviceResources()
     {
+        _thumbnailPresentBusyCount = 0;
+        _thumbnailPresentBusySince = 0;
         ClearGpuTextureCacheImmediate();
         DisposeThumbnailBrushes();
         DisposeThumbnailDeviceContext();

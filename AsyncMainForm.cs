@@ -187,6 +187,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private CancellationTokenSource? _thumbnailCancellation;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<BrowsePreviewKey, byte>
         _browsePreviewsInFlight = new();
+    private int _browsePreviewRetryPending;
     private CancellationTokenSource? _randomOpenCancellation;
     private int _pageIndex;
     private int _progressVersion;
@@ -2779,7 +2780,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     {
         var key = new BrowsePreviewKey(
             Path.GetFullPath(path), targetSize.Width, targetSize.Height, fastPreview);
-        if (!_browsePreviewsInFlight.TryAdd(key, 0)) return null;
+        if (!await ClaimBrowsePreviewWorkAsync(key, cancellationToken)
+                .ConfigureAwait(false)) return null;
         var completionTransferred = false;
         try
         {
@@ -2831,6 +2833,52 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         {
             if (!completionTransferred) _browsePreviewsInFlight.TryRemove(key, out _);
         }
+    }
+
+    private async Task<bool> ClaimBrowsePreviewWorkAsync(
+        BrowsePreviewKey key, CancellationToken cancellationToken)
+    {
+        if (_browsePreviewsInFlight.TryAdd(key, 0)) return true;
+
+        // A device-loss refresh can overlap the last GPU cover jobs from the
+        // removed device. Returning immediately marks the replacement pass as
+        // complete even though those stale results will be rejected, leaving
+        // the grid permanently blank. Wait outside all codec/GPU gates for the
+        // prior owner to publish or retire, then claim one replacement attempt.
+        var deadline = Environment.TickCount64 + 3000;
+        while (Environment.TickCount64 < deadline)
+        {
+            await Task.Delay(40, cancellationToken).ConfigureAwait(false);
+            if (_browsePreviewsInFlight.TryAdd(key, 0)) return true;
+        }
+        ScheduleVisibleBrowsePreviewRetry();
+        return false;
+    }
+
+    private void ScheduleVisibleBrowsePreviewRetry()
+    {
+        if (Interlocked.Exchange(ref _browsePreviewRetryPending, 1) != 0) return;
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(500).ConfigureAwait(false);
+            if (IsDisposed || Disposing)
+            {
+                Interlocked.Exchange(ref _browsePreviewRetryPending, 0);
+                return;
+            }
+            try
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    Interlocked.Exchange(ref _browsePreviewRetryPending, 0);
+                    if (_thumbnailMode) RequestVisibleThumbnailRefresh();
+                }));
+            }
+            catch (InvalidOperationException)
+            {
+                Interlocked.Exchange(ref _browsePreviewRetryPending, 0);
+            }
+        });
     }
 
     private async Task UpdateThumbnailColorProfileAsync(
