@@ -620,8 +620,9 @@ internal sealed class ReaderSettingsDialog : Form
                 ("Lanczos quality", _quality),
                 ("NVIDIA GPU decode", _useNvJpeg)),
             CreateSection("PDF rendering",
-                "PDFium uses isolated native processes for parallel page rendering and can pass eligible full-page JPEG data to nvJPEG.",
-                ("PDFium worker processes", _pdfiumProcesses)),
+                "PDFium uses an independent thumbnail lane and isolated native processes. It is not limited by Non-JPEG resize images; the global fast-preview ceiling still applies.",
+                ("PDFium worker processes", Explain(_pdfiumProcesses,
+                    "Maximum PDF pages rendered concurrently. Effective fast thumbnails are min(this value, Global fast-preview concurrency); eligible embedded full-page JPEG data may use nvJPEG afterward."))),
             CreateSection("Thumbnail rendering",
                 "Limit the internal preview resolution used to populate the thumbnail grid.",
                 ("Maximum preview edge (px)", _thumbnailMaxPreviewSize)));
@@ -659,7 +660,7 @@ internal sealed class ReaderSettingsDialog : Form
                 ("Global fast-preview concurrency", Explain(_globalFastPreviewConcurrency,
                     "Shared ceiling for fast JPEG, WIC and format work; never exceeds this computer's logical-core count.")),
                 ("Non-JPEG resize images in parallel", Explain(_fastPreviewWorkers,
-                    "Image-level slots for fast non-JPEG resizing. Effective slots are limited by Global fast-preview concurrency.")),
+                    "Image-level slots for ordinary non-JPEG resizing. PDF thumbnails use the separate PDFium worker setting instead. Effective slots are limited by Global fast-preview concurrency.")),
                 ("CPU threads per non-JPEG resize", Explain(_fastPreviewThreads,
                     "Threads used inside each non-JPEG resize. Total demand is effective image slots multiplied by this value.")),
                 ("Effective fast paths", _effectiveFastParallelism),
@@ -918,7 +919,7 @@ internal sealed class ReaderSettingsDialog : Form
                  {
                      _globalFastPreviewConcurrency, _fastPreviewWorkers,
                      _fastPreviewThreads, _precacheWorkers, _imageMagickThreads,
-                     _zoomImageMagickThreads, _jpegCpuFastWorkers,
+                     _zoomImageMagickThreads, _pdfiumProcesses, _jpegCpuFastWorkers,
                      _jpegCpuBackgroundWorkers, _nvJpegWorkers, _nvJpegBatchSize,
                      _nvJpegBatchDelay, _nvJpegVramHeadroom, _wicWorkers,
                      _pngWorkers, _webpWorkers, _gifWorkers, _tiffWorkers,
@@ -982,6 +983,13 @@ internal sealed class ReaderSettingsDialog : Form
             batchDemand > logical);
         SetEffect(_zoomImageMagickThreads,
             $"One visible zoom-detail job may use {(int)_zoomImageMagickThreads.Value} threads; it does not multiply by pre-cache workers.");
+
+        var pdfiumProcesses = (int)_pdfiumProcesses.Value;
+        var effectivePdfium = Math.Min(global, pdfiumProcesses);
+        SetEffect(_pdfiumProcesses,
+            $"Effective fast PDF thumbnails = min({pdfiumProcesses} PDFium processes, global {global}) = {effectivePdfium}. " +
+            "The ordinary non-JPEG resize limit does not reduce this lane.",
+            pdfiumProcesses > effectivePdfium);
 
         var cpuJpeg = (int)_jpegCpuFastWorkers.Value;
         var effectiveCpuJpeg = Math.Min(global, cpuJpeg);
@@ -1063,12 +1071,14 @@ internal sealed class ReaderSettingsDialog : Form
         var threadsPerResize = (int)_fastPreviewThreads.Value;
         var nonJpegThreads = Math.Min(logical, nonJpegImages * threadsPerResize);
         var cpuJpegImages = Math.Min(global, (int)_jpegCpuFastWorkers.Value);
+        var pdfiumImages = Math.Min(global, (int)_pdfiumProcesses.Value);
         var gpuJpeg = _useNvJpeg.Checked
             ? $"{Math.Min(global, (int)_nvJpegWorkers.Value)} images"
             : $"Off (configured {(int)_nvJpegWorkers.Value})";
         _effectiveFastParallelism.Text =
             $"Fast scheduling: {global} images maximum\n" +
             $"CPU JPEG: {cpuJpegImages} images × 1 decode thread\n" +
+            $"PDFium: {pdfiumImages} pages (independent from non-JPEG resize slots)\n" +
             $"Non-JPEG resize: {nonJpegImages} images × up to {threadsPerResize} threads " +
             $"(up to {nonJpegThreads} CPU threads)\n" +
             $"GPU JPEG: {gpuJpeg}";

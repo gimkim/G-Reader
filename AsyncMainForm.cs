@@ -2577,6 +2577,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         using var genericFastSlots = new SemaphoreSlim(
             Math.Clamp(_performance.FastPreviewWorkerCount, 1, 64));
         using var genericFullSlots = new SemaphoreSlim(PrecacheWorkerCount);
+        using var pdfThumbnailSlots = new SemaphoreSlim(
+            Math.Clamp(PdfRendering.PdfiumProcessCount, 1, 16));
 
         async Task<bool> RunPassAsync(IEnumerable<int> phasePages, bool fastPreview)
         {
@@ -2593,15 +2595,17 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                     CancellationToken = cancellation.Token
                 }, async (page, workerToken) =>
                 {
-                    var enteredGenericSlot = false;
+                    SemaphoreSlim? enteredSourceSlot = null;
                     try
                     {
                         workerToken.ThrowIfCancellationRequested();
                         if (!EncodedJpegRenderer.Supports(book.Pages[page]))
                         {
-                            var slots = fastPreview ? genericFastSlots : genericFullSlots;
+                            var slots = book.Pages[page].DecodeThumbnail is not null
+                                ? pdfThumbnailSlots
+                                : fastPreview ? genericFastSlots : genericFullSlots;
                             await slots.WaitAsync(workerToken).ConfigureAwait(false);
-                            enteredGenericSlot = true;
+                            enteredSourceSlot = slots;
                         }
                         var needsThumbnail = fastPreview
                             ? !_thumbnailGrid.HasFullThumbnail(page, targetSize) &&
@@ -2640,8 +2644,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                     }
                     finally
                     {
-                        if (enteredGenericSlot)
-                            (fastPreview ? genericFastSlots : genericFullSlots).Release();
+                        enteredSourceSlot?.Release();
                     }
                 }).ConfigureAwait(false);
             }
@@ -2660,7 +2663,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                     CancellationToken = cancellation.Token
                 }, async (work, workerToken) =>
                 {
-                    var enteredGenericSlot = false;
+                    SemaphoreSlim? enteredSourceSlot = null;
                     try
                     {
                         workerToken.ThrowIfCancellationRequested();
@@ -2668,8 +2671,11 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                             EncodedJpegRenderer.Supports(book.Pages[work.Index]);
                         if (!work.IsBrowse && !encodedPage)
                         {
-                            await genericFastSlots.WaitAsync(workerToken).ConfigureAwait(false);
-                            enteredGenericSlot = true;
+                            var slots = book.Pages[work.Index].DecodeThumbnail is not null
+                                ? pdfThumbnailSlots
+                                : genericFastSlots;
+                            await slots.WaitAsync(workerToken).ConfigureAwait(false);
+                            enteredSourceSlot = slots;
                         }
                         if (work.IsBrowse)
                         {
@@ -2734,7 +2740,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                     }
                     finally
                     {
-                        if (enteredGenericSlot) genericFastSlots.Release();
+                        enteredSourceSlot?.Release();
                     }
                 }).ConfigureAwait(false);
             }
@@ -2851,8 +2857,13 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                             : !_thumbnailGrid.HasFullThumbnail(work.Index, targetSize) &&
                               !_thumbnailGrid.HasFastPreview(work.Index, targetSize)))
                     .ToArray();
-                var batchSize = Math.Clamp(
-                    _performance.FastPreviewWorkerCount * 2, 2, 16);
+                var usesPdfThumbnailLane = book.Pages.Count > 0 &&
+                    book.Pages[0].DecodeThumbnail is not null;
+                var visibleWorkerCount = usesPdfThumbnailLane
+                    ? Math.Min(RenderWorkScheduler.FastCodecConcurrency,
+                        Math.Clamp(PdfRendering.PdfiumProcessCount, 1, 16))
+                    : Math.Clamp(_performance.FastPreviewWorkerCount, 1, 64);
+                var batchSize = Math.Clamp(visibleWorkerCount * 2, 2, 32);
                 var hasMoreVisibleWork = missingVisibleWork.Length > batchSize;
                 var visibleWork = missingVisibleWork.Take(batchSize).ToArray();
                 if (visibleWork.Length == 0) continue;
@@ -2867,8 +2878,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 {
                     await Parallel.ForEachAsync(visibleWork, new ParallelOptions
                     {
-                        MaxDegreeOfParallelism = Math.Clamp(
-                            _performance.FastPreviewWorkerCount, 1, 64),
+                        MaxDegreeOfParallelism = visibleWorkerCount,
                         CancellationToken = bookCancellation.Token
                     }, async (work, workerToken) =>
                     {
@@ -3138,6 +3148,19 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             using var image = wic ?? await LoadThumbnailSourceAsync(
                 book, page, targetSize, fastPreview ? 1f : 2f,
                 cancellationToken).ConfigureAwait(false);
+            if (fastPreview && entry.DecodeThumbnail is not null)
+            {
+                // PDFium's thumbnail API already rasterizes directly to the
+                // requested fit bounds. Sending that small bitmap through the
+                // generic non-JPEG resize lane again only serialized PDF work
+                // behind FastPreviewWorkerCount (commonly 4) without improving
+                // its dimensions or quality.
+                result = new Bitmap(image);
+                PersistentPreviewCache.StoreCopyInBackground(
+                    persistentKind, book, page, targetSize, rotation,
+                    persistentQuality, result);
+                return new GeneratedThumbnail(result, null);
+            }
             var sourceBytes = (long)image.Width * image.Height * 4;
             // PDF pages already arrive at thumbnail size from the PDF renderer.
             // Do not create their D3D textures on background D2D contexts while
