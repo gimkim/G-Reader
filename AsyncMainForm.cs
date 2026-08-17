@@ -157,6 +157,33 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         Dock = DockStyle.Fill, Minimum = 2, Maximum = 12, TickFrequency = 1,
         SmallChange = 1, LargeChange = 1
     };
+    private readonly Panel _thumbnailSearchPanel = new()
+    {
+        Dock = DockStyle.Right, Width = 280,
+        BackColor = ModernUiTheme.HeaderBackground,
+        Padding = new Padding(8, 3, 0, 3)
+    };
+    private readonly TextBox _thumbnailSearchBox = new()
+    {
+        Dock = DockStyle.Fill, BorderStyle = BorderStyle.FixedSingle,
+        BackColor = ModernUiTheme.ControlRaised, ForeColor = ModernUiTheme.Text,
+        Font = new Font("Segoe UI", 9f), PlaceholderText = "Filter current view"
+    };
+    private readonly Button _thumbnailSearchClearButton = new()
+    {
+        Dock = DockStyle.Right, Width = 28, Text = "×",
+        FlatStyle = FlatStyle.Flat, TabStop = false,
+        BackColor = ModernUiTheme.HeaderBackground,
+        ForeColor = ModernUiTheme.MutedText,
+        Font = new Font("Segoe UI Semibold", 10f)
+    };
+    private readonly System.Windows.Forms.Timer _thumbnailSearchTimer = new()
+    {
+        Interval = 180
+    };
+    private readonly Dictionary<string, string> _thumbnailSessionFilters =
+        new(StringComparer.OrdinalIgnoreCase);
+    private bool _restoringThumbnailSearch;
     private readonly System.Windows.Forms.Timer _slideTimer = new() { Interval = 4000 };
     private readonly System.Collections.Concurrent.ConcurrentDictionary<int, int> _rotations = [];
     private readonly System.Collections.Concurrent.ConcurrentDictionary<int, bool> _landscapePages = [];
@@ -422,6 +449,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         Resize += (_, _) =>
         {
             UpdateBottomInfoWidth();
+            UpdateThumbnailSearchWidth();
             PositionToastOverlay();
             PositionFullscreenSliderOverlay();
             PositionFullscreenToolbarOverlay();
@@ -453,9 +481,11 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             _toastTimer.Dispose();
             _wheelDispatchTimer.Dispose();
             _thumbnailWarmSelectionTimer.Dispose();
+            _thumbnailSearchTimer.Dispose();
             _fullscreenChromeTimer.Dispose();
             _slideTimer.Dispose();
             CancelAndDisposeInBackground(_monitorProfileCancellation);
+            _thumbnailSessionFilters.Clear();
             Application.RemoveMessageFilter(this);
         };
         Shown += (_, _) =>
@@ -606,6 +636,27 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private void BuildThumbnailModePanel()
     {
+        _thumbnailSearchClearButton.FlatAppearance.BorderSize = 0;
+        _thumbnailSearchClearButton.Click += (_, _) =>
+        {
+            _thumbnailSearchBox.Clear();
+            _thumbnailSearchBox.Focus();
+        };
+        _thumbnailSearchBox.TextChanged += (_, _) =>
+        {
+            if (_restoringThumbnailSearch) return;
+            RememberCurrentThumbnailFilter();
+            _thumbnailSearchTimer.Stop();
+            _thumbnailSearchTimer.Start();
+        };
+        _thumbnailSearchTimer.Tick += (_, _) =>
+        {
+            _thumbnailSearchTimer.Stop();
+            ApplyCurrentThumbnailFilter();
+        };
+        _thumbnailSearchPanel.Controls.Add(_thumbnailSearchBox);
+        _thumbnailSearchPanel.Controls.Add(_thumbnailSearchClearButton);
+        UpdateThumbnailSearchWidth();
         var columns = Math.Clamp(_settings.ThumbnailImagesPerRow, 2, 12);
         _thumbnailColumnsSlider.Value = columns;
         _thumbnailGrid.ImagesPerRow = columns;
@@ -643,7 +694,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _thumbnailGrid.BrowsePriorityChanged += (_, _) =>
         {
             if (_thumbnailMode && !_thumbnailActivationPending)
-                _ = LoadThumbnailsProgressivelyAsync();
+                RequestVisibleThumbnailRefresh();
         };
         _thumbnailGrid.ThumbnailInteractionStarted += (_, _) =>
         {
@@ -673,6 +724,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _thumbnailAddressPanel.Controls.Add(_thumbnailAddressBox);
         _thumbnailAddressPanel.Controls.Add(addressLabel);
         _thumbnailControls.Controls.Add(_thumbnailColumnsSlider);
+        _thumbnailControls.Controls.Add(_thumbnailSearchPanel);
         _thumbnailControls.Controls.Add(_thumbnailColumnsLabel);
         _thumbnailModePanel.Controls.Add(_thumbnailGrid);
         _thumbnailModePanel.Controls.Add(_thumbnailControls);
@@ -681,6 +733,39 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private void UpdateThumbnailColumnsLabel() =>
         _thumbnailColumnsLabel.Text = $"Images per row: {_thumbnailColumnsSlider.Value}";
+
+    private void UpdateThumbnailSearchWidth()
+    {
+        _thumbnailSearchPanel.Width = Math.Clamp(
+            Math.Max(1, ClientSize.Width) / 4, 210, 340);
+    }
+
+    private void RememberCurrentThumbnailFilter()
+    {
+        if (_book is not { } book) return;
+        var key = GetReadingPositionKey(book.SourcePath);
+        var filter = _thumbnailSearchBox.Text.Trim();
+        if (filter.Length == 0) _thumbnailSessionFilters.Remove(key);
+        else _thumbnailSessionFilters[key] = filter;
+    }
+
+    private void RestoreThumbnailFilter(string? sourcePath)
+    {
+        var filter = string.IsNullOrWhiteSpace(sourcePath)
+            ? string.Empty
+            : _thumbnailSessionFilters.GetValueOrDefault(
+                GetReadingPositionKey(sourcePath), string.Empty);
+        _restoringThumbnailSearch = true;
+        try { _thumbnailSearchBox.Text = filter; }
+        finally { _restoringThumbnailSearch = false; }
+        _thumbnailGrid.SetFilter(filter, requestRefresh: false);
+    }
+
+    private void ApplyCurrentThumbnailFilter()
+    {
+        if (_book is null) return;
+        _thumbnailGrid.SetFilter(_thumbnailSearchBox.Text);
+    }
 
     private void OpenFiles()
     {
@@ -739,6 +824,10 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         }
     }
 
+    private readonly record struct RandomLibraryScanProgress(
+        int ProcessedDirectories, int DiscoveredDirectories,
+        int CandidatesFound);
+
     private async void OpenRandomBook()
     {
         if (Interlocked.CompareExchange(ref _randomOpenInProgress, 1, 0) != 0) return;
@@ -755,10 +844,19 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         var cancellation = new CancellationTokenSource();
         _randomOpenCancellation = cancellation;
         var progress = BeginProgress("Scanning random library...", 0, true);
+        var scanProgress = new Progress<RandomLibraryScanProgress>(status =>
+        {
+            var total = Math.Max(status.ProcessedDirectories,
+                status.DiscoveredDirectories);
+            UpdateProgress(progress, status.ProcessedDirectories, total,
+                $"Scanning random library... {status.ProcessedDirectories:N0}/{total:N0} folders " +
+                $"• {status.CandidatesFound:N0} books found");
+        });
         try
         {
             var candidates = await Task.Run(
-                () => FindRandomBookCandidates(root, cancellation.Token), cancellation.Token);
+                () => FindRandomBookCandidates(
+                    root, cancellation.Token, scanProgress), cancellation.Token);
             cancellation.Token.ThrowIfCancellationRequested();
             if (candidates.Length == 0)
             {
@@ -799,12 +897,17 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         }
     }
 
-    private static string[] FindRandomBookCandidates(string root, CancellationToken token)
+    private static string[] FindRandomBookCandidates(string root,
+        CancellationToken token, IProgress<RandomLibraryScanProgress>? progress = null)
     {
         var results = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var discovered = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var pending = new Stack<string>();
-        pending.Push(Path.GetFullPath(root));
+        var rootPath = Path.GetFullPath(root);
+        discovered.Add(rootPath);
+        pending.Push(rootPath);
+        var lastProgressTick = 0L;
         while (pending.Count > 0)
         {
             token.ThrowIfCancellationRequested();
@@ -812,27 +915,51 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             if (!visited.Add(directory)) continue;
             string[] files;
             try { files = Directory.GetFiles(directory); }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { continue; }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { files = []; }
 
-            if (files.Any(Book.IsSupportedImage)) results.Add(directory);
+            var containsImage = false;
             foreach (var file in files)
-                if (!Book.IsSupportedImage(file) && Book.IsSupportedBook(file))
+            {
+                if (Book.IsSupportedImage(file)) containsImage = true;
+                else if (Book.IsSupportedBook(file))
                     results.Add(file);
+            }
+            if (containsImage) results.Add(directory);
 
             string[] subdirectories;
             try { subdirectories = Directory.GetDirectories(directory); }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { continue; }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            { subdirectories = []; }
             foreach (var subdirectory in subdirectories)
             {
                 try
                 {
                     if ((File.GetAttributes(subdirectory) & FileAttributes.ReparsePoint) == 0)
-                        pending.Push(subdirectory);
+                    {
+                        var fullPath = Path.GetFullPath(subdirectory);
+                        if (discovered.Add(fullPath)) pending.Push(fullPath);
+                    }
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
             }
+            ReportRandomLibraryProgress(progress, visited.Count, discovered.Count,
+                results.Count, ref lastProgressTick);
         }
         return results.ToArray();
+    }
+
+    private static void ReportRandomLibraryProgress(
+        IProgress<RandomLibraryScanProgress>? progress, int processed, int total,
+        int candidates, ref long lastProgressTick)
+    {
+        if (progress is null) return;
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        var interval = System.Diagnostics.Stopwatch.Frequency / 12;
+        if (processed != 1 && processed < total && now - lastProgressTick < interval)
+            return;
+        lastProgressTick = now;
+        progress.Report(new RandomLibraryScanProgress(
+            processed, Math.Max(processed, total), candidates));
     }
 
     private void CancelRandomOpenWork()
@@ -876,21 +1003,41 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         try
         {
             var folderOrder = PathsEqual(path, _initialPath) ? _initialFolderOrder : null;
+            var folderSort = NormalizeSortMode(_settings.FolderPageSort);
+            var folderSortDescending = _settings.FolderPageSortDescending;
             if (folderOrder is null && _forceInitialFullPage &&
                 PathsEqual(path, _initialPath) && File.Exists(path) &&
                 Book.IsSupportedImage(path))
             {
-                UpdateProgress(progress, 0, 0, "Reading Explorer folder order...");
-                folderOrder = await ExplorerViewOrder.CaptureAsync(
-                    path, cancellation.Token);
+                UpdateProgress(progress, 0, 0, "Reading Explorer sort rule...");
+                var explorerProgress = new Progress<ExplorerOrderProgress>(status =>
+                {
+                    var total = Math.Max(status.ItemsProcessed, status.TotalItems);
+                    var count = total > 0
+                        ? $"{status.ItemsProcessed:N0}/{total:N0}"
+                        : $"{status.ItemsProcessed:N0}";
+                    UpdateProgress(progress, status.ItemsProcessed, total,
+                        $"Reading Explorer folder order... {count} items");
+                });
+                var explorerCapture = await ExplorerViewOrder.CaptureAsync(
+                    path, cancellation.Token, explorerProgress);
+                if (explorerCapture is { UsesNativeSort: true, SortMode: { } explorerSort })
+                {
+                    folderSort = explorerSort;
+                    folderSortDescending = explorerCapture.Descending;
+                    UpdateProgress(progress, 1, 1,
+                        "Explorer sort rule ready; listing folder files...");
+                }
+                else
+                    folderOrder = explorerCapture?.Files;
             }
             UpdateProgress(progress, 0, 0,
                 Directory.Exists(path) ? "Listing folder files..." : "Opening file...");
             var book = await Task.Run(() => Book.Open(
                 path, folderOrder,
-                NormalizeSortMode(_settings.FolderPageSort),
+                folderSort,
                 NormalizeSortMode(_settings.ArchivePageSort),
-                _settings.FolderPageSortDescending,
+                folderSortDescending,
                 _settings.ArchivePageSortDescending,
                 cancellation.Token, openProgress), cancellation.Token);
             if (cancellation.IsCancellationRequested ||
@@ -2253,6 +2400,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         {
             _thumbnailAddressBox.Text = string.Empty;
         }
+        RestoreThumbnailFilter(_book?.SourcePath);
         var pageNames = _book?.Pages.Select(page => page.Name) ?? [];
         var emptyMessage = _book is { Pages.Count: 0, Subfolders.Count: 0,
             Containers.Count: 0 }
@@ -2369,14 +2517,63 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             _thumbnailGrid.PriorityItemCount, orderedWork.Length);
         var priorityWork = orderedWork.Take(priorityCount).ToArray();
         var remainingWork = orderedWork.Skip(priorityCount).ToArray();
-        var priorityPages = priorityWork.Where(work => !work.IsBrowse)
+        HashSet<ThumbnailPreviewWorkItem> completedFastWork;
+        HashSet<ThumbnailPreviewWorkItem> completedFullWork;
+        try
+        {
+            (completedFastWork, completedFullWork) = await Task.Run(() =>
+            {
+                var fast = new HashSet<ThumbnailPreviewWorkItem>();
+                var full = new HashSet<ThumbnailPreviewWorkItem>();
+                foreach (var work in orderedWork)
+                {
+                    cancellation.Token.ThrowIfCancellationRequested();
+                    var hasFull = work.IsBrowse
+                        ? _thumbnailGrid.HasBrowseFullPreview(work.Index, targetSize)
+                        : _thumbnailGrid.HasFullThumbnail(work.Index, targetSize);
+                    if (hasFull)
+                    {
+                        // A full preview also satisfies the fast-preview stage.
+                        full.Add(work);
+                        fast.Add(work);
+                    }
+                    else if (work.IsBrowse
+                        ? _thumbnailGrid.HasBrowseFastPreview(work.Index, targetSize)
+                        : _thumbnailGrid.HasFastPreview(work.Index, targetSize))
+                        fast.Add(work);
+                }
+                return (fast, full);
+            }, cancellation.Token);
+        }
+        catch (OperationCanceledException) { return; }
+        if (cancellation.IsCancellationRequested || !ReferenceEquals(_book, book) ||
+            !_thumbnailMode || thumbnailGeneration != _thumbnailGrid.ContentGeneration)
+            return;
+
+        // Reprioritizing after a selection change must retain progress already
+        // represented by the per-item caches. Only missing stages enter the new
+        // pass, so its counter never restarts at 1 merely because order changed.
+        var priorityFastWork = priorityWork
+            .Where(work => !completedFastWork.Contains(work)).ToArray();
+        var remainingFastWork = remainingWork
+            .Where(work => !completedFastWork.Contains(work)).ToArray();
+        var priorityFullWork = priorityWork
+            .Where(work => !completedFullWork.Contains(work)).ToArray();
+        var remainingFullWork = remainingWork
+            .Where(work => !completedFullWork.Contains(work)).ToArray();
+        var priorityPages = priorityFullWork.Where(work => !work.IsBrowse)
             .Select(work => work.Index).ToArray();
-        var remainingPages = remainingWork.Where(work => !work.IsBrowse)
+        var remainingPages = remainingFullWork.Where(work => !work.IsBrowse)
             .Select(work => work.Index).ToArray();
-        var loaded = 0;
-        var browseWorkCount = Math.Min(browseEntries.Length, browseWorkLimit);
-        var total = book.Pages.Count * 2 + browseWorkCount * 2;
-        var id = BeginProgress("Loading thumbnail previews...", total, false);
+        var loaded = completedFastWork.Count + completedFullWork.Count;
+        var browseWorkCount = orderedWork.Count(work => work.IsBrowse);
+        var pageWorkCount = orderedWork.Length - browseWorkCount;
+        var total = (pageWorkCount + browseWorkCount) * 2;
+        var initialProgressText = loaded >= total
+            ? "Thumbnails ready"
+            : $"Thumbnail previews {loaded}/{total}";
+        var id = BeginProgress(initialProgressText, total, false);
+        if (loaded > 0) UpdateProgress(id, loaded, total, initialProgressText);
         using var genericFastSlots = new SemaphoreSlim(
             Math.Clamp(_performance.FastPreviewWorkerCount, 1, 64));
         using var genericFullSlots = new SemaphoreSlim(PrecacheWorkerCount);
@@ -2605,8 +2802,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         // Visible/nearby cells get both stages first. The remaining book receives
         // fast placeholders before its slower Lanczos pass. Browse contact sheets
         // and image placeholders share one ordered worker queue.
-        if (!await RunUnifiedFastPassAsync(priorityWork, priority: true)) return;
-        if (!await RunBrowseFullPassAsync(priorityWork, priority: true)) return;
+        if (!await RunUnifiedFastPassAsync(priorityFastWork, priority: true)) return;
+        if (!await RunBrowseFullPassAsync(priorityFullWork, priority: true)) return;
         if (!await RunPassAsync(priorityPages, fastPreview: false)) return;
         // Once visible and nearby cards have both preview stages, spend one
         // lowest-priority worker on full-view cache warming. The idle scheduler
@@ -2614,8 +2811,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         if (_cache is { } idleCache && ReferenceEquals(_book, book) && _thumbnailMode)
             RequestCacheWarm(_pageIndex, idleCache, book,
                 immediate: true, idlePriority: true);
-        if (!await RunUnifiedFastPassAsync(remainingWork, priority: false)) return;
-        if (!await RunBrowseFullPassAsync(remainingWork, priority: false)) return;
+        if (!await RunUnifiedFastPassAsync(remainingFastWork, priority: false)) return;
+        if (!await RunBrowseFullPassAsync(remainingFullWork, priority: false)) return;
         if (!await RunPassAsync(remainingPages, fastPreview: false)) return;
         if (!cancellation.IsCancellationRequested) EndProgress(id, "Thumbnails ready");
     }
@@ -4454,6 +4651,22 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     {
         var shortcut = ToolbarHotkeyCatalog.Normalize(keyData);
         var keyCode = shortcut & Keys.KeyCode;
+        if (_thumbnailMode && shortcut == (Keys.Control | Keys.F))
+        {
+            _thumbnailSearchBox.Focus();
+            _thumbnailSearchBox.SelectAll();
+            return true;
+        }
+        if (_thumbnailSearchBox.ContainsFocus)
+        {
+            if (shortcut == Keys.Escape)
+            {
+                if (_thumbnailSearchBox.TextLength > 0) _thumbnailSearchBox.Clear();
+                else _thumbnailGrid.Focus();
+                return true;
+            }
+            return base.ProcessCmdKey(ref msg, keyData);
+        }
         if (shortcut == Keys.Delete && !_thumbnailAddressBox.ContainsFocus)
         {
             _ = DeleteSelectedPdfPageAsync();
@@ -5133,6 +5346,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         (PageSortMode.NameAlphabetical, "Name (alphabetical)"),
         (PageSortMode.NameNumeric, "Name (numeric)"),
         (PageSortMode.DateModified, "Date modified"),
+        (PageSortMode.DateCreated, "Date created"),
         (PageSortMode.DateTaken, "Date taken"),
         (PageSortMode.Size, "Size"),
         (PageSortMode.Extension, "Extension")

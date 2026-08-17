@@ -531,14 +531,15 @@ internal sealed partial class ThumbnailGridView
         imageArea.Height -= labelHeight;
         if (browseItem)
         {
+            var browseSource = _folderSourceIndices[item];
             using var browseGpuFull = _gpuBrowseFullPreviewCache.AcquireBest(
-                item, _renderTargetSize);
+                browseSource, _renderTargetSize);
             using var browseGpuFast = _gpuBrowseFastPreviewCache.AcquireBest(
-                item, _renderTargetSize);
+                browseSource, _renderTargetSize);
             using var browseFull = _browseFullPreviewCache.AcquireBest(
-                item, _renderTargetSize);
+                browseSource, _renderTargetSize);
             using var browseFast = _browseFastPreviewCache.AcquireBest(
-                item, _renderTargetSize);
+                browseSource, _renderTargetSize);
             // Quality wins across CPU/GPU storage: a CPU Lanczos sheet must not
             // remain hidden behind an earlier GPU fast preview.
             var gpuPreview = browseGpuFull ??
@@ -583,7 +584,8 @@ internal sealed partial class ThumbnailGridView
             return;
         }
 
-        var page = item - _folders.Length;
+        var displayPage = item - _folders.Length;
+        var page = _pageSourceIndices[displayPage];
         using var gpuFull = _gpuFullCache.AcquireBest(page, _renderTargetSize);
         GpuThumbnailRenderCache.Lease? gpuFast = null;
         var selectedGpu = gpuFull;
@@ -655,7 +657,8 @@ internal sealed partial class ThumbnailGridView
         var nameBounds = new Rectangle(
             bounds.X + 9, bounds.Bottom - labelHeight + 1,
             bounds.Width - 18, labelHeight - 3);
-        DrawDirect2DText(_pageNames[page], nameBounds, _thumbnailNameFormat, _textBrush!);
+        DrawDirect2DText(_pageNames[displayPage], nameBounds,
+            _thumbnailNameFormat, _textBrush!);
 
         var number = (page + 1).ToString();
         var badgeWidth = Math.Max(20, 10 + number.Length * 8);
@@ -1223,6 +1226,10 @@ internal sealed partial class ThumbnailGridView
                 // Rebuilding only the Direct2D target cannot revive a removed
                 // D3D11 device. Release imported views before replacing the
                 // shared device and all GPU sources created from its generation.
+                // Cancel queued work before changing generations so an aggressive
+                // cold-cache pass cannot keep saturating the removed device while
+                // the replacement target is trying to present its first frame.
+                ThumbnailInteractionStarted?.Invoke(this, EventArgs.Empty);
                 DiscardThumbnailDeviceResources();
                 var recreated = GpuInteropDevice.RecreateAfterDeviceLoss();
                 _thumbnailSharedDeviceResetRequired = false;

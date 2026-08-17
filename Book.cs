@@ -27,10 +27,11 @@ internal sealed record PageEntry(
 internal readonly record struct BookOpenProgress(
     string Phase, int ItemsProcessed, string? CurrentName);
 internal sealed record SortablePage(
-    string Name, long Size, DateTime Modified, DateTime? Taken, Func<Stream> Open,
+    string Name, long Size, DateTime Modified, DateTime Created,
+    DateTime? Taken, Func<Stream> Open,
     int ExifRotation = 0);
 internal sealed record SortableBrowsePath(
-    string Path, long Size, DateTime Modified, DateTime? Taken);
+    string Path, long Size, DateTime Modified, DateTime Created, DateTime? Taken);
 
 internal sealed class Book : IDisposable
 {
@@ -261,7 +262,8 @@ internal sealed class Book : IDisposable
         {
             var path = discoveredFiles[index];
             cancellationToken.ThrowIfCancellationRequested();
-            var needsFileInfo = sortMode is PageSortMode.Size or PageSortMode.DateModified;
+            var needsFileInfo = sortMode is PageSortMode.Size or
+                PageSortMode.DateModified or PageSortMode.DateCreated;
             FileInfo? info = null;
             if (needsFileInfo)
             {
@@ -274,6 +276,7 @@ internal sealed class Book : IDisposable
             sortablePages.Add(new SortablePage(
                 Path.GetFileName(path), info?.Length ?? 0L,
                 info?.LastWriteTimeUtc ?? DateTime.MinValue,
+                info?.CreationTimeUtc ?? DateTime.MinValue,
                 sortMode == PageSortMode.DateTaken ? TryReadDateTaken(path) : null,
                 () => File.OpenRead(path)));
             ReportOpenProgress(progress, "Reading file metadata", index + 1,
@@ -318,6 +321,8 @@ internal sealed class Book : IDisposable
         {
             PageSortMode.DateModified => descending
                 ? "modified newest first" : "modified oldest first",
+            PageSortMode.DateCreated => descending
+                ? "created newest first" : "created oldest first",
             PageSortMode.Size => descending ? "size largest first" : "size smallest first",
             PageSortMode.DateTaken => descending ? "date taken newest first" : "date taken oldest first",
             PageSortMode.Extension => descending ? "extension descending" : "extension ascending",
@@ -429,7 +434,8 @@ internal sealed class Book : IDisposable
                     catch { }
                 }
                 pages.Add(new SortablePage(
-                    name, entry.Size, entry.LastModifiedTime ?? DateTime.MinValue, taken,
+                    name, entry.Size, entry.LastModifiedTime ?? DateTime.MinValue,
+                    entry.LastModifiedTime ?? DateTime.MinValue, taken,
                     () => throw new InvalidOperationException("Archive session is not initialized."),
                     exifRotation));
                 ReportOpenProgress(progress, "Listing archive entries", ++entryCount,
@@ -638,6 +644,9 @@ internal sealed class Book : IDisposable
             PageSortMode.DateModified => pages
                 .OrderBy(page => page.Modified)
                 .ThenBy(page => page.Name, numericComparer),
+            PageSortMode.DateCreated => pages
+                .OrderBy(page => page.Created)
+                .ThenBy(page => page.Name, numericComparer),
             PageSortMode.DateTaken => pages
                 .OrderBy(page => page.Taken.HasValue ? 0 : 1)
                 .ThenBy(page => page.Taken ?? DateTime.MaxValue)
@@ -658,6 +667,9 @@ internal sealed class Book : IDisposable
                     StringComparer.CurrentCultureIgnoreCase),
             PageSortMode.DateModified => pages
                 .OrderByDescending(page => page.Modified)
+                .ThenByDescending(page => page.Name, numericComparer),
+            PageSortMode.DateCreated => pages
+                .OrderByDescending(page => page.Created)
                 .ThenByDescending(page => page.Name, numericComparer),
             PageSortMode.DateTaken => pages
                 .OrderBy(page => page.Taken.HasValue ? 0 : 1)
@@ -692,6 +704,8 @@ internal sealed class Book : IDisposable
                     name, StringComparer.CurrentCultureIgnoreCase),
                 PageSortMode.DateModified => items.OrderBy(item => item.Modified)
                     .ThenBy(name, NumericFirstComparer.Instance),
+                PageSortMode.DateCreated => items.OrderBy(item => item.Created)
+                    .ThenBy(name, NumericFirstComparer.Instance),
                 PageSortMode.DateTaken => items
                     .OrderBy(item => item.Taken.HasValue ? 0 : 1)
                     .ThenBy(item => item.Taken ?? DateTime.MaxValue)
@@ -712,6 +726,8 @@ internal sealed class Book : IDisposable
                 PageSortMode.NameAlphabetical => items.OrderByDescending(
                     name, StringComparer.CurrentCultureIgnoreCase),
                 PageSortMode.DateModified => items.OrderByDescending(item => item.Modified)
+                    .ThenByDescending(name, NumericFirstComparer.Instance),
+                PageSortMode.DateCreated => items.OrderByDescending(item => item.Created)
                     .ThenByDescending(name, NumericFirstComparer.Instance),
                 PageSortMode.DateTaken => items
                     .OrderBy(item => item.Taken.HasValue ? 0 : 1)
@@ -734,6 +750,7 @@ internal sealed class Book : IDisposable
     {
         long size = 0;
         var modified = DateTime.MinValue;
+        var created = DateTime.MinValue;
         if (mode == PageSortMode.DateModified)
         {
             try
@@ -741,6 +758,17 @@ internal sealed class Book : IDisposable
                 modified = directory
                     ? Directory.GetLastWriteTimeUtc(path)
                     : File.GetLastWriteTimeUtc(path);
+            }
+            catch { }
+        }
+
+        if (mode == PageSortMode.DateCreated)
+        {
+            try
+            {
+                created = directory
+                    ? Directory.GetCreationTimeUtc(path)
+                    : File.GetCreationTimeUtc(path);
             }
             catch { }
         }
@@ -777,7 +805,7 @@ internal sealed class Book : IDisposable
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
         }
-        return new SortableBrowsePath(path, size, modified, taken);
+        return new SortableBrowsePath(path, size, modified, created, taken);
     }
 
     private static DateTime? TryReadDateTaken(string path)

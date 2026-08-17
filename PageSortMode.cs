@@ -7,5 +7,6 @@ internal enum PageSortMode
     DateModified,
     DateTaken,
     Size,
-    Extension
+    Extension,
+    DateCreated
 }

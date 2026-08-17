@@ -28,9 +28,17 @@ internal sealed partial class ThumbnailGridView : Panel
     private readonly object _contentGate = new();
     private readonly HashSet<int> _pendingInvalidationItems = [];
     private bool _invalidationDispatchScheduled;
+    private string[] _allPageNames = [];
+    private ThumbnailFolderEntry[] _allFolders = [];
     private string[] _pageNames = [];
     private ThumbnailFolderEntry[] _folders = [];
+    private int[] _pageSourceIndices = [];
+    private int[] _folderSourceIndices = [];
+    private int[] _pageDisplayBySource = [];
+    private int[] _folderDisplayBySource = [];
     private string? _emptyMessage;
+    private string? _sourceEmptyMessage;
+    private string _filterText = string.Empty;
     private int _pageCount;
     private int _contentGeneration;
     private int _imagesPerRow = 6;
@@ -76,7 +84,7 @@ internal sealed partial class ThumbnailGridView : Panel
         _selectedItem >= 0 && _selectedItem < _folders.Length
             ? _folders[_selectedItem].Path
             : null;
-    private int ItemCount => _folders.Length + _pageCount;
+    private int ItemCount => _folders.Length + _pageNames.Length;
     public Size RenderTargetSize => _renderTargetSize;
     public int PriorityItemCount => Math.Min(ItemCount, Math.Max(
         _imagesPerRow * 2,
@@ -99,13 +107,17 @@ internal sealed partial class ThumbnailGridView : Panel
     {
         get
         {
-            if (_pageCount == 0) return 0;
+            if (_pageNames.Length == 0) return 0;
             var middleY = ScrollOffset + ClientSize.Height / 2;
             var row = Math.Max(0, middleY / Math.Max(1, _cellHeight));
             var item = row * _imagesPerRow + _imagesPerRow / 2;
-            return Math.Clamp(item - _folders.Length, 0, _pageCount - 1);
+            var displayPage = Math.Clamp(
+                item - _folders.Length, 0, _pageSourceIndices.Length - 1);
+            return _pageSourceIndices[displayPage];
         }
     }
+
+    public string FilterText => _filterText;
 
     public int ImagesPerRow
     {
@@ -125,12 +137,19 @@ internal sealed partial class ThumbnailGridView : Panel
         set
         {
             value = _pageCount == 0 ? -1 : Math.Clamp(value, 0, _pageCount - 1);
+            var requestedDisplayPage = value >= 0 &&
+                value < _pageDisplayBySource.Length
+                ? _pageDisplayBySource[value]
+                : -1;
+            if (value >= 0 && requestedDisplayPage < 0) return;
             if (_selectedPage == value && _selectedPages.Count == (value >= 0 ? 1 : 0) &&
                 (value < 0 || _selectedPages.Contains(value))) return;
             var previous = _selectedPage;
             var previouslySelected = _selectedPages.ToArray();
             _selectedPage = value;
-            _selectedItem = value < 0 ? -1 : _folders.Length + value;
+            _selectedItem = requestedDisplayPage < 0
+                ? -1
+                : _folders.Length + requestedDisplayPage;
             _selectedPages.Clear();
             _selectedPageOrder.Clear();
             if (value >= 0)
@@ -245,6 +264,7 @@ internal sealed partial class ThumbnailGridView : Panel
         IEnumerable<ThumbnailFolderEntry>? folders = null,
         string? emptyMessage = null)
     {
+        var selectionChanged = false;
         lock (_contentGate)
         {
             Interlocked.Increment(ref _contentGeneration);
@@ -258,11 +278,11 @@ internal sealed partial class ThumbnailGridView : Panel
             _gpuFastPreviewCache.Clear(retirement);
             _gpuBrowseFullPreviewCache.Clear(retirement);
             _gpuBrowseFastPreviewCache.Clear(retirement);
-            _pageNames = pageNames.Select(GetDisplayFileName).ToArray();
-            _folders = folders?.ToArray() ?? [];
-            _emptyMessage = string.IsNullOrWhiteSpace(emptyMessage)
+            _allPageNames = pageNames.Select(GetDisplayFileName).ToArray();
+            _allFolders = folders?.ToArray() ?? [];
+            _sourceEmptyMessage = string.IsNullOrWhiteSpace(emptyMessage)
                 ? null : emptyMessage;
-            _pageCount = _pageNames.Length;
+            _pageCount = _allPageNames.Length;
             _generationStates.Clear();
             _pageColorProfiles.Clear();
             _selectedPage = _pageCount == 0 ? -1 : Math.Clamp(_selectedPage, 0, _pageCount - 1);
@@ -273,11 +293,11 @@ internal sealed partial class ThumbnailGridView : Panel
                 _selectedPages.Add(_selectedPage);
                 _selectedPageOrder.Add(_selectedPage);
             }
-            _selectedItem = _selectedPage >= 0 ? _folders.Length + _selectedPage :
-                _folders.Length > 0 ? 0 : -1;
+            selectionChanged = RebuildFilteredItemsCore();
         }
         SetScrollOffset(0);
         UpdateVirtualLayout();
+        if (selectionChanged) SelectionChanged?.Invoke(this, _selectedPage);
     }
 
     public void RemapPages(IEnumerable<string> pageNames,
@@ -285,6 +305,7 @@ internal sealed partial class ThumbnailGridView : Panel
         IReadOnlyDictionary<int, int> oldToNewPage, int selectedPage,
         string? emptyMessage = null)
     {
+        var selectionChanged = false;
         lock (_contentGate)
         {
             Interlocked.Increment(ref _contentGeneration);
@@ -311,11 +332,11 @@ internal sealed partial class ThumbnailGridView : Panel
                 if (oldToNewPage.TryGetValue(pair.Key, out var newPage))
                     _pageColorProfiles[newPage] = pair.Value;
 
-            _pageNames = pageNames.Select(GetDisplayFileName).ToArray();
-            _folders = folders?.ToArray() ?? [];
-            _emptyMessage = string.IsNullOrWhiteSpace(emptyMessage)
+            _allPageNames = pageNames.Select(GetDisplayFileName).ToArray();
+            _allFolders = folders?.ToArray() ?? [];
+            _sourceEmptyMessage = string.IsNullOrWhiteSpace(emptyMessage)
                 ? null : emptyMessage;
-            _pageCount = _pageNames.Length;
+            _pageCount = _allPageNames.Length;
             _selectedPage = _pageCount == 0 ? -1 : Math.Clamp(selectedPage, 0, _pageCount - 1);
             _selectedPages.Clear();
             _selectedPageOrder.Clear();
@@ -324,12 +345,92 @@ internal sealed partial class ThumbnailGridView : Panel
                 _selectedPages.Add(_selectedPage);
                 _selectedPageOrder.Add(_selectedPage);
             }
-            _selectedItem = _selectedPage >= 0 ? _folders.Length + _selectedPage :
-                _folders.Length > 0 ? 0 : -1;
+            selectionChanged = RebuildFilteredItemsCore();
         }
         SetScrollOffset(0);
         UpdateVirtualLayout();
         EnsurePageVisible(_selectedPage);
+        if (selectionChanged) SelectionChanged?.Invoke(this, _selectedPage);
+    }
+
+    public void SetFilter(string? filter, bool requestRefresh = true)
+    {
+        filter = filter?.Trim() ?? string.Empty;
+        if (string.Equals(_filterText, filter, StringComparison.Ordinal)) return;
+        var selectionChanged = false;
+        lock (_contentGate)
+        {
+            _filterText = filter;
+            selectionChanged = RebuildFilteredItemsCore();
+        }
+        SetScrollOffset(0);
+        UpdateVirtualLayout();
+        if (selectionChanged) SelectionChanged?.Invoke(this, _selectedPage);
+        if (requestRefresh)
+        {
+            ThumbnailInteractionStarted?.Invoke(this, EventArgs.Empty);
+            ThumbnailRefreshRequested?.Invoke(this, EventArgs.Empty);
+        }
+    }
+
+    private bool RebuildFilteredItemsCore()
+    {
+        var previousSelectedPage = _selectedPage;
+        var selectedBrowsePath = _selectedItem >= 0 && _selectedItem < _folders.Length
+            ? _folders[_selectedItem].Path
+            : null;
+        var hasFilter = !string.IsNullOrWhiteSpace(_filterText);
+
+        var visibleFolders = _allFolders.Select((entry, sourceIndex) =>
+                (entry, sourceIndex))
+            .Where(item => item.entry.IsParent || !hasFilter ||
+                item.entry.Label.Contains(_filterText,
+                    StringComparison.CurrentCultureIgnoreCase))
+            .ToArray();
+        var visiblePages = _allPageNames.Select((name, sourceIndex) =>
+                (name, sourceIndex))
+            .Where(item => !hasFilter || item.name.Contains(_filterText,
+                StringComparison.CurrentCultureIgnoreCase))
+            .ToArray();
+
+        _folders = visibleFolders.Select(item => item.entry).ToArray();
+        _folderSourceIndices = visibleFolders.Select(item => item.sourceIndex).ToArray();
+        _pageNames = visiblePages.Select(item => item.name).ToArray();
+        _pageSourceIndices = visiblePages.Select(item => item.sourceIndex).ToArray();
+        _folderDisplayBySource = Enumerable.Repeat(-1, _allFolders.Length).ToArray();
+        for (var display = 0; display < _folderSourceIndices.Length; display++)
+            _folderDisplayBySource[_folderSourceIndices[display]] = display;
+        _pageDisplayBySource = Enumerable.Repeat(-1, _pageCount).ToArray();
+        for (var display = 0; display < _pageSourceIndices.Length; display++)
+            _pageDisplayBySource[_pageSourceIndices[display]] = display;
+
+        _selectedPages.RemoveWhere(page => page < 0 ||
+            page >= _pageDisplayBySource.Length || _pageDisplayBySource[page] < 0);
+        _selectedPageOrder.RemoveAll(page => !_selectedPages.Contains(page));
+        if (_selectedPage < 0 || _selectedPage >= _pageDisplayBySource.Length ||
+            _pageDisplayBySource[_selectedPage] < 0)
+            _selectedPage = _selectedPageOrder.Count > 0 ? _selectedPageOrder[^1] : -1;
+
+        if (_selectedPage >= 0)
+        {
+            if (_selectedPages.Add(_selectedPage)) _selectedPageOrder.Add(_selectedPage);
+            _selectedItem = _folders.Length + _pageDisplayBySource[_selectedPage];
+        }
+        else if (!string.IsNullOrWhiteSpace(selectedBrowsePath))
+        {
+            _selectedItem = Array.FindIndex(_folders,
+                entry => PathsEqual(entry.Path, selectedBrowsePath));
+            if (_selectedItem < 0) _selectedItem = ItemCount > 0 ? 0 : -1;
+        }
+        else
+            _selectedItem = ItemCount > 0 ? 0 : -1;
+
+        var hasMatchingContent = visiblePages.Length > 0 ||
+            visibleFolders.Any(item => !item.entry.IsParent);
+        _emptyMessage = hasFilter && !hasMatchingContent
+            ? $"No items match \"{_filterText}\"."
+            : _sourceEmptyMessage;
+        return previousSelectedPage != _selectedPage;
     }
 
     public bool HasFullThumbnail(int page, Size size) =>
@@ -356,16 +457,17 @@ internal sealed partial class ThumbnailGridView : Panel
         lock (fast.Bitmap) return new Bitmap(fast.Bitmap);
     }
 
-    public ThumbnailFolderEntry[] GetBrowseEntries() => _folders.ToArray();
-    public ThumbnailFolderEntry[] GetBrowseEntriesSnapshot() => _folders;
+    public ThumbnailFolderEntry[] GetBrowseEntries() => _allFolders.ToArray();
+    public ThumbnailFolderEntry[] GetBrowseEntriesSnapshot() => _allFolders;
 
     public ThumbnailFolderEntry? GetBrowseEntry(int item) =>
-        item >= 0 && item < _folders.Length ? _folders[item] : null;
+        item >= 0 && item < _allFolders.Length ? _allFolders[item] : null;
 
     public ThumbnailPreviewWorkItem[] GetPreviewPriorityOrder()
     {
         return BuildPreviewPriorityOrder(ItemCount, _folders.Length,
-            _folders.Select(folder => folder.IsParent).ToArray(), ScrollOffset,
+            _folders.Select(folder => folder.IsParent).ToArray(),
+            _folderSourceIndices, _pageSourceIndices, ScrollOffset,
             ClientSize.Height, _cellHeight, _imagesPerRow, _selectedItem,
             CancellationToken.None);
     }
@@ -378,18 +480,22 @@ internal sealed partial class ThumbnailGridView : Panel
         var itemCount = ItemCount;
         var folderCount = _folders.Length;
         var parentFlags = _folders.Select(folder => folder.IsParent).ToArray();
+        var folderSourceIndices = _folderSourceIndices.ToArray();
+        var pageSourceIndices = _pageSourceIndices.ToArray();
         var scrollOffset = ScrollOffset;
         var clientHeight = ClientSize.Height;
         var cellHeight = _cellHeight;
         var imagesPerRow = _imagesPerRow;
         var selectedItem = _selectedItem;
         return Task.Run(() => BuildPreviewPriorityOrder(itemCount, folderCount,
-            parentFlags, scrollOffset, clientHeight, cellHeight, imagesPerRow,
-            selectedItem, cancellationToken), cancellationToken);
+            parentFlags, folderSourceIndices, pageSourceIndices, scrollOffset,
+            clientHeight, cellHeight, imagesPerRow, selectedItem,
+            cancellationToken), cancellationToken);
     }
 
     private static ThumbnailPreviewWorkItem[] BuildPreviewPriorityOrder(
-        int itemCount, int folderCount, bool[] parentFlags, int scrollOffset,
+        int itemCount, int folderCount, bool[] parentFlags,
+        int[] folderSourceIndices, int[] pageSourceIndices, int scrollOffset,
         int clientHeight, int cellHeight, int imagesPerRow, int selectedItem,
         CancellationToken cancellationToken)
     {
@@ -440,8 +546,9 @@ internal sealed partial class ThumbnailGridView : Panel
         }
         return result.Where(item => item >= folderCount || !parentFlags[item])
             .Select(item => item < folderCount
-                ? new ThumbnailPreviewWorkItem(true, item)
-                : new ThumbnailPreviewWorkItem(false, item - folderCount))
+                ? new ThumbnailPreviewWorkItem(true, folderSourceIndices[item])
+                : new ThumbnailPreviewWorkItem(
+                    false, pageSourceIndices[item - folderCount]))
             .ToArray();
     }
 
@@ -469,21 +576,22 @@ internal sealed partial class ThumbnailGridView : Panel
                 result.Add(ToPreviewWorkItem(after));
         }
         return result.Where(work => !work.IsBrowse ||
-                !_folders[work.Index].IsParent)
+                !_allFolders[work.Index].IsParent)
             .ToArray();
     }
 
     private ThumbnailPreviewWorkItem ToPreviewWorkItem(int item) =>
         item < _folders.Length
-            ? new ThumbnailPreviewWorkItem(true, item)
-            : new ThumbnailPreviewWorkItem(false, item - _folders.Length);
+            ? new ThumbnailPreviewWorkItem(true, _folderSourceIndices[item])
+            : new ThumbnailPreviewWorkItem(
+                false, _pageSourceIndices[item - _folders.Length]);
 
     public void SetBrowsePreview(
         int item, Size size, Bitmap preview, bool fastPreview, int generation)
     {
         lock (_contentGate)
         {
-            if (generation != ContentGeneration || item < 0 || item >= _folders.Length)
+            if (generation != ContentGeneration || item < 0 || item >= _allFolders.Length)
             { preview.Dispose(); return; }
             if (fastPreview) _browseFastPreviewCache.AddOwned(item, size, preview);
             else _browseFullPreviewCache.AddOwned(item, size, preview);
@@ -498,7 +606,7 @@ internal sealed partial class ThumbnailGridView : Panel
         {
             if (!NativeGpuSourcesEnabled)
             { preview.Dispose(); return; }
-            if (generation != ContentGeneration || item < 0 || item >= _folders.Length)
+            if (generation != ContentGeneration || item < 0 || item >= _allFolders.Length)
             { preview.Dispose(); return; }
             if (preview.DeviceGeneration != GpuInteropDevice.Generation)
             { preview.Dispose(); return; }
@@ -549,7 +657,11 @@ internal sealed partial class ThumbnailGridView : Panel
     public void EnsurePageVisible(int page)
     {
         if (page < 0 || page >= _pageCount) return;
-        var row = (_folders.Length + page) / _imagesPerRow;
+        var displayPage = page < _pageDisplayBySource.Length
+            ? _pageDisplayBySource[page]
+            : -1;
+        if (displayPage < 0) return;
+        var row = (_folders.Length + displayPage) / _imagesPerRow;
         var top = row * _cellHeight;
         var bottom = top + _cellHeight;
         var viewportTop = ScrollOffset;
@@ -602,7 +714,6 @@ internal sealed partial class ThumbnailGridView : Panel
             _smoothScrollPosition = _smoothScrollTarget;
             SetScrollOffsetCore((int)Math.Round(_smoothScrollPosition));
             _smoothScrollTimer.Stop();
-            QueueThumbnailRefresh();
             return;
         }
 
@@ -667,7 +778,8 @@ internal sealed partial class ThumbnailGridView : Panel
         if (item < _folders.Length)
             FolderActivated?.Invoke(this, _folders[item].Path);
         else
-            PageActivated?.Invoke(this, item - _folders.Length);
+            PageActivated?.Invoke(this,
+                _pageSourceIndices[item - _folders.Length]);
         return true;
     }
 
@@ -737,7 +849,6 @@ internal sealed partial class ThumbnailGridView : Panel
         if (_smoothScrollTimer.Enabled)
         {
             StopSmoothScroll();
-            QueueThumbnailRefresh();
         }
         _overlayScrollInteraction = false;
         if (e.Button == MouseButtons.Left && _showOverlayScrollBar &&
@@ -932,7 +1043,11 @@ internal sealed partial class ThumbnailGridView : Panel
     private void InvalidateCell(int page)
     {
         if (page < 0 || page >= _pageCount) return;
-        var bounds = GetItemBounds(_folders.Length + page);
+        var displayPage = page < _pageDisplayBySource.Length
+            ? _pageDisplayBySource[page]
+            : -1;
+        if (displayPage < 0) return;
+        var bounds = GetItemBounds(_folders.Length + displayPage);
         bounds.Offset(0, -ScrollOffset);
         Invalidate(Rectangle.Inflate(bounds, 3, 3));
     }
@@ -943,7 +1058,9 @@ internal sealed partial class ThumbnailGridView : Panel
         var previous = _selectedItem;
         var previousPage = _selectedPage;
         var previouslySelected = _selectedPages.ToArray();
-        var page = item >= _folders.Length ? item - _folders.Length : -1;
+        var page = item >= _folders.Length
+            ? _pageSourceIndices[item - _folders.Length]
+            : -1;
 
         if (extendPageSelection && page >= 0)
         {
@@ -951,7 +1068,13 @@ internal sealed partial class ThumbnailGridView : Panel
             {
                 _selectedPageOrder.Remove(page);
                 _selectedPage = _selectedPageOrder.Count > 0 ? _selectedPageOrder[^1] : -1;
-                _selectedItem = _selectedPage >= 0 ? _folders.Length + _selectedPage : -1;
+                var selectedDisplayPage = _selectedPage >= 0 &&
+                    _selectedPage < _pageDisplayBySource.Length
+                    ? _pageDisplayBySource[_selectedPage]
+                    : -1;
+                _selectedItem = selectedDisplayPage >= 0
+                    ? _folders.Length + selectedDisplayPage
+                    : -1;
             }
             else
             {
@@ -981,15 +1104,15 @@ internal sealed partial class ThumbnailGridView : Panel
         InvalidateItem(previous);
         InvalidateItem(_selectedItem);
         if (previousPage != _selectedPage) SelectionChanged?.Invoke(this, _selectedPage);
-        // Stop stale background rendering immediately, but only rebuild its
-        // ordered working set after a short quiet period during key repeat.
-        ThumbnailInteractionStarted?.Invoke(this, EventArgs.Empty);
+        // Selection priority is an overlay on the active full-book pass. Do not
+        // cancel/restart that pass: the debounced visible request below promotes
+        // the new viewport while its cumulative preview progress keeps running.
         _priorityRefreshDebounce.Stop();
         _priorityRefreshDebounce.Start();
     }
 
     private bool IsItemSelected(int item) => item >= _folders.Length
-        ? _selectedPages.Contains(item - _folders.Length)
+        ? _selectedPages.Contains(_pageSourceIndices[item - _folders.Length])
         : item == _selectedItem;
 
     private void EnsureItemVisible(int item)
@@ -1032,9 +1155,10 @@ internal sealed partial class ThumbnailGridView : Panel
             : 0;
         if (_scrollOffset == value) return;
         SetScrollOffsetCore(value);
-        // Let in-flight previews continue to complete while the scrollbar is
-        // moving. The debounce reorders the queue around the settled viewport.
-        QueueThumbnailRefresh();
+        // Scrolling changes priority, not the required preview dimensions.
+        // VisiblePreviewRefreshRequested fills the new viewport immediately;
+        // keep the existing full-book pass alive instead of resetting its
+        // progress and rebuilding all 65k+ work items after every scroll.
     }
 
     private void SetScrollOffsetCore(int value)
@@ -1145,13 +1269,26 @@ internal sealed partial class ThumbnailGridView : Panel
 
     private void InvalidateCellThreadSafe(int page)
     {
-        if (page < 0 || page >= _pageCount) return;
-        QueueItemInvalidation(_folders.Length + page);
+        var displayItem = -1;
+        lock (_contentGate)
+        {
+            if (page < 0 || page >= _pageCount) return;
+            var displayPage = page < _pageDisplayBySource.Length
+                ? _pageDisplayBySource[page]
+                : -1;
+            if (displayPage >= 0) displayItem = _folders.Length + displayPage;
+        }
+        if (displayItem >= 0) QueueItemInvalidation(displayItem);
     }
 
     private void InvalidateItemThreadSafe(int item)
     {
-        QueueItemInvalidation(item);
+        int displayItem;
+        lock (_contentGate)
+            displayItem = item >= 0 && item < _folderDisplayBySource.Length
+                ? _folderDisplayBySource[item]
+                : -1;
+        if (displayItem >= 0) QueueItemInvalidation(displayItem);
     }
 
     private void QueueItemInvalidation(int item)

@@ -25,6 +25,7 @@ internal static unsafe class NvJpegNativeDecoder
     private const int NppiInterpolationCubic = 4;
     private const int NppiInterpolationLanczos = 16;
     private const int MaximumGpuWorkers = 16;
+    private const int MaximumStagedThumbnailGpuWorkers = 4;
     private const int BufferAlignment = 4 * 1024 * 1024;
 
     private static readonly object InitializationGate = new();
@@ -33,6 +34,12 @@ internal static unsafe class NvJpegNativeDecoder
     // This is only a safety ceiling. Actual background concurrency is admitted
     // by available VRAM and each image's estimated working set below.
     private static readonly SemaphoreSlim BackgroundGpuSlots = new(MaximumGpuWorkers - 1);
+    // Staged thumbnail decode shares the GPU with the Direct2D UI surface. A
+    // large user-configured global fast lane must not turn into 16 simultaneous
+    // full-resolution nvJPEG/NPP allocations and starve presentation long enough
+    // for Windows TDR to remove the D3D device.
+    private static readonly SemaphoreSlim StagedThumbnailGpuSlots = new(
+        MaximumStagedThumbnailGpuWorkers, MaximumStagedThumbnailGpuWorkers);
     // NVIDIA's CUDA-D3D registration path is much less tolerant of concurrent
     // resource churn than nvJPEG/NPP compute. Keep decode and resize parallel,
     // but serialize only the short handoff that exposes a finished texture to D3D.
@@ -374,6 +381,63 @@ internal static unsafe class NvJpegNativeDecoder
         }
     }
 
+    public static bool TryDecodeThumbnailStaged(
+        PageEntry page, Size displayBounds, int rotation, int oversample,
+        bool fastPreview, CancellationToken cancellationToken,
+        out Bitmap? bitmap, out bool landscape)
+    {
+        bitmap = null;
+        landscape = false;
+        if (!_enabled || Volatile.Read(ref _state) != Ready) return false;
+
+        SemaphoreSlim? configuredBackground = null;
+        SemaphoreSlim? configuredGpu = null;
+        Worker? worker = null;
+        var stagedAcquired = false;
+        var backgroundAcquired = false;
+        var configuredBackgroundAcquired = false;
+        var configuredGpuAcquired = false;
+        var gpuAcquired = false;
+        try
+        {
+            StagedThumbnailGpuSlots.Wait(cancellationToken);
+            stagedAcquired = true;
+            configuredBackground = Volatile.Read(ref _configuredBackgroundSlots);
+            configuredBackground.Wait(cancellationToken);
+            configuredBackgroundAcquired = true;
+            var delay = Volatile.Read(ref _backgroundBatchDelayMs);
+            if (delay > 0)
+                Task.Delay(delay, cancellationToken).GetAwaiter().GetResult();
+            BackgroundGpuSlots.Wait(cancellationToken);
+            backgroundAcquired = true;
+            configuredGpu = Volatile.Read(ref _configuredGpuSlots);
+            configuredGpu.Wait(cancellationToken);
+            configuredGpuAcquired = true;
+            GpuSlots.Wait(cancellationToken);
+            gpuAcquired = true;
+            if (!Workers.TryTake(out worker)) return false;
+            return worker.TryDecode(page, displayBounds, rotation, oversample,
+                fastPreview, cancellationToken, out bitmap, out landscape,
+                background: true);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch
+        {
+            bitmap?.Dispose();
+            bitmap = null;
+            return false;
+        }
+        finally
+        {
+            if (worker is not null) Workers.Add(worker);
+            if (gpuAcquired) GpuSlots.Release();
+            if (configuredGpuAcquired) configuredGpu!.Release();
+            if (backgroundAcquired) BackgroundGpuSlots.Release();
+            if (configuredBackgroundAcquired) configuredBackground!.Release();
+            if (stagedAcquired) StagedThumbnailGpuSlots.Release();
+        }
+    }
+
     public static bool TryResizeBitmapStagedGpu(
         Bitmap source, Size bounds, bool fastPreview,
         CancellationToken cancellationToken, out Bitmap? bitmap)
@@ -499,7 +563,7 @@ internal static unsafe class NvJpegNativeDecoder
         public bool TryDecode(
             PageEntry page, Size displayBounds, int rotation, int oversample,
             bool fastPreview, CancellationToken cancellationToken,
-            out Bitmap? bitmap, out bool landscape)
+            out Bitmap? bitmap, out bool landscape, bool background = false)
         {
             bitmap = null;
             landscape = false;
@@ -524,6 +588,12 @@ internal static unsafe class NvJpegNativeDecoder
             landscape = displayedWidth > displayedHeight;
             var target = CalculateDecodeSize(sourceWidth, sourceHeight,
                 displayBounds, normalizedRotation, oversample, fastPreview);
+            using var vramLease = background
+                ? AcquireBackgroundVram(_api,
+                    EstimateGpuWorkingSet(sourceWidth, sourceHeight, target,
+                        normalizedRotation), cancellationToken)
+                : null;
+            if (background && vramLease is null) return false;
 
             // Without NPP, nvJPEG would have to transfer the entire decoded
             // 45MP RGB image back and resize it on the CPU. For substantial

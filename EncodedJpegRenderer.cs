@@ -133,7 +133,7 @@ internal static class EncodedJpegRenderer
         // NVIDIA CUDA-D3D registration API which can AV inside nvwgf2umx.dll under
         // rapid resource churn, without moving decode or resize work to the CPU.
         var target = new Size(Math.Max(32, bounds.Width), Math.Max(32, bounds.Height));
-        if (NvJpegNativeDecoder.TryDecode(
+        if (NvJpegNativeDecoder.TryDecodeThumbnailStaged(
                 page, target, rotation, oversample: 1, fastPreview,
                 cancellationToken, out var decoded, out var landscape) &&
             decoded is not null)

@@ -34,12 +34,15 @@ internal sealed class AsyncViewerPanel : Panel
         public int ActiveReaders { get; set; }
         public bool Retired { get; set; }
     }
-    private sealed class ZoomDetailPatch(ZoomPatchSurface surface, Rectangle bounds)
+    private sealed class ZoomDetailPatch(
+        ZoomPatchSurface surface, Rectangle bounds, bool rightPage)
     {
         public ZoomPatchSurface Surface { get; } = surface;
         public Rectangle Bounds { get; set; } = bounds;
+        public bool RightPage { get; } = rightPage;
     }
-    private readonly record struct ZoomCropRequest(Rectangle Source, Rectangle Destination);
+    private readonly record struct ZoomCropRequest(
+        int PageIndex, Rectangle Source, Rectangle Destination, bool RightPage);
     private sealed class ActiveAnimation(AnimationFrameSet frames, bool rightPage)
     {
         public AnimationFrameSet Frames { get; } = frames;
@@ -107,6 +110,14 @@ internal sealed class AsyncViewerPanel : Panel
     private readonly Dictionary<int, ActiveAnimation> _activeAnimations = [];
     private Rectangle _zoomBaseBounds;
     private Size _zoomOriginalSize;
+    private Size _zoomLeftOriginalSize;
+    private Size _zoomRightOriginalSize;
+    private int _zoomLeftPageIndex = -1;
+    private int _zoomRightPageIndex = -1;
+    private RectangleF _zoomLeftLogicalBounds;
+    private RectangleF _zoomRightLogicalBounds;
+    private bool _zoomDualPage;
+    private Rectangle _zoomFitBounds;
     private Point _zoomPanLast;
     private Point _pendingZoomAnchor;
     private int _zoomPageIndex = -1;
@@ -586,7 +597,7 @@ internal sealed class AsyncViewerPanel : Panel
                 _zoomInteractionVersion++;
                 CancelAndDisposeZoomRender();
                 ClampZoomBounds();
-                _direct2DSurface.UpdateZoomLayout(_zoomBaseBounds, clearDetail: true);
+                UpdateDirect2DZoomLayout(clearDetail: true);
                 ClearZoomDetail();
                 ScheduleZoomDetailRender();
                 return;
@@ -1118,20 +1129,80 @@ internal sealed class AsyncViewerPanel : Panel
     {
         if (_zoomEntering || _zoomMode || ZoomSourceSizeRequested is null) return;
         if (!TryGetZoomPage(anchor, out var useRight, out var pageIndex, out var fitBounds)) return;
+        var dualPage = TryGetVisualPageIndices(out var leftPageIndex, out var rightPageIndex);
         _zoomEntering = true;
         var version = ++_zoomInteractionVersion;
         using var cancellation = new CancellationTokenSource();
         try
         {
-            var originalSize = await ZoomSourceSizeRequested(pageIndex, cancellation.Token);
-            if (version != _zoomInteractionVersion || originalSize.Width <= 0 || originalSize.Height <= 0)
-                return;
+            Size originalSize;
+            Size leftOriginalSize = Size.Empty;
+            Size rightOriginalSize = Size.Empty;
+            Rectangle spreadFitBounds;
+            double fitScale;
+            if (dualPage)
+            {
+                var leftSizeTask = ZoomSourceSizeRequested(leftPageIndex, cancellation.Token);
+                var rightSizeTask = ZoomSourceSizeRequested(rightPageIndex, cancellation.Token);
+                await Task.WhenAll(leftSizeTask, rightSizeTask);
+                leftOriginalSize = leftSizeTask.Result;
+                rightOriginalSize = rightSizeTask.Result;
+                if (leftOriginalSize.Width <= 0 || leftOriginalSize.Height <= 0 ||
+                    rightOriginalSize.Width <= 0 || rightOriginalSize.Height <= 0)
+                    return;
+
+                // Preserve the existing independently fitted page rectangles,
+                // then treat their union as one logical spread for zoom/pan.
+                // The larger source defines the native 100% scale; the other
+                // page keeps its fitted relative size and follows the same zoom
+                // factor instead of being zoomed independently.
+                var leftFitBounds = _left.Bounds;
+                var rightFitBounds = _right.Bounds;
+                spreadFitBounds = Rectangle.Union(leftFitBounds, rightFitBounds);
+                var leftPixels = (long)leftOriginalSize.Width * leftOriginalSize.Height;
+                var rightPixels = (long)rightOriginalSize.Width * rightOriginalSize.Height;
+                var masterIsRight = rightPixels > leftPixels;
+                var masterSize = masterIsRight ? rightOriginalSize : leftOriginalSize;
+                var masterFitBounds = masterIsRight ? rightFitBounds : leftFitBounds;
+                fitScale = Math.Min(
+                    (double)masterFitBounds.Width / masterSize.Width,
+                    (double)masterFitBounds.Height / masterSize.Height);
+                fitScale = Math.Max(0.0001d, fitScale);
+                originalSize = new Size(
+                    Math.Max(1, (int)Math.Ceiling(spreadFitBounds.Width / fitScale)),
+                    Math.Max(1, (int)Math.Ceiling(spreadFitBounds.Height / fitScale)));
+                _zoomLeftLogicalBounds = ToLogicalZoomBounds(
+                    leftFitBounds, spreadFitBounds, fitScale);
+                _zoomRightLogicalBounds = ToLogicalZoomBounds(
+                    rightFitBounds, spreadFitBounds, fitScale);
+            }
+            else
+            {
+                originalSize = await ZoomSourceSizeRequested(pageIndex, cancellation.Token);
+                if (originalSize.Width <= 0 || originalSize.Height <= 0) return;
+                fitScale = Math.Min(
+                    (double)fitBounds.Width / originalSize.Width,
+                    (double)fitBounds.Height / originalSize.Height);
+                spreadFitBounds = fitBounds;
+                leftPageIndex = useRight ? -1 : pageIndex;
+                rightPageIndex = useRight ? pageIndex : -1;
+                leftOriginalSize = useRight ? Size.Empty : originalSize;
+                rightOriginalSize = useRight ? originalSize : Size.Empty;
+                _zoomLeftLogicalBounds = useRight
+                    ? RectangleF.Empty
+                    : new RectangleF(0, 0, originalSize.Width, originalSize.Height);
+                _zoomRightLogicalBounds = useRight
+                    ? new RectangleF(0, 0, originalSize.Width, originalSize.Height)
+                    : RectangleF.Empty;
+            }
+            if (version != _zoomInteractionVersion) return;
             anchor = fromFitWheel ? _pendingZoomAnchor : anchor;
             if (!TryGetZoomPage(anchor, out useRight, out var currentPageIndex, out fitBounds) ||
                 currentPageIndex != pageIndex) return;
-            var fitScale = Math.Min(
-                (double)fitBounds.Width / originalSize.Width,
-                (double)fitBounds.Height / originalSize.Height);
+            if (dualPage && (!TryGetVisualPageIndices(
+                    out var currentLeftPageIndex, out var currentRightPageIndex) ||
+                currentLeftPageIndex != leftPageIndex ||
+                currentRightPageIndex != rightPageIndex)) return;
             var requestedScale = fromFitWheel
                 ? _pendingEntryAbsoluteScale ?? fitScale * _pendingEntryZoomFactor
                 : 1d;
@@ -1140,12 +1211,20 @@ internal sealed class AsyncViewerPanel : Panel
             _zoomOriginalSize = originalSize;
             _zoomPageIndex = pageIndex;
             _zoomUseRightPage = useRight;
+            _zoomDualPage = dualPage;
+            _zoomLeftPageIndex = leftPageIndex;
+            _zoomRightPageIndex = rightPageIndex;
+            _zoomLeftOriginalSize = leftOriginalSize;
+            _zoomRightOriginalSize = rightOriginalSize;
+            _zoomFitBounds = spreadFitBounds;
             var targetScale = (float)Math.Clamp(requestedScale, 0.05d, 8d);
             _zoomScale = (float)Math.Clamp(fitScale, 0.05d, 8d);
-            var normalizedX = fitBounds.Width <= 0
-                ? 0.5d : Math.Clamp((double)(anchor.X - fitBounds.Left) / fitBounds.Width, 0d, 1d);
-            var normalizedY = fitBounds.Height <= 0
-                ? 0.5d : Math.Clamp((double)(anchor.Y - fitBounds.Top) / fitBounds.Height, 0d, 1d);
+            var normalizedX = spreadFitBounds.Width <= 0
+                ? 0.5d : Math.Clamp(
+                    (double)(anchor.X - spreadFitBounds.Left) / spreadFitBounds.Width, 0d, 1d);
+            var normalizedY = spreadFitBounds.Height <= 0
+                ? 0.5d : Math.Clamp(
+                    (double)(anchor.Y - spreadFitBounds.Top) / spreadFitBounds.Height, 0d, 1d);
             var width = Math.Max(1, (int)Math.Round(originalSize.Width * _zoomScale));
             var height = Math.Max(1, (int)Math.Round(originalSize.Height * _zoomScale));
             _zoomBaseBounds = new Rectangle(
@@ -1158,7 +1237,7 @@ internal sealed class AsyncViewerPanel : Panel
             Cursor = Cursors.Hand;
             _animationTimer.Stop();
             CancelRender();
-            _direct2DSurface.BeginZoom(useRight, _zoomBaseBounds);
+            BeginDirect2DZoom();
             ZoomModeChanged?.Invoke(this, true);
             if (Math.Abs(targetScale - _zoomScale) > 0.0001f)
                 StartZoomTransition(targetScale, anchor);
@@ -1188,6 +1267,14 @@ internal sealed class AsyncViewerPanel : Panel
         _zoomMode = false;
         _zoomPanning = false;
         _zoomPageIndex = -1;
+        _zoomLeftPageIndex = -1;
+        _zoomRightPageIndex = -1;
+        _zoomDualPage = false;
+        _zoomLeftOriginalSize = Size.Empty;
+        _zoomRightOriginalSize = Size.Empty;
+        _zoomLeftLogicalBounds = RectangleF.Empty;
+        _zoomRightLogicalBounds = RectangleF.Empty;
+        _zoomFitBounds = Rectangle.Empty;
         _zoomInteractionVersion++;
         FitToScreen = true;
         _zoomRenderDebounce.Stop();
@@ -1260,7 +1347,7 @@ internal sealed class AsyncViewerPanel : Panel
             _zoomScale = _zoomBaseBounds.Width /
                          (float)Math.Max(1, _zoomOriginalSize.Width);
             ReportZoomPercent();
-            _direct2DSurface.UpdateZoomLayout(_zoomBaseBounds, clearDetail: false);
+            UpdateDirect2DZoomLayout(clearDetail: false);
             if (!finishedBounds) return;
 
             _zoomTransitionTimer.Stop();
@@ -1291,7 +1378,7 @@ internal sealed class AsyncViewerPanel : Panel
             _zoomTransitionAnchor.Y - (int)Math.Round(_zoomTransitionSourceY * _zoomScale),
             width, height);
         ClampZoomBounds();
-        _direct2DSurface.UpdateZoomLayout(_zoomBaseBounds, clearDetail: false);
+        UpdateDirect2DZoomLayout(clearDetail: false);
     }
 
     private void ReportZoomPercent()
@@ -1323,7 +1410,7 @@ internal sealed class AsyncViewerPanel : Panel
         CancelAndDisposeZoomRender();
         RenderingStateChanged?.Invoke(this, false);
         ClearZoomDetail();
-        _zoomTransitionFitBounds = _zoomUseRightPage ? _right.Bounds : _left.Bounds;
+        _zoomTransitionFitBounds = _zoomFitBounds;
         if (_zoomTransitionFitBounds.Width <= 0 || _zoomTransitionFitBounds.Height <= 0)
         {
             ExitZoomMode();
@@ -1386,7 +1473,14 @@ internal sealed class AsyncViewerPanel : Panel
             bounds.Offset(actualOffset);
             patch.Bounds = bounds;
         }
-        _direct2DSurface.PanZoomLayout(_zoomBaseBounds, actualOffset);
+        if (_zoomDualPage)
+        {
+            var (leftBounds, rightBounds) = GetZoomSpreadPageBounds();
+            _direct2DSurface.PanZoomSpreadLayout(
+                leftBounds, rightBounds, actualOffset);
+        }
+        else
+            _direct2DSurface.PanZoomLayout(_zoomBaseBounds, actualOffset);
         PruneZoomDetailPatches();
     }
 
@@ -1405,6 +1499,48 @@ internal sealed class AsyncViewerPanel : Panel
         _zoomPanning = false;
         Cursor = Cursors.Hand;
         ScheduleZoomDetailRender();
+    }
+
+    private static RectangleF ToLogicalZoomBounds(
+        Rectangle pageBounds, Rectangle spreadBounds, double masterFitScale) =>
+        new(
+            (float)((pageBounds.Left - spreadBounds.Left) / masterFitScale),
+            (float)((pageBounds.Top - spreadBounds.Top) / masterFitScale),
+            (float)(pageBounds.Width / masterFitScale),
+            (float)(pageBounds.Height / masterFitScale));
+
+    private Rectangle ScaleLogicalZoomBounds(RectangleF logicalBounds) =>
+        new(
+            _zoomBaseBounds.Left + (int)Math.Round(logicalBounds.Left * _zoomScale),
+            _zoomBaseBounds.Top + (int)Math.Round(logicalBounds.Top * _zoomScale),
+            Math.Max(1, (int)Math.Round(logicalBounds.Width * _zoomScale)),
+            Math.Max(1, (int)Math.Round(logicalBounds.Height * _zoomScale)));
+
+    private (Rectangle Left, Rectangle Right) GetZoomSpreadPageBounds() =>
+        (ScaleLogicalZoomBounds(_zoomLeftLogicalBounds),
+            ScaleLogicalZoomBounds(_zoomRightLogicalBounds));
+
+    private void BeginDirect2DZoom()
+    {
+        if (_zoomDualPage)
+        {
+            var (leftBounds, rightBounds) = GetZoomSpreadPageBounds();
+            _direct2DSurface.BeginZoomSpread(leftBounds, rightBounds);
+        }
+        else
+            _direct2DSurface.BeginZoom(_zoomUseRightPage, _zoomBaseBounds);
+    }
+
+    private void UpdateDirect2DZoomLayout(bool clearDetail)
+    {
+        if (_zoomDualPage)
+        {
+            var (leftBounds, rightBounds) = GetZoomSpreadPageBounds();
+            _direct2DSurface.UpdateZoomSpreadLayout(
+                leftBounds, rightBounds, clearDetail);
+        }
+        else
+            _direct2DSurface.UpdateZoomLayout(_zoomBaseBounds, clearDetail);
     }
 
     private void ClampZoomBounds()
@@ -1432,6 +1568,16 @@ internal sealed class AsyncViewerPanel : Panel
         return pageIndex >= 0 && fitBounds.Width > 0 && fitBounds.Height > 0;
     }
 
+    private bool TryGetVisualPageIndices(out int leftPageIndex, out int rightPageIndex)
+    {
+        leftPageIndex = JapaneseMode ? _secondIndex : _firstIndex;
+        rightPageIndex = JapaneseMode ? _firstIndex : _secondIndex;
+        return _left.Visible && _right.Visible &&
+            leftPageIndex >= 0 && rightPageIndex >= 0 &&
+            _left.Bounds.Width > 0 && _left.Bounds.Height > 0 &&
+            _right.Bounds.Width > 0 && _right.Bounds.Height > 0;
+    }
+
     private static long DistanceSquared(Point point, Rectangle bounds)
     {
         var x = Math.Clamp(point.X, bounds.Left, bounds.Right);
@@ -1456,29 +1602,39 @@ internal sealed class AsyncViewerPanel : Panel
         var cancellation = new CancellationTokenSource();
         _zoomRenderCancellation = cancellation;
         var version = ++_zoomInteractionVersion;
-        var visible = Rectangle.Intersect(ClientRectangle, _zoomBaseBounds);
-        if (visible.Width <= 0 || visible.Height <= 0)
-        {
-            _zoomRenderCancellation = null;
-            cancellation.Dispose();
-            return;
-        }
-        var uncovered = GetUncoveredZoomAreas(visible);
-        if (uncovered.Count == 0)
-        {
-            _zoomRenderCancellation = null;
-            cancellation.Dispose();
-            return;
-        }
+        var pageLayouts = _zoomDualPage
+            ? new[]
+            {
+                (_zoomLeftPageIndex, _zoomLeftOriginalSize,
+                    GetZoomSpreadPageBounds().Left, RightPage: false),
+                (_zoomRightPageIndex, _zoomRightOriginalSize,
+                    GetZoomSpreadPageBounds().Right, RightPage: true)
+            }
+            : new[]
+            {
+                (_zoomPageIndex, _zoomOriginalSize, _zoomBaseBounds,
+                    RightPage: _zoomUseRightPage)
+            };
 
-        // Give Lanczos a tiny overlap into existing sharp pixels. This avoids a
-        // visible filter seam while still rendering only the newly exposed edge.
-        var requests = uncovered
-            .Select(area => Rectangle.Intersect(visible, Rectangle.Inflate(area, 2, 2)))
-            .Distinct()
-            .Select(CreateZoomCropRequest)
-            .Where(request => request.HasValue)
-            .Select(request => request!.Value)
+        // Give Lanczos a tiny overlap into existing sharp pixels. Each page is
+        // cropped in its own source coordinates, but both destinations share the
+        // spread transform and therefore remain locked together while zooming.
+        var requests = pageLayouts
+            .SelectMany(layout =>
+            {
+                var visible = Rectangle.Intersect(ClientRectangle, layout.Item3);
+                if (visible.Width <= 0 || visible.Height <= 0)
+                    return Enumerable.Empty<ZoomCropRequest>();
+                return GetUncoveredZoomAreas(visible)
+                    .Select(area => Rectangle.Intersect(
+                        visible, Rectangle.Inflate(area, 2, 2)))
+                    .Distinct()
+                    .Select(destination => CreateZoomCropRequest(
+                        layout.Item1, layout.Item2, layout.Item3,
+                        layout.RightPage, destination))
+                    .Where(request => request.HasValue)
+                    .Select(request => request!.Value);
+            })
             .ToArray();
         if (requests.Length == 0)
         {
@@ -1500,12 +1656,13 @@ internal sealed class AsyncViewerPanel : Panel
             cancellation.Token.ThrowIfCancellationRequested();
             if (!_zoomMode || version != _zoomInteractionVersion) return;
 
-            var fastPatches = new Dictionary<Rectangle, ZoomPatchSurface>();
+            var fastPatches = new Dictionary<ZoomCropRequest, ZoomPatchSurface>();
             foreach (var result in results)
             {
                 if (result.Surface is not { } surface) continue;
-                fastPatches[result.Request.Destination] = surface;
-                AddZoomPatch(surface, result.Request.Destination);
+                fastPatches[result.Request] = surface;
+                AddZoomPatch(
+                    surface, result.Request.Destination, result.Request.RightPage);
             }
             results = [];
 
@@ -1518,8 +1675,9 @@ internal sealed class AsyncViewerPanel : Panel
             foreach (var result in results)
             {
                 if (result.Surface is not { } surface) continue;
-                AddZoomPatch(surface, result.Request.Destination);
-                if (fastPatches.Remove(result.Request.Destination, out var fastSurface))
+                AddZoomPatch(
+                    surface, result.Request.Destination, result.Request.RightPage);
+                if (fastPatches.Remove(result.Request, out var fastSurface))
                     RemoveZoomDetailPatch(fastSurface);
             }
             results = [];
@@ -1551,7 +1709,7 @@ internal sealed class AsyncViewerPanel : Panel
         try
         {
             var bitmap = await renderer(
-                _zoomPageIndex, request.Source, request.Destination.Size,
+                request.PageIndex, request.Source, request.Destination.Size,
                 fastPreview, cancellationToken);
             return (request, bitmap);
         }
@@ -1563,20 +1721,26 @@ internal sealed class AsyncViewerPanel : Panel
         }
     }
 
-    private ZoomCropRequest? CreateZoomCropRequest(Rectangle destination)
+    private ZoomCropRequest? CreateZoomCropRequest(
+        int pageIndex, Size originalSize, Rectangle pageBounds,
+        bool rightPage, Rectangle destination)
     {
         var sourceLeft = Math.Max(0, (int)Math.Floor(
-            (destination.Left - _zoomBaseBounds.Left) / (double)_zoomScale));
+            (destination.Left - pageBounds.Left) /
+            Math.Max(0.0001d, pageBounds.Width / (double)originalSize.Width)));
         var sourceTop = Math.Max(0, (int)Math.Floor(
-            (destination.Top - _zoomBaseBounds.Top) / (double)_zoomScale));
-        var sourceRight = Math.Min(_zoomOriginalSize.Width, (int)Math.Ceiling(
-            (destination.Right - _zoomBaseBounds.Left) / (double)_zoomScale));
-        var sourceBottom = Math.Min(_zoomOriginalSize.Height, (int)Math.Ceiling(
-            (destination.Bottom - _zoomBaseBounds.Top) / (double)_zoomScale));
+            (destination.Top - pageBounds.Top) /
+            Math.Max(0.0001d, pageBounds.Height / (double)originalSize.Height)));
+        var sourceRight = Math.Min(originalSize.Width, (int)Math.Ceiling(
+            (destination.Right - pageBounds.Left) /
+            Math.Max(0.0001d, pageBounds.Width / (double)originalSize.Width)));
+        var sourceBottom = Math.Min(originalSize.Height, (int)Math.Ceiling(
+            (destination.Bottom - pageBounds.Top) /
+            Math.Max(0.0001d, pageBounds.Height / (double)originalSize.Height)));
         var source = Rectangle.FromLTRB(sourceLeft, sourceTop, sourceRight, sourceBottom);
         return source.Width > 0 && source.Height > 0 &&
             destination.Width > 0 && destination.Height > 0
-            ? new ZoomCropRequest(source, destination)
+            ? new ZoomCropRequest(pageIndex, source, destination, rightPage)
             : null;
     }
 
@@ -1635,11 +1799,14 @@ internal sealed class AsyncViewerPanel : Panel
         _zoomDetailPatches.Clear();
     }
 
-    private void AddZoomPatch(ZoomPatchSurface surface, Rectangle bounds)
+    private void AddZoomPatch(
+        ZoomPatchSurface surface, Rectangle bounds, bool rightPage)
     {
-        _zoomDetailPatches.Add(new ZoomDetailPatch(surface, bounds));
-        if (surface.Gpu is { } gpu) _direct2DSurface.AddZoomDetailGpu(gpu, bounds);
-        else if (surface.Bitmap is { } bitmap) _direct2DSurface.AddZoomDetail(bitmap, bounds);
+        _zoomDetailPatches.Add(new ZoomDetailPatch(surface, bounds, rightPage));
+        if (surface.Gpu is { } gpu)
+            _direct2DSurface.AddZoomDetailGpu(gpu, bounds, rightPage);
+        else if (surface.Bitmap is { } bitmap)
+            _direct2DSurface.AddZoomDetail(bitmap, bounds, rightPage);
     }
 
     private void RemoveZoomSurfaceFromRenderer(ZoomPatchSurface surface)
