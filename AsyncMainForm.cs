@@ -2992,8 +2992,6 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         var completionTransferred = false;
         try
         {
-            var isPdf = Path.GetExtension(path).Equals(
-                ".pdf", StringComparison.OrdinalIgnoreCase);
             var result = await BrowsePreviewWorkScheduler.RunAsync(priority, async () =>
             {
                 var cached = await Task.Run(() =>
@@ -3005,16 +3003,13 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 }, cancellationToken).ConfigureAwait(false);
                 if (cached is not null) return new GeneratedThumbnail(cached, null);
 
-                if (fastPreview && !isPdf && _thumbnailGrid.NativeGpuSourcesEnabled)
-                {
-                    var gpu = await RenderWorkScheduler.RunFastCodecAsync(
-                        () => BrowsePreviewRenderer.CreateGpu(
-                            path, targetSize, fastPreview: true,
-                            _settings.LanczosQuality, cancellationToken),
-                        cancellationToken).ConfigureAwait(false);
-                    if (gpu is not null) return new GeneratedThumbnail(null, gpu);
-                }
-
+                // Keep nvJPEG/NPP work on the GPU, but stage the small finished
+                // cover through host memory before the UI uploads it to Direct2D.
+                // Importing a newly produced D3D texture with
+                // CreateBitmapFromDxgiSurface inside WM_PAINT can wait forever in
+                // the display driver during rapid folder changes. The staged path
+                // preserves GPU decode/resize and hardware presentation without
+                // putting an unbounded native interop call on the UI thread.
                 var preview = fastPreview
                     ? await RenderWorkScheduler.RunFastAsync(
                         threads => BrowsePreviewRenderer.Create(
@@ -3172,21 +3167,19 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 ImagePipelineTuning.UseGenericGpuFastPreview &&
                 sourceBytes <= ImagePipelineTuning.GenericGpuFastMaximumSourceBytes)
             {
-                var gpu = await RenderWorkScheduler.RunFastCodecAsync(() =>
+                var stagedGpu = await RenderWorkScheduler.RunFastCodecAsync(() =>
                 {
                     using var lease = ImagePipelineTuning.EnterGenericGpu(cancellationToken);
-                    return GpuContactSheetRenderer.TryScale(
-                        image, targetSize, cancellationToken);
+                    return NvJpegNativeDecoder.TryResizeBitmapStagedGpu(
+                        image, targetSize, fastPreview: true, cancellationToken,
+                        out var rendered) ? rendered : null;
                 }, cancellationToken).ConfigureAwait(false);
-                if (gpu is not null)
+                if (stagedGpu is not null)
                 {
-                    // WIC already produced the target-sized preview. Persist it
-                    // before transferring ownership of the visible result to D3D.
-                    if (wic is not null)
-                        PersistentPreviewCache.StoreCopyInBackground(
-                            persistentKind, book, page, targetSize, rotation,
-                            persistentQuality, image);
-                    return new GeneratedThumbnail(null, gpu);
+                    PersistentPreviewCache.StoreCopyInBackground(
+                        persistentKind, book, page, targetSize, rotation,
+                        persistentQuality, stagedGpu);
+                    return new GeneratedThumbnail(stagedGpu, null);
                 }
             }
             if (_thumbnailGrid.NativeGpuSourcesEnabled &&

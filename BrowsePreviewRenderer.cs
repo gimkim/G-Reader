@@ -210,7 +210,7 @@ internal static class BrowsePreviewRenderer
         CancellationToken cancellationToken)
     {
         if (EncodedJpegRenderer.Supports(page))
-            return EncodedJpegRenderer.RenderThumbnail(
+            return EncodedJpegRenderer.RenderThumbnailStagedGpu(
                 page, targetSize, page.ExifRotation, quality,
                 fastPreview, cancellationToken).Bitmap;
         return RenderGenericPage(
