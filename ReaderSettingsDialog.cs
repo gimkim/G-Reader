@@ -1,5 +1,42 @@
 namespace CDisplayEx.CSharp;
 
+internal sealed class SettingsNumericUpDown : NumericUpDown
+{
+    private const int WmMouseWheel = 0x020A;
+    private const int MkShift = 0x0004;
+    private const int MkControl = 0x0008;
+
+    protected override void OnMouseWheel(MouseEventArgs e)
+    {
+        // A settings page is primarily a scroll surface. Hovering a numeric
+        // editor must never silently modify its value; forward the wheel to the
+        // nearest scrolling container instead. Keyboard, typing, and the arrow
+        // buttons retain their normal NumericUpDown behavior.
+        var scrollParent = Parent;
+        while (scrollParent is not null &&
+               (scrollParent is not ScrollableControl scrollable ||
+                !scrollable.AutoScroll))
+            scrollParent = scrollParent.Parent;
+        if (scrollParent is null || !scrollParent.IsHandleCreated) return;
+
+        var keyState = 0;
+        if ((ModifierKeys & Keys.Shift) != 0) keyState |= MkShift;
+        if ((ModifierKeys & Keys.Control) != 0) keyState |= MkControl;
+        var wheel = unchecked((int)(short)e.Delta);
+        var wParam = new IntPtr((wheel << 16) | keyState);
+        var screen = PointToScreen(e.Location);
+        var lParam = new IntPtr(
+            (unchecked((ushort)screen.Y) << 16) | unchecked((ushort)screen.X));
+        PostMessage(scrollParent.Handle, WmMouseWheel, wParam, lParam);
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    [return: System.Runtime.InteropServices.MarshalAs(
+        System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool PostMessage(
+        IntPtr hWnd, int message, IntPtr wParam, IntPtr lParam);
+}
+
 internal sealed class ReaderSettingsDialog : Form
 {
     public event EventHandler<bool>? BenchmarkRunningChanged;
@@ -1487,31 +1524,31 @@ internal sealed class ReaderSettingsDialog : Form
         return row;
     }
 
-    private static NumericUpDown CreateMemoryInput() => new()
+    private static NumericUpDown CreateMemoryInput() => new SettingsNumericUpDown()
     {
         Minimum = 0, Maximum = 65536, Increment = 128,
         ThousandsSeparator = true, Dock = DockStyle.Fill
     };
 
-    private static NumericUpDown CreateWorkerInput() => new()
+    private static NumericUpDown CreateWorkerInput() => new SettingsNumericUpDown()
     {
         Minimum = 1, Maximum = 64, Increment = 1,
         ThousandsSeparator = false, Dock = DockStyle.Fill
     };
 
-    private static NumericUpDown CreatePdfiumProcessInput() => new()
+    private static NumericUpDown CreatePdfiumProcessInput() => new SettingsNumericUpDown()
     {
         Minimum = 1, Maximum = 16, Increment = 1,
         ThousandsSeparator = false, Dock = DockStyle.Fill
     };
 
-    private static NumericUpDown CreateZoomThreadInput() => new()
+    private static NumericUpDown CreateZoomThreadInput() => new SettingsNumericUpDown()
     {
         Minimum = 1, Maximum = 255, Increment = 1,
         ThousandsSeparator = false, Dock = DockStyle.Fill
     };
 
-    private static NumericUpDown CreatePixelInput() => new()
+    private static NumericUpDown CreatePixelInput() => new SettingsNumericUpDown()
     {
         Minimum = 32, Maximum = 8192, Increment = 32,
         ThousandsSeparator = true, Dock = DockStyle.Fill
@@ -1522,23 +1559,24 @@ internal sealed class ReaderSettingsDialog : Form
         Text = text, AutoSize = true, Dock = DockStyle.Fill
     };
 
-    private static NumericUpDown CreateMillisecondsInput() => new()
+    private static NumericUpDown CreateMillisecondsInput() => new SettingsNumericUpDown()
     {
         Minimum = 0, Maximum = 100, Increment = 1, Dock = DockStyle.Fill
     };
 
-    private static NumericUpDown CreatePercentInput() => new()
+    private static NumericUpDown CreatePercentInput() => new SettingsNumericUpDown()
     {
         Minimum = 5, Maximum = 75, Increment = 1, Dock = DockStyle.Fill
     };
 
-    private static NumericUpDown CreateTimeBudgetInput() => new()
+    private static NumericUpDown CreateTimeBudgetInput() => new SettingsNumericUpDown()
     {
         Minimum = 0.5m, Maximum = 50m, Increment = 0.5m,
         DecimalPlaces = 1, Dock = DockStyle.Fill
     };
 
-    private static NumericUpDown CreateCountInput(int minimum, int maximum) => new()
+    private static NumericUpDown CreateCountInput(int minimum, int maximum) =>
+        new SettingsNumericUpDown()
     {
         Minimum = minimum, Maximum = maximum, Increment = 1,
         ThousandsSeparator = true, Dock = DockStyle.Fill
