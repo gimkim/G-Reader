@@ -199,7 +199,7 @@ internal static class TurboJpegNativeDecoder
     private static byte[] ReadAllBytes(
         PageEntry page, CancellationToken cancellationToken)
     {
-        using var source = page.Open();
+        using var source = page.OpenStream(cancellationToken);
         var capacity = 0;
         try
         {

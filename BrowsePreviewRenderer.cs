@@ -33,14 +33,20 @@ internal static class BrowsePreviewRenderer
                             CopyToWithCancellation(source, memory, cancellationToken);
                         return memory.ToArray();
                     });
-                    return new PageEntry(captured.Key!, () =>
+                    var page = new PageEntry(captured.Key!, () =>
                         new MemoryStream(encoded.Value, writable: false));
+                    return page with { ExifRotation = Book.ReadExifRotation(page) };
                 }).ToArray();
             return CreateGpuFromPages(
                 pages, targetSize, fastPreview, quality, cancellationToken);
         }
-        return CreateGpuFromPages(Book.OpenPreviewPages(path, 4, cancellationToken),
-            targetSize, fastPreview, quality, cancellationToken);
+        var previewPages = Book.OpenPreviewPages(path, 4, cancellationToken);
+        if (previewPages.Count == 0 && TryGetFirstContainer(path,
+                cancellationToken) is { } firstContainer)
+            return CreateGpu(firstContainer, targetSize, fastPreview, quality,
+                cancellationToken);
+        return CreateGpuFromPages(previewPages, targetSize, fastPreview, quality,
+            cancellationToken);
     }
 
     private static GpuRenderedImage? CreateGpuFromPages(
@@ -62,7 +68,8 @@ internal static class BrowsePreviewRenderer
                 if (EncodedJpegRenderer.Supports(page))
                 {
                     var result = EncodedJpegRenderer.RenderThumbnailGpu(page, cardTarget,
-                        0, fastPreview, jpegQuality: fastPreview ? 82 : 92,
+                        page.ExifRotation, fastPreview,
+                        jpegQuality: fastPreview ? 82 : 92,
                         cancellationToken);
                     if (result is not { } rendered) return null;
                     images.Add(rendered.Image);
@@ -115,16 +122,43 @@ internal static class BrowsePreviewRenderer
                         CopyToWithCancellation(source, memory, cancellationToken);
                     return memory.ToArray();
                 });
-                return new PageEntry(captured.Key!, () =>
+                var page = new PageEntry(captured.Key!, () =>
                     new MemoryStream(encoded.Value, writable: false));
+                return page with { ExifRotation = Book.ReadExifRotation(page) };
             }).ToArray();
             return CreateFromPages(
                 archivePages, targetSize, threads, fastPreview, quality,
                 cancellationToken);
         }
         var pages = Book.OpenPreviewPages(path, 4, cancellationToken);
+        if (pages.Count == 0 && TryGetFirstContainer(path,
+                cancellationToken) is { } firstContainer)
+            return Create(firstContainer, targetSize, threads, fastPreview, quality,
+                cancellationToken);
         return CreateFromPages(
             pages, targetSize, threads, fastPreview, quality, cancellationToken);
+    }
+
+    private static string? TryGetFirstContainer(
+        string path, CancellationToken cancellationToken)
+    {
+        if (!Directory.Exists(path)) return null;
+        try
+        {
+            foreach (var file in Directory.EnumerateFiles(path)
+                         .Where(file => Book.IsSupportedArchive(file) ||
+                             Path.GetExtension(file).Equals(
+                                 ".pdf", StringComparison.OrdinalIgnoreCase))
+                         .OrderBy(file => file, NumericFirstComparer.Instance))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                return file;
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception exception) when (exception is IOException or
+                                             UnauthorizedAccessException) { }
+        return null;
     }
 
     private static Bitmap? CreateFromPages(
@@ -176,8 +210,9 @@ internal static class BrowsePreviewRenderer
         CancellationToken cancellationToken)
     {
         if (EncodedJpegRenderer.Supports(page))
-            return EncodedJpegRenderer.RenderThumbnail(
-                page, targetSize, 0, quality, fastPreview, cancellationToken).Bitmap;
+            return EncodedJpegRenderer.RenderThumbnailStagedGpu(
+                page, targetSize, page.ExifRotation, quality,
+                fastPreview, cancellationToken).Bitmap;
         return RenderGenericPage(
             page, targetSize, fastPreview, quality, cancellationToken);
     }
@@ -191,7 +226,7 @@ internal static class BrowsePreviewRenderer
                 page, targetSize, cancellationToken, out var wic) && wic is not null)
             return wic;
         using var formatLease = ImagePipelineTuning.EnterFormat(page.Name, cancellationToken);
-        using var stream = page.Open();
+        using var stream = page.OpenStream(cancellationToken);
         using var image = new MagickImage(stream);
         if (image.GetColorProfile() is not null)
             image.TransformColorSpace(ColorProfiles.SRGB);
@@ -225,25 +260,36 @@ internal static class BrowsePreviewRenderer
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        using var document = PdfRendering.Open(path);
-        var previews = new List<Bitmap>(4);
+        using var document = PdfRendering.Open(
+            path, background: true, cancellationToken);
+        Bitmap?[] previews = [];
         try
         {
             var cardTarget = GetCardTarget(targetSize, fastPreview);
-            var count = Math.Min(4, document.PageCount);
-            for (var index = 0; index < count; index++)
+            // Publish a one-page cover during the fast pass. The later full pass
+            // upgrades it to the four-page contact sheet, so a folder containing
+            // several uncached PDFs no longer waits for four PDFium rasters per
+            // card before displaying anything.
+            var count = Math.Min(fastPreview ? 1 : 4, document.PageCount);
+            previews = new Bitmap?[count];
+            Parallel.For(0, count, new ParallelOptions
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                previews.Add(RenderPdfPreviewPage(document, index, cardTarget,
-                    fastPreview, quality, cancellationToken));
-            }
-            return previews.Count == 0
+                CancellationToken = cancellationToken,
+                MaxDegreeOfParallelism = Math.Min(
+                    count, Math.Max(1, PdfRendering.PdfiumProcessCount))
+            }, index =>
+            {
+                previews[index] = RenderPdfPreviewPage(document, index, cardTarget,
+                    fastPreview, quality, cancellationToken);
+            });
+            var completed = previews.OfType<Bitmap>().ToArray();
+            return completed.Length == 0
                 ? null
-                : Compose(previews, targetSize, cancellationToken);
+                : Compose(completed, targetSize, cancellationToken);
         }
         finally
         {
-            foreach (var preview in previews) preview.Dispose();
+            foreach (var preview in previews) preview?.Dispose();
         }
     }
 
@@ -255,7 +301,8 @@ internal static class BrowsePreviewRenderer
         // the selected PDF engine for 2x detail, then applies Lanczos
         // filter once. Pixel data never takes an encoded stream round-trip.
         using var raster = document.RenderPageToFit(
-            index, targetSize, fastPreview ? 1f : 2f);
+            index, targetSize, fastPreview ? 1f : 2f, background: true,
+            cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
         if (!fastPreview)
             return AsyncViewerPanel.CreateLanczosThumbnail(
@@ -287,7 +334,9 @@ internal static class BrowsePreviewRenderer
         var angles = new[] { -8f, -3f, 3f, 8f };
         var offsets = new[] { -0.10f, -0.04f, 0.04f, 0.10f };
         var count = previews.Count;
-        for (var index = 0; index < count; index++)
+        // Draw in reverse source order so the first page/image is the front card
+        // instead of being hidden behind the last page in the contact sheet.
+        for (var index = count - 1; index >= 0; index--)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var source = previews[index];

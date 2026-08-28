@@ -34,12 +34,15 @@ internal sealed class AsyncViewerPanel : Panel
         public int ActiveReaders { get; set; }
         public bool Retired { get; set; }
     }
-    private sealed class ZoomDetailPatch(ZoomPatchSurface surface, Rectangle bounds)
+    private sealed class ZoomDetailPatch(
+        ZoomPatchSurface surface, Rectangle bounds, bool rightPage)
     {
         public ZoomPatchSurface Surface { get; } = surface;
         public Rectangle Bounds { get; set; } = bounds;
+        public bool RightPage { get; } = rightPage;
     }
-    private readonly record struct ZoomCropRequest(Rectangle Source, Rectangle Destination);
+    private readonly record struct ZoomCropRequest(
+        int PageIndex, Rectangle Source, Rectangle Destination, bool RightPage);
     private sealed class ActiveAnimation(AnimationFrameSet frames, bool rightPage)
     {
         public AnimationFrameSet Frames { get; } = frames;
@@ -87,6 +90,8 @@ internal sealed class AsyncViewerPanel : Panel
     private int _secondIndex = -1;
     private Bitmap? _leftRendered;
     private Bitmap? _rightRendered;
+    private Size _leftDisplayedSourceSize;
+    private Size _rightDisplayedSourceSize;
     private CancellationTokenSource? _renderCancellation;
     private int _renderVersion;
     private long _renderCacheSequence;
@@ -105,6 +110,14 @@ internal sealed class AsyncViewerPanel : Panel
     private readonly Dictionary<int, ActiveAnimation> _activeAnimations = [];
     private Rectangle _zoomBaseBounds;
     private Size _zoomOriginalSize;
+    private Size _zoomLeftOriginalSize;
+    private Size _zoomRightOriginalSize;
+    private int _zoomLeftPageIndex = -1;
+    private int _zoomRightPageIndex = -1;
+    private RectangleF _zoomLeftLogicalBounds;
+    private RectangleF _zoomRightLogicalBounds;
+    private bool _zoomDualPage;
+    private Rectangle _zoomFitBounds;
     private Point _zoomPanLast;
     private Point _pendingZoomAnchor;
     private int _zoomPageIndex = -1;
@@ -127,6 +140,7 @@ internal sealed class AsyncViewerPanel : Panel
 
     public event EventHandler<bool>? RenderingStateChanged;
     public event EventHandler? ViewportRenderContextChanged;
+    public event EventHandler? RenderDeviceRecovered;
     public event EventHandler<bool>? ZoomModeChanged;
     public event EventHandler<int>? ZoomPercentChanged;
     public event Action<int, AnimationFrameSet>? AnimationReleased;
@@ -291,14 +305,15 @@ internal sealed class AsyncViewerPanel : Panel
                 {
                     foreach (var candidate in renderCandidates.Skip(offset).Take(batchSize))
                     {
-                        if (candidate.Value.ActiveReaders != 0 ||
-                            !_renderCache.Remove(candidate.Key)) continue;
+                        if (!_renderCache.Remove(candidate.Key)) continue;
                         _renderCacheBytes -= candidate.Value.Bytes;
                         SubtractRenderStats(candidate.Key, candidate.Value.Bytes);
                         _renderLookup.Remove(new RenderLookupKey(
                             candidate.Key.PageIndex, candidate.Key.PageKey,
                             candidate.Key.VisiblePageCount, candidate.Key.ContextVersion));
-                        evicted.Add(candidate.Value.Bitmap);
+                        if (candidate.Value.ActiveReaders == 0)
+                            evicted.Add(candidate.Value.Bitmap);
+                        else candidate.Value.Retired = true;
                     }
                 }
                 Thread.Yield();
@@ -312,14 +327,15 @@ internal sealed class AsyncViewerPanel : Panel
             {
                 lock (_renderCacheGate)
                 {
-                    if (candidate.Value.ActiveReaders != 0 ||
-                        !_gpuRenderCache.Remove(candidate.Key)) continue;
+                    if (!_gpuRenderCache.Remove(candidate.Key)) continue;
                     _renderCacheBytes -= candidate.Value.Bytes;
                     SubtractRenderStats(candidate.Key, candidate.Value.Bytes);
                     _gpuRenderLookup.Remove(new RenderLookupKey(
                         candidate.Key.PageIndex, candidate.Key.PageKey,
                         candidate.Key.VisiblePageCount, candidate.Key.ContextVersion));
-                    gpuEvicted.Add(candidate.Value.Image);
+                    if (candidate.Value.ActiveReaders == 0)
+                        gpuEvicted.Add(candidate.Value.Image);
+                    else candidate.Value.Retired = true;
                 }
             }
 
@@ -333,13 +349,14 @@ internal sealed class AsyncViewerPanel : Panel
                 {
                     foreach (var candidate in previewCandidates.Skip(offset).Take(batchSize))
                     {
-                        if (candidate.Value.ActiveReaders != 0 ||
-                            !_previewCache.Remove(candidate.Key)) continue;
+                        if (!_previewCache.Remove(candidate.Key)) continue;
                         _previewCacheBytes -= candidate.Value.Bytes;
                         _previewLookup.Remove(new RenderLookupKey(
                             candidate.Key.PageIndex, candidate.Key.PageKey,
                             candidate.Key.VisiblePageCount, candidate.Key.ContextVersion));
-                        evicted.Add(candidate.Value.Bitmap);
+                        if (candidate.Value.ActiveReaders == 0)
+                            evicted.Add(candidate.Value.Bitmap);
+                        else candidate.Value.Retired = true;
                     }
                 }
                 Thread.Yield();
@@ -352,13 +369,14 @@ internal sealed class AsyncViewerPanel : Panel
             {
                 lock (_previewCacheGate)
                 {
-                    if (candidate.Value.ActiveReaders != 0 ||
-                        !_gpuPreviewCache.Remove(candidate.Key)) continue;
+                    if (!_gpuPreviewCache.Remove(candidate.Key)) continue;
                     _previewCacheBytes -= candidate.Value.Bytes;
                     _gpuPreviewLookup.Remove(new RenderLookupKey(
                         candidate.Key.PageIndex, candidate.Key.PageKey,
                         candidate.Key.VisiblePageCount, candidate.Key.ContextVersion));
-                    gpuEvicted.Add(candidate.Value.Image);
+                    if (candidate.Value.ActiveReaders == 0)
+                        gpuEvicted.Add(candidate.Value.Image);
+                    else candidate.Value.Retired = true;
                 }
             }
             foreach (var bitmap in evicted) lock (bitmap) bitmap.Dispose();
@@ -555,6 +573,14 @@ internal sealed class AsyncViewerPanel : Panel
         _direct2DSurface.MouseMove += OnViewerMouseMove;
         _direct2DSurface.MouseUp += OnViewerMouseUp;
         _direct2DSurface.MouseCaptureChanged += OnViewerMouseCaptureChanged;
+        _direct2DSurface.DeviceResourcesRecovered += (_, _) =>
+        {
+            if (IsDisposed || Disposing) return;
+            _renderContextVersion++;
+            ClearRenderCache();
+            ClearPreviewCache();
+            RenderDeviceRecovered?.Invoke(this, EventArgs.Empty);
+        };
         AccessibleName = "Hardware-accelerated Direct2D comic viewer";
         Scroll += (_, _) => _direct2DSurface.UpdateLayout(_left.Bounds, _right.Bounds);
         _lastRenderControlSize = Size;
@@ -571,7 +597,7 @@ internal sealed class AsyncViewerPanel : Panel
                 _zoomInteractionVersion++;
                 CancelAndDisposeZoomRender();
                 ClampZoomBounds();
-                _direct2DSurface.UpdateZoomLayout(_zoomBaseBounds, clearDetail: true);
+                UpdateDirect2DZoomLayout(clearDetail: true);
                 ClearZoomDetail();
                 ScheduleZoomDetailRender();
                 return;
@@ -848,20 +874,16 @@ internal sealed class AsyncViewerPanel : Panel
             .Select(pair => pair.Key.Page)
             .ToHashSet();
 
-    public (int BehindStart, int AheadEnd) GetCachedPageRange(int center)
+    public int[] GetCachedPages()
     {
         var context = Volatile.Read(ref _renderContextVersion);
-        var pages = _cachedPageCounts
+        return _cachedPageCounts
             .Where(pair => pair.Key.Context == context &&
                 IsActivePageKey(pair.Key.PageKey) && pair.Value > 0)
             .Select(pair => pair.Key.Page)
-            .ToHashSet();
-        if (!pages.Contains(center)) return (-1, -1);
-        var behind = center;
-        var ahead = center;
-        while (pages.Contains(behind - 1)) behind--;
-        while (pages.Contains(ahead + 1)) ahead++;
-        return (behind, ahead);
+            .Distinct()
+            .Order()
+            .ToArray();
     }
 
     public void ClearBookCache()
@@ -929,7 +951,8 @@ internal sealed class AsyncViewerPanel : Panel
         Bitmap source,
         int visiblePageCount,
         PreRenderContext context,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool idlePriority = false)
     {
         var gap = 10;
         var availableWidth = Math.Max(100, context.ClientSize.Width - gap * 3);
@@ -940,7 +963,8 @@ internal sealed class AsyncViewerPanel : Panel
             pageIndex, pageKey, size.Width, size.Height, visiblePageCount, context.Version);
         if (ContainsRender(key)) return;
 
-        if (Volatile.Read(ref _previewCacheLimitBytes) > 0 && !ContainsPreview(key))
+        if (!idlePriority && Volatile.Read(ref _previewCacheLimitBytes) > 0 &&
+            !ContainsPreview(key))
         {
             GpuRenderedImage? gpuPreview = null;
             var sourceBytes = (long)source.Width * source.Height * 4;
@@ -949,7 +973,12 @@ internal sealed class AsyncViewerPanel : Panel
                 gpuPreview = await RenderWorkScheduler.RunFastCodecAsync(() =>
                 {
                     using var lease = ImagePipelineTuning.EnterGenericGpu(cancellationToken);
-                    return GpuContactSheetRenderer.TryScale(source, size, cancellationToken);
+                    if (!NvJpegNativeDecoder.TryResizeBitmapStagedGpu(
+                            source, size, fastPreview: true, cancellationToken,
+                            out var resized) || resized is null)
+                        return null;
+                    using (resized)
+                        return GpuContactSheetRenderer.Upload(resized);
                 }, cancellationToken);
             if (gpuPreview is not null)
             {
@@ -968,25 +997,30 @@ internal sealed class AsyncViewerPanel : Panel
             (long)source.Width * source.Height * 4 >=
             ImagePipelineTuning.GenericGpuMinimumSourceBytes)
         {
-            var gpuRendered = await RenderWorkScheduler.RunFullAsync(() =>
+            var gpuWork = () =>
             {
                 using var lease = ImagePipelineTuning.EnterGenericGpu(cancellationToken);
-                return NvJpegNativeDecoder.TryResizeBitmapToGpu(
+                return NvJpegNativeDecoder.TryResizeBitmapStagedGpu(
                     source, size, fastPreview: false, cancellationToken,
                     out var image) ? image : null;
-            }, cancellationToken);
+            };
+            var gpuRendered = idlePriority
+                ? await RenderWorkScheduler.RunIdleFullAsync(gpuWork, cancellationToken)
+                : await RenderWorkScheduler.RunFullAsync(gpuWork, cancellationToken);
             if (gpuRendered is not null)
             {
-                if (!AddGpuRenderOwned(key, gpuRendered)) gpuRendered.Dispose();
+                if (!AddRenderOwned(key, gpuRendered)) gpuRendered.Dispose();
                 return;
             }
         }
 
         // The caller owns this source clone until the await completes, so another
         // full-size defensive copy only adds allocation pressure and GC pauses.
-        var rendered = await RenderWorkScheduler.RunFullAsync(
-            () => ResizeLanczosForPrecache(
-                source, size, context.LanczosQuality, cancellationToken), cancellationToken);
+        var fullWork = () => ResizeLanczosForPrecache(
+            source, size, context.LanczosQuality, cancellationToken);
+        var rendered = idlePriority
+            ? await RenderWorkScheduler.RunIdleFullAsync(fullWork, cancellationToken)
+            : await RenderWorkScheduler.RunFullAsync(fullWork, cancellationToken);
         if (rendered is null) return;
         // Transfer the completed bitmap into the cache. No pixel copy is made
         // while holding the render-cache lock.
@@ -996,28 +1030,18 @@ internal sealed class AsyncViewerPanel : Panel
     public async Task PreRenderEncodedJpegAsync(
         int pageIndex, string pageKey, PageEntry page, int visiblePageCount,
         int rotation, PreRenderContext context, bool generatePreview,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, bool interactiveFull = false,
+        bool idlePriority = false)
     {
         if (HasCachedRender(
                 pageIndex, pageKey, visiblePageCount, context.Version)) return;
 
         if (generatePreview && Volatile.Read(ref _previewCacheLimitBytes) > 0)
         {
-            var gpuPreview = await RenderWorkScheduler.RunFastCodecAsync(
-                () => EncodedJpegRenderer.RenderReaderGpu(
-                    page, context.ClientSize, visiblePageCount, rotation,
-                    fastPreview: true, cancellationToken),
-                cancellationToken).ConfigureAwait(false);
-            if (gpuPreview is { } directPreview)
-            {
-                var directKey = new RenderKey(
-                    pageIndex, pageKey, directPreview.Image.Width, directPreview.Image.Height,
-                    visiblePageCount, context.Version);
-                if (!AddGpuPreviewOwned(directKey, directPreview.Image))
-                    directPreview.Image.Dispose();
-            }
-            else
-            {
+            // Background preview batches retain many pages and evict them as the
+            // directional window moves. Keep nvJPEG/NPP on the GPU, but stage the
+            // small result through pinned host memory instead of registering a
+            // short-lived CUDA-D3D texture for every preview.
             var preview = await RenderWorkScheduler.RunFastCodecAsync(
                 () => EncodedJpegRenderer.RenderReader(
                     page, context.ClientSize, visiblePageCount, rotation,
@@ -1027,29 +1051,42 @@ internal sealed class AsyncViewerPanel : Panel
                 pageIndex, pageKey, preview.Bitmap.Width, preview.Bitmap.Height,
                 visiblePageCount, context.Version);
             if (!AddPreviewOwned(previewKey, preview.Bitmap)) preview.Bitmap.Dispose();
+        }
+
+        // Direct CUDA-D3D handoff is valuable for the page requested by the user
+        // because it avoids a host copy. Background warming instead uses the
+        // staged nvJPEG path below: it keeps GPU decode/resize performance while
+        // avoiding hundreds of register/unregister operations and driver churn.
+        if (interactiveFull)
+        {
+            var gpuRendered = await RenderWorkScheduler.RunInteractiveFullAsync(
+                () => EncodedJpegRenderer.RenderReaderGpu(
+                    page, context.ClientSize, visiblePageCount, rotation,
+                    fastPreview: false, cancellationToken), cancellationToken)
+                .ConfigureAwait(false);
+            if (gpuRendered is { } directRendered)
+            {
+                var directKey = new RenderKey(
+                    pageIndex, pageKey, directRendered.Image.Width,
+                    directRendered.Image.Height, visiblePageCount, context.Version);
+                if (!AddGpuRenderOwned(directKey, directRendered.Image))
+                    directRendered.Image.Dispose();
+                return;
             }
         }
 
-        var gpuRendered = await RenderWorkScheduler.RunFullAsync(
-            () => EncodedJpegRenderer.RenderReaderGpu(
-                page, context.ClientSize, visiblePageCount, rotation,
-                fastPreview: false, cancellationToken),
-            cancellationToken).ConfigureAwait(false);
-        if (gpuRendered is { } directRendered)
-        {
-            var directKey = new RenderKey(
-                pageIndex, pageKey, directRendered.Image.Width, directRendered.Image.Height,
-                visiblePageCount, context.Version);
-            if (!AddGpuRenderOwned(directKey, directRendered.Image))
-                directRendered.Image.Dispose();
-            return;
-        }
-
-        var rendered = await RenderWorkScheduler.RunFullAsync(
-            () => EncodedJpegRenderer.RenderReader(
-                page, context.ClientSize, visiblePageCount, rotation,
-                context.LanczosQuality, fastPreview: false, cancellationToken),
-            cancellationToken).ConfigureAwait(false);
+        var cpuWork = () => EncodedJpegRenderer.RenderReader(
+            page, context.ClientSize, visiblePageCount, rotation,
+            context.LanczosQuality, fastPreview: false, cancellationToken);
+        var rendered = interactiveFull
+            ? await RenderWorkScheduler.RunInteractiveFullAsync(
+                cpuWork,
+                cancellationToken).ConfigureAwait(false)
+            : idlePriority
+                ? await RenderWorkScheduler.RunIdleFullAsync(
+                    cpuWork, cancellationToken).ConfigureAwait(false)
+                : await RenderWorkScheduler.RunFullAsync(
+                    cpuWork, cancellationToken).ConfigureAwait(false);
         var renderKey = new RenderKey(
             pageIndex, pageKey, rendered.Bitmap.Width, rendered.Bitmap.Height,
             visiblePageCount, context.Version);
@@ -1092,20 +1129,80 @@ internal sealed class AsyncViewerPanel : Panel
     {
         if (_zoomEntering || _zoomMode || ZoomSourceSizeRequested is null) return;
         if (!TryGetZoomPage(anchor, out var useRight, out var pageIndex, out var fitBounds)) return;
+        var dualPage = TryGetVisualPageIndices(out var leftPageIndex, out var rightPageIndex);
         _zoomEntering = true;
         var version = ++_zoomInteractionVersion;
         using var cancellation = new CancellationTokenSource();
         try
         {
-            var originalSize = await ZoomSourceSizeRequested(pageIndex, cancellation.Token);
-            if (version != _zoomInteractionVersion || originalSize.Width <= 0 || originalSize.Height <= 0)
-                return;
+            Size originalSize;
+            Size leftOriginalSize = Size.Empty;
+            Size rightOriginalSize = Size.Empty;
+            Rectangle spreadFitBounds;
+            double fitScale;
+            if (dualPage)
+            {
+                var leftSizeTask = ZoomSourceSizeRequested(leftPageIndex, cancellation.Token);
+                var rightSizeTask = ZoomSourceSizeRequested(rightPageIndex, cancellation.Token);
+                await Task.WhenAll(leftSizeTask, rightSizeTask);
+                leftOriginalSize = leftSizeTask.Result;
+                rightOriginalSize = rightSizeTask.Result;
+                if (leftOriginalSize.Width <= 0 || leftOriginalSize.Height <= 0 ||
+                    rightOriginalSize.Width <= 0 || rightOriginalSize.Height <= 0)
+                    return;
+
+                // Preserve the existing independently fitted page rectangles,
+                // then treat their union as one logical spread for zoom/pan.
+                // The larger source defines the native 100% scale; the other
+                // page keeps its fitted relative size and follows the same zoom
+                // factor instead of being zoomed independently.
+                var leftFitBounds = _left.Bounds;
+                var rightFitBounds = _right.Bounds;
+                spreadFitBounds = Rectangle.Union(leftFitBounds, rightFitBounds);
+                var leftPixels = (long)leftOriginalSize.Width * leftOriginalSize.Height;
+                var rightPixels = (long)rightOriginalSize.Width * rightOriginalSize.Height;
+                var masterIsRight = rightPixels > leftPixels;
+                var masterSize = masterIsRight ? rightOriginalSize : leftOriginalSize;
+                var masterFitBounds = masterIsRight ? rightFitBounds : leftFitBounds;
+                fitScale = Math.Min(
+                    (double)masterFitBounds.Width / masterSize.Width,
+                    (double)masterFitBounds.Height / masterSize.Height);
+                fitScale = Math.Max(0.0001d, fitScale);
+                originalSize = new Size(
+                    Math.Max(1, (int)Math.Ceiling(spreadFitBounds.Width / fitScale)),
+                    Math.Max(1, (int)Math.Ceiling(spreadFitBounds.Height / fitScale)));
+                _zoomLeftLogicalBounds = ToLogicalZoomBounds(
+                    leftFitBounds, spreadFitBounds, fitScale);
+                _zoomRightLogicalBounds = ToLogicalZoomBounds(
+                    rightFitBounds, spreadFitBounds, fitScale);
+            }
+            else
+            {
+                originalSize = await ZoomSourceSizeRequested(pageIndex, cancellation.Token);
+                if (originalSize.Width <= 0 || originalSize.Height <= 0) return;
+                fitScale = Math.Min(
+                    (double)fitBounds.Width / originalSize.Width,
+                    (double)fitBounds.Height / originalSize.Height);
+                spreadFitBounds = fitBounds;
+                leftPageIndex = useRight ? -1 : pageIndex;
+                rightPageIndex = useRight ? pageIndex : -1;
+                leftOriginalSize = useRight ? Size.Empty : originalSize;
+                rightOriginalSize = useRight ? originalSize : Size.Empty;
+                _zoomLeftLogicalBounds = useRight
+                    ? RectangleF.Empty
+                    : new RectangleF(0, 0, originalSize.Width, originalSize.Height);
+                _zoomRightLogicalBounds = useRight
+                    ? new RectangleF(0, 0, originalSize.Width, originalSize.Height)
+                    : RectangleF.Empty;
+            }
+            if (version != _zoomInteractionVersion) return;
             anchor = fromFitWheel ? _pendingZoomAnchor : anchor;
             if (!TryGetZoomPage(anchor, out useRight, out var currentPageIndex, out fitBounds) ||
                 currentPageIndex != pageIndex) return;
-            var fitScale = Math.Min(
-                (double)fitBounds.Width / originalSize.Width,
-                (double)fitBounds.Height / originalSize.Height);
+            if (dualPage && (!TryGetVisualPageIndices(
+                    out var currentLeftPageIndex, out var currentRightPageIndex) ||
+                currentLeftPageIndex != leftPageIndex ||
+                currentRightPageIndex != rightPageIndex)) return;
             var requestedScale = fromFitWheel
                 ? _pendingEntryAbsoluteScale ?? fitScale * _pendingEntryZoomFactor
                 : 1d;
@@ -1114,12 +1211,20 @@ internal sealed class AsyncViewerPanel : Panel
             _zoomOriginalSize = originalSize;
             _zoomPageIndex = pageIndex;
             _zoomUseRightPage = useRight;
+            _zoomDualPage = dualPage;
+            _zoomLeftPageIndex = leftPageIndex;
+            _zoomRightPageIndex = rightPageIndex;
+            _zoomLeftOriginalSize = leftOriginalSize;
+            _zoomRightOriginalSize = rightOriginalSize;
+            _zoomFitBounds = spreadFitBounds;
             var targetScale = (float)Math.Clamp(requestedScale, 0.05d, 8d);
             _zoomScale = (float)Math.Clamp(fitScale, 0.05d, 8d);
-            var normalizedX = fitBounds.Width <= 0
-                ? 0.5d : Math.Clamp((double)(anchor.X - fitBounds.Left) / fitBounds.Width, 0d, 1d);
-            var normalizedY = fitBounds.Height <= 0
-                ? 0.5d : Math.Clamp((double)(anchor.Y - fitBounds.Top) / fitBounds.Height, 0d, 1d);
+            var normalizedX = spreadFitBounds.Width <= 0
+                ? 0.5d : Math.Clamp(
+                    (double)(anchor.X - spreadFitBounds.Left) / spreadFitBounds.Width, 0d, 1d);
+            var normalizedY = spreadFitBounds.Height <= 0
+                ? 0.5d : Math.Clamp(
+                    (double)(anchor.Y - spreadFitBounds.Top) / spreadFitBounds.Height, 0d, 1d);
             var width = Math.Max(1, (int)Math.Round(originalSize.Width * _zoomScale));
             var height = Math.Max(1, (int)Math.Round(originalSize.Height * _zoomScale));
             _zoomBaseBounds = new Rectangle(
@@ -1132,7 +1237,7 @@ internal sealed class AsyncViewerPanel : Panel
             Cursor = Cursors.Hand;
             _animationTimer.Stop();
             CancelRender();
-            _direct2DSurface.BeginZoom(useRight, _zoomBaseBounds);
+            BeginDirect2DZoom();
             ZoomModeChanged?.Invoke(this, true);
             if (Math.Abs(targetScale - _zoomScale) > 0.0001f)
                 StartZoomTransition(targetScale, anchor);
@@ -1162,6 +1267,14 @@ internal sealed class AsyncViewerPanel : Panel
         _zoomMode = false;
         _zoomPanning = false;
         _zoomPageIndex = -1;
+        _zoomLeftPageIndex = -1;
+        _zoomRightPageIndex = -1;
+        _zoomDualPage = false;
+        _zoomLeftOriginalSize = Size.Empty;
+        _zoomRightOriginalSize = Size.Empty;
+        _zoomLeftLogicalBounds = RectangleF.Empty;
+        _zoomRightLogicalBounds = RectangleF.Empty;
+        _zoomFitBounds = Rectangle.Empty;
         _zoomInteractionVersion++;
         FitToScreen = true;
         _zoomRenderDebounce.Stop();
@@ -1234,7 +1347,7 @@ internal sealed class AsyncViewerPanel : Panel
             _zoomScale = _zoomBaseBounds.Width /
                          (float)Math.Max(1, _zoomOriginalSize.Width);
             ReportZoomPercent();
-            _direct2DSurface.UpdateZoomLayout(_zoomBaseBounds, clearDetail: false);
+            UpdateDirect2DZoomLayout(clearDetail: false);
             if (!finishedBounds) return;
 
             _zoomTransitionTimer.Stop();
@@ -1265,7 +1378,7 @@ internal sealed class AsyncViewerPanel : Panel
             _zoomTransitionAnchor.Y - (int)Math.Round(_zoomTransitionSourceY * _zoomScale),
             width, height);
         ClampZoomBounds();
-        _direct2DSurface.UpdateZoomLayout(_zoomBaseBounds, clearDetail: false);
+        UpdateDirect2DZoomLayout(clearDetail: false);
     }
 
     private void ReportZoomPercent()
@@ -1297,7 +1410,7 @@ internal sealed class AsyncViewerPanel : Panel
         CancelAndDisposeZoomRender();
         RenderingStateChanged?.Invoke(this, false);
         ClearZoomDetail();
-        _zoomTransitionFitBounds = _zoomUseRightPage ? _right.Bounds : _left.Bounds;
+        _zoomTransitionFitBounds = _zoomFitBounds;
         if (_zoomTransitionFitBounds.Width <= 0 || _zoomTransitionFitBounds.Height <= 0)
         {
             ExitZoomMode();
@@ -1360,7 +1473,14 @@ internal sealed class AsyncViewerPanel : Panel
             bounds.Offset(actualOffset);
             patch.Bounds = bounds;
         }
-        _direct2DSurface.PanZoomLayout(_zoomBaseBounds, actualOffset);
+        if (_zoomDualPage)
+        {
+            var (leftBounds, rightBounds) = GetZoomSpreadPageBounds();
+            _direct2DSurface.PanZoomSpreadLayout(
+                leftBounds, rightBounds, actualOffset);
+        }
+        else
+            _direct2DSurface.PanZoomLayout(_zoomBaseBounds, actualOffset);
         PruneZoomDetailPatches();
     }
 
@@ -1379,6 +1499,48 @@ internal sealed class AsyncViewerPanel : Panel
         _zoomPanning = false;
         Cursor = Cursors.Hand;
         ScheduleZoomDetailRender();
+    }
+
+    private static RectangleF ToLogicalZoomBounds(
+        Rectangle pageBounds, Rectangle spreadBounds, double masterFitScale) =>
+        new(
+            (float)((pageBounds.Left - spreadBounds.Left) / masterFitScale),
+            (float)((pageBounds.Top - spreadBounds.Top) / masterFitScale),
+            (float)(pageBounds.Width / masterFitScale),
+            (float)(pageBounds.Height / masterFitScale));
+
+    private Rectangle ScaleLogicalZoomBounds(RectangleF logicalBounds) =>
+        new(
+            _zoomBaseBounds.Left + (int)Math.Round(logicalBounds.Left * _zoomScale),
+            _zoomBaseBounds.Top + (int)Math.Round(logicalBounds.Top * _zoomScale),
+            Math.Max(1, (int)Math.Round(logicalBounds.Width * _zoomScale)),
+            Math.Max(1, (int)Math.Round(logicalBounds.Height * _zoomScale)));
+
+    private (Rectangle Left, Rectangle Right) GetZoomSpreadPageBounds() =>
+        (ScaleLogicalZoomBounds(_zoomLeftLogicalBounds),
+            ScaleLogicalZoomBounds(_zoomRightLogicalBounds));
+
+    private void BeginDirect2DZoom()
+    {
+        if (_zoomDualPage)
+        {
+            var (leftBounds, rightBounds) = GetZoomSpreadPageBounds();
+            _direct2DSurface.BeginZoomSpread(leftBounds, rightBounds);
+        }
+        else
+            _direct2DSurface.BeginZoom(_zoomUseRightPage, _zoomBaseBounds);
+    }
+
+    private void UpdateDirect2DZoomLayout(bool clearDetail)
+    {
+        if (_zoomDualPage)
+        {
+            var (leftBounds, rightBounds) = GetZoomSpreadPageBounds();
+            _direct2DSurface.UpdateZoomSpreadLayout(
+                leftBounds, rightBounds, clearDetail);
+        }
+        else
+            _direct2DSurface.UpdateZoomLayout(_zoomBaseBounds, clearDetail);
     }
 
     private void ClampZoomBounds()
@@ -1406,6 +1568,16 @@ internal sealed class AsyncViewerPanel : Panel
         return pageIndex >= 0 && fitBounds.Width > 0 && fitBounds.Height > 0;
     }
 
+    private bool TryGetVisualPageIndices(out int leftPageIndex, out int rightPageIndex)
+    {
+        leftPageIndex = JapaneseMode ? _secondIndex : _firstIndex;
+        rightPageIndex = JapaneseMode ? _firstIndex : _secondIndex;
+        return _left.Visible && _right.Visible &&
+            leftPageIndex >= 0 && rightPageIndex >= 0 &&
+            _left.Bounds.Width > 0 && _left.Bounds.Height > 0 &&
+            _right.Bounds.Width > 0 && _right.Bounds.Height > 0;
+    }
+
     private static long DistanceSquared(Point point, Rectangle bounds)
     {
         var x = Math.Clamp(point.X, bounds.Left, bounds.Right);
@@ -1430,29 +1602,39 @@ internal sealed class AsyncViewerPanel : Panel
         var cancellation = new CancellationTokenSource();
         _zoomRenderCancellation = cancellation;
         var version = ++_zoomInteractionVersion;
-        var visible = Rectangle.Intersect(ClientRectangle, _zoomBaseBounds);
-        if (visible.Width <= 0 || visible.Height <= 0)
-        {
-            _zoomRenderCancellation = null;
-            cancellation.Dispose();
-            return;
-        }
-        var uncovered = GetUncoveredZoomAreas(visible);
-        if (uncovered.Count == 0)
-        {
-            _zoomRenderCancellation = null;
-            cancellation.Dispose();
-            return;
-        }
+        var pageLayouts = _zoomDualPage
+            ? new[]
+            {
+                (_zoomLeftPageIndex, _zoomLeftOriginalSize,
+                    GetZoomSpreadPageBounds().Left, RightPage: false),
+                (_zoomRightPageIndex, _zoomRightOriginalSize,
+                    GetZoomSpreadPageBounds().Right, RightPage: true)
+            }
+            : new[]
+            {
+                (_zoomPageIndex, _zoomOriginalSize, _zoomBaseBounds,
+                    RightPage: _zoomUseRightPage)
+            };
 
-        // Give Lanczos a tiny overlap into existing sharp pixels. This avoids a
-        // visible filter seam while still rendering only the newly exposed edge.
-        var requests = uncovered
-            .Select(area => Rectangle.Intersect(visible, Rectangle.Inflate(area, 2, 2)))
-            .Distinct()
-            .Select(CreateZoomCropRequest)
-            .Where(request => request.HasValue)
-            .Select(request => request!.Value)
+        // Give Lanczos a tiny overlap into existing sharp pixels. Each page is
+        // cropped in its own source coordinates, but both destinations share the
+        // spread transform and therefore remain locked together while zooming.
+        var requests = pageLayouts
+            .SelectMany(layout =>
+            {
+                var visible = Rectangle.Intersect(ClientRectangle, layout.Item3);
+                if (visible.Width <= 0 || visible.Height <= 0)
+                    return Enumerable.Empty<ZoomCropRequest>();
+                return GetUncoveredZoomAreas(visible)
+                    .Select(area => Rectangle.Intersect(
+                        visible, Rectangle.Inflate(area, 2, 2)))
+                    .Distinct()
+                    .Select(destination => CreateZoomCropRequest(
+                        layout.Item1, layout.Item2, layout.Item3,
+                        layout.RightPage, destination))
+                    .Where(request => request.HasValue)
+                    .Select(request => request!.Value);
+            })
             .ToArray();
         if (requests.Length == 0)
         {
@@ -1474,12 +1656,13 @@ internal sealed class AsyncViewerPanel : Panel
             cancellation.Token.ThrowIfCancellationRequested();
             if (!_zoomMode || version != _zoomInteractionVersion) return;
 
-            var fastPatches = new Dictionary<Rectangle, ZoomPatchSurface>();
+            var fastPatches = new Dictionary<ZoomCropRequest, ZoomPatchSurface>();
             foreach (var result in results)
             {
                 if (result.Surface is not { } surface) continue;
-                fastPatches[result.Request.Destination] = surface;
-                AddZoomPatch(surface, result.Request.Destination);
+                fastPatches[result.Request] = surface;
+                AddZoomPatch(
+                    surface, result.Request.Destination, result.Request.RightPage);
             }
             results = [];
 
@@ -1492,8 +1675,9 @@ internal sealed class AsyncViewerPanel : Panel
             foreach (var result in results)
             {
                 if (result.Surface is not { } surface) continue;
-                AddZoomPatch(surface, result.Request.Destination);
-                if (fastPatches.Remove(result.Request.Destination, out var fastSurface))
+                AddZoomPatch(
+                    surface, result.Request.Destination, result.Request.RightPage);
+                if (fastPatches.Remove(result.Request, out var fastSurface))
                     RemoveZoomDetailPatch(fastSurface);
             }
             results = [];
@@ -1525,7 +1709,7 @@ internal sealed class AsyncViewerPanel : Panel
         try
         {
             var bitmap = await renderer(
-                _zoomPageIndex, request.Source, request.Destination.Size,
+                request.PageIndex, request.Source, request.Destination.Size,
                 fastPreview, cancellationToken);
             return (request, bitmap);
         }
@@ -1537,20 +1721,26 @@ internal sealed class AsyncViewerPanel : Panel
         }
     }
 
-    private ZoomCropRequest? CreateZoomCropRequest(Rectangle destination)
+    private ZoomCropRequest? CreateZoomCropRequest(
+        int pageIndex, Size originalSize, Rectangle pageBounds,
+        bool rightPage, Rectangle destination)
     {
         var sourceLeft = Math.Max(0, (int)Math.Floor(
-            (destination.Left - _zoomBaseBounds.Left) / (double)_zoomScale));
+            (destination.Left - pageBounds.Left) /
+            Math.Max(0.0001d, pageBounds.Width / (double)originalSize.Width)));
         var sourceTop = Math.Max(0, (int)Math.Floor(
-            (destination.Top - _zoomBaseBounds.Top) / (double)_zoomScale));
-        var sourceRight = Math.Min(_zoomOriginalSize.Width, (int)Math.Ceiling(
-            (destination.Right - _zoomBaseBounds.Left) / (double)_zoomScale));
-        var sourceBottom = Math.Min(_zoomOriginalSize.Height, (int)Math.Ceiling(
-            (destination.Bottom - _zoomBaseBounds.Top) / (double)_zoomScale));
+            (destination.Top - pageBounds.Top) /
+            Math.Max(0.0001d, pageBounds.Height / (double)originalSize.Height)));
+        var sourceRight = Math.Min(originalSize.Width, (int)Math.Ceiling(
+            (destination.Right - pageBounds.Left) /
+            Math.Max(0.0001d, pageBounds.Width / (double)originalSize.Width)));
+        var sourceBottom = Math.Min(originalSize.Height, (int)Math.Ceiling(
+            (destination.Bottom - pageBounds.Top) /
+            Math.Max(0.0001d, pageBounds.Height / (double)originalSize.Height)));
         var source = Rectangle.FromLTRB(sourceLeft, sourceTop, sourceRight, sourceBottom);
         return source.Width > 0 && source.Height > 0 &&
             destination.Width > 0 && destination.Height > 0
-            ? new ZoomCropRequest(source, destination)
+            ? new ZoomCropRequest(pageIndex, source, destination, rightPage)
             : null;
     }
 
@@ -1609,11 +1799,14 @@ internal sealed class AsyncViewerPanel : Panel
         _zoomDetailPatches.Clear();
     }
 
-    private void AddZoomPatch(ZoomPatchSurface surface, Rectangle bounds)
+    private void AddZoomPatch(
+        ZoomPatchSurface surface, Rectangle bounds, bool rightPage)
     {
-        _zoomDetailPatches.Add(new ZoomDetailPatch(surface, bounds));
-        if (surface.Gpu is { } gpu) _direct2DSurface.AddZoomDetailGpu(gpu, bounds);
-        else if (surface.Bitmap is { } bitmap) _direct2DSurface.AddZoomDetail(bitmap, bounds);
+        _zoomDetailPatches.Add(new ZoomDetailPatch(surface, bounds, rightPage));
+        if (surface.Gpu is { } gpu)
+            _direct2DSurface.AddZoomDetailGpu(gpu, bounds, rightPage);
+        else if (surface.Bitmap is { } bitmap)
+            _direct2DSurface.AddZoomDetail(bitmap, bounds, rightPage);
     }
 
     private void RemoveZoomSurfaceFromRenderer(ZoomPatchSurface surface)
@@ -1760,6 +1953,20 @@ internal sealed class AsyncViewerPanel : Panel
 
     private async void BeginRender()
     {
+        try { await BeginRenderCoreAsync(); }
+        catch (OperationCanceledException) { }
+        catch (Exception exception)
+        {
+            // This is the only async-void boundary. Keeping the complete render
+            // pipeline behind it prevents any pre-await layout/cache exception
+            // from escaping into the WinForms message loop.
+            ExtendedDiagnostics.LogException("Full-view render boundary failed", exception,
+                $"first={_firstIndex}; second={_secondIndex}; version={_renderVersion}");
+        }
+    }
+
+    private async Task BeginRenderCoreAsync()
+    {
         if (IsDisposed || Disposing) return;
         CancelRender();
         var cancellation = new CancellationTokenSource();
@@ -1788,9 +1995,26 @@ internal sealed class AsyncViewerPanel : Panel
         var renderKeys = pageKeys.Select((key, index) => key is null || sizes[index].IsEmpty
             ? null : new RenderKey(pageIndices[index], key, sizes[index].Width, sizes[index].Height,
                 visible, _renderContextVersion)).ToArray();
-        var qualityRendered = await Task.WhenAll(renderKeys.Select(key => key is null
-            ? Task.FromResult<Bitmap?>(null)
-            : GetRenderCloneAsync(key, cancellation.Token)));
+        Bitmap?[] qualityRendered;
+        try
+        {
+            qualityRendered = await Task.WhenAll(renderKeys.Select(key => key is null
+                ? Task.FromResult<Bitmap?>(null)
+                : GetRenderCloneAsync(key, cancellation.Token)));
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+        catch (Exception exception)
+        {
+            // BeginRender is an async-void UI entry point. Every awaited operation
+            // must be guarded or its exception is reposted to the WinForms message
+            // loop and terminates the process.
+            ExtendedDiagnostics.LogException("Full-view cached render lookup failed", exception,
+                $"first={_firstIndex}; second={_secondIndex}; version={version}/{_renderVersion}");
+            return;
+        }
         if (cancellation.IsCancellationRequested || version != _renderVersion || IsDisposed)
         {
             foreach (var rendered in qualityRendered) RetireSource(rendered);
@@ -1846,10 +2070,10 @@ internal sealed class AsyncViewerPanel : Panel
             }
 
             var leftTask = qualityRendered[0] is not null ? Task.FromResult(qualityRendered[0]) :
-                RenderWorkScheduler.RunFullAsync(() => ResizeLanczos(
+                RenderWorkScheduler.RunInteractiveFullAsync(() => ResizeLanczos(
                     renderSources[0], sizes[0], _lanczosQuality, cancellation.Token), cancellation.Token);
             var rightTask = qualityRendered[1] is not null ? Task.FromResult(qualityRendered[1]) :
-                RenderWorkScheduler.RunFullAsync(() => ResizeLanczos(
+                RenderWorkScheduler.RunInteractiveFullAsync(() => ResizeLanczos(
                     renderSources[1], sizes[1], _lanczosQuality, cancellation.Token), cancellation.Token);
             qualityTasksOwnResults = true;
             qualityRendered = await AwaitBitmapTasksOwnedAsync([leftTask, rightTask]);
@@ -1878,6 +2102,8 @@ internal sealed class AsyncViewerPanel : Panel
             // BeginRender is an async UI event path. Never allow a worker-side
             // decode/resample failure to escape it and terminate the WinForms app.
             System.Diagnostics.Debug.WriteLine($"Page render failed: {exception}");
+            ExtendedDiagnostics.LogException("Full-view page render failed", exception,
+                $"first={_firstIndex}; second={_secondIndex}; version={version}/{_renderVersion}");
         }
         finally
         {
@@ -1891,24 +2117,33 @@ internal sealed class AsyncViewerPanel : Panel
 
     private static Size CalculateSize(
         Image source, int targetWidth, int availableHeight, bool fitToScreen, float zoom)
+        => CalculateSize(source.Width, source.Height, targetWidth,
+            availableHeight, fitToScreen, zoom);
+
+    private static Size CalculateSize(
+        int sourceWidth, int sourceHeight, int targetWidth, int availableHeight,
+        bool fitToScreen, float zoom)
     {
         var scale = fitToScreen
-            ? Math.Min((float)targetWidth / source.Width, (float)availableHeight / source.Height)
+            ? Math.Min((float)targetWidth / sourceWidth,
+                (float)availableHeight / sourceHeight)
             : zoom;
         scale = Math.Max(0.02f, scale);
-        return new Size(Math.Max(1, (int)(source.Width * scale)), Math.Max(1, (int)(source.Height * scale)));
+        return new Size(Math.Max(1, (int)(sourceWidth * scale)),
+            Math.Max(1, (int)(sourceHeight * scale)));
     }
 
     private void RelayoutDisplayedFrame()
     {
         if (!FitToScreen) return;
-        // Use the bitmap aspect ratio, not proxy bounds captured during an
-        // earlier/incomplete layout pass.
+        // Use the displayed source aspect ratio, not proxy bounds captured
+        // during an earlier layout pass. GPU and borrowed cached frames do not
+        // retain a CPU bitmap, but must still fill the current viewport.
         var visible = new[]
         {
-            (Box: _left, Source: _leftRendered),
-            (Box: _right, Source: _rightRendered)
-        }.Where(item => item.Box.Visible && item.Source is not null).ToArray();
+            (Box: _left, SourceSize: _leftDisplayedSourceSize),
+            (Box: _right, SourceSize: _rightDisplayedSourceSize)
+        }.Where(item => item.Box.Visible && !item.SourceSize.IsEmpty).ToArray();
         if (visible.Length == 0) return;
 
         const int gap = 10;
@@ -1917,7 +2152,7 @@ internal sealed class AsyncViewerPanel : Panel
         var targetWidth = visible.Length == 2 ? availableWidth / 2 : availableWidth;
         var sizes = visible.Select(item =>
         {
-            var source = item.Source!;
+            var source = item.SourceSize;
             var scale = Math.Min((float)targetWidth / source.Width,
                 (float)availableHeight / source.Height);
             return new Size(Math.Max(1, (int)Math.Round(source.Width * scale)),
@@ -2256,10 +2491,16 @@ internal sealed class AsyncViewerPanel : Panel
                 ? new[] { second?.Image, first.Image }
                 : new[] { first.Image, second?.Image };
             const int gap = 10;
+            var availableWidth = Math.Max(100, ClientSize.Width - gap * 3);
             var availableHeight = Math.Max(100, ClientSize.Height - gap * 2);
+            var targetWidth = visiblePageCount == 2
+                ? availableWidth / 2 : availableWidth;
             var sizes = rendered.Select(image => image is null
-                ? Size.Empty : new Size(image.Width, image.Height)).ToArray();
-            ApplyRenderedGpu(rendered[0], rendered[1], sizes, availableHeight, gap);
+                ? Size.Empty
+                : CalculateSize(image.Width, image.Height, targetWidth,
+                    availableHeight, fitToScreen: true, zoom: 1f)).ToArray();
+            if (!ApplyRenderedGpu(rendered[0], rendered[1], sizes, availableHeight, gap))
+                return false;
             _displayedPreview = firstPreview || secondPreview;
             RenderingStateChanged?.Invoke(this, false);
             return true;
@@ -2279,12 +2520,16 @@ internal sealed class AsyncViewerPanel : Panel
         }
     }
 
-    private void ApplyRenderedGpu(
+    private bool ApplyRenderedGpu(
         GpuRenderedImage? left, GpuRenderedImage? right, Size[] sizes,
         int availableHeight, int gap)
     {
         _loadingPlaceholder.Visible = false;
         DisposeRendered(clearSurface: false);
+        _leftDisplayedSourceSize = left is null
+            ? Size.Empty : new Size(left.Width, left.Height);
+        _rightDisplayedSourceSize = right is null
+            ? Size.Empty : new Size(right.Width, right.Height);
         var boxes = new[] { _left, _right };
         var visibleSizes = sizes.Where(size => !size.IsEmpty).ToArray();
         var contentWidth = visibleSizes.Sum(size => size.Width) +
@@ -2309,8 +2554,10 @@ internal sealed class AsyncViewerPanel : Panel
             AutoScrollMinSize = Size.Empty;
         }
         finally { ResumeLayout(false); }
-        _direct2DSurface.PresentGpu(left, right, _left.Bounds, _right.Bounds);
+        var presented = _direct2DSurface.PresentGpu(
+            left, right, _left.Bounds, _right.Bounds);
         _displayedContextVersion = _renderContextVersion;
+        return presented;
     }
 
     private void ApplyRendered(
@@ -2321,6 +2568,8 @@ internal sealed class AsyncViewerPanel : Panel
         DisposeRendered(clearSurface: false);
         _leftRendered = retainBitmaps ? left : null;
         _rightRendered = retainBitmaps ? right : null;
+        _leftDisplayedSourceSize = left?.Size ?? Size.Empty;
+        _rightDisplayedSourceSize = right?.Size ?? Size.Empty;
         var boxes = new[] { _left, _right };
         var visibleSizes = sizes.Where(size => !size.IsEmpty).ToArray();
         var contentWidth = visibleSizes.Sum(size => size.Width) + Math.Max(0, visibleSizes.Length - 1) * gap;
@@ -2390,7 +2639,8 @@ internal sealed class AsyncViewerPanel : Panel
     {
         try { await cancellation.CancelAsync().ConfigureAwait(false); }
         catch (ObjectDisposedException) { }
-        finally { cancellation.Dispose(); }
+        // Render continuations may still read Token after cancellation. Let GC
+        // reclaim the source after those continuations release their reference.
     }
 
     private void AcquireSource(Image? source)
@@ -2441,6 +2691,8 @@ internal sealed class AsyncViewerPanel : Panel
         RetireSource(_rightRendered);
         _leftRendered = null;
         _rightRendered = null;
+        _leftDisplayedSourceSize = Size.Empty;
+        _rightDisplayedSourceSize = Size.Empty;
     }
 
     private bool ContainsRender(RenderKey key)
@@ -2460,7 +2712,8 @@ internal sealed class AsyncViewerPanel : Panel
     {
         var lookup = new RenderLookupKey(pageIndex, pageKey, visiblePageCount, _renderContextVersion);
         if (!_gpuRenderLookup.TryGetValue(lookup, out var key) ||
-            !_gpuRenderCache.TryGetValue(key, out var item)) return null;
+            !_gpuRenderCache.TryGetValue(key, out var item) ||
+            item.Image.DeviceGeneration != GpuInteropDevice.Generation) return null;
         item.ActiveReaders++;
         item.Sequence = Interlocked.Increment(ref _renderCacheSequence);
         return item;
@@ -2471,7 +2724,8 @@ internal sealed class AsyncViewerPanel : Panel
     {
         var lookup = new RenderLookupKey(pageIndex, pageKey, visiblePageCount, _renderContextVersion);
         if (!_gpuPreviewLookup.TryGetValue(lookup, out var key) ||
-            !_gpuPreviewCache.TryGetValue(key, out var item)) return null;
+            !_gpuPreviewCache.TryGetValue(key, out var item) ||
+            item.Image.DeviceGeneration != GpuInteropDevice.Generation) return null;
         item.ActiveReaders++;
         item.Sequence = Interlocked.Increment(ref _renderCacheSequence);
         return item;
@@ -2600,13 +2854,25 @@ internal sealed class AsyncViewerPanel : Panel
 
     private bool AddGpuRenderOwned(RenderKey key, GpuRenderedImage image)
     {
-        if (key.ContextVersion != Volatile.Read(ref _renderContextVersion)) return false;
+        if (key.ContextVersion != Volatile.Read(ref _renderContextVersion) ||
+            image.DeviceGeneration != GpuInteropDevice.Generation) return false;
+        GpuRenderedImage? stale = null;
         lock (_renderCacheGate)
         {
             if (_gpuRenderCache.TryGetValue(key, out var existing))
             {
-                existing.Sequence = Interlocked.Increment(ref _renderCacheSequence);
-                return false;
+                if (existing.Image.DeviceGeneration == GpuInteropDevice.Generation)
+                {
+                    existing.Sequence = Interlocked.Increment(ref _renderCacheSequence);
+                    return false;
+                }
+                _gpuRenderCache.Remove(key);
+                _gpuRenderLookup.Remove(new RenderLookupKey(
+                    key.PageIndex, key.PageKey, key.VisiblePageCount, key.ContextVersion));
+                _renderCacheBytes -= existing.Bytes;
+                SubtractRenderStats(key, existing.Bytes);
+                existing.Retired = true;
+                if (existing.ActiveReaders == 0) stale = existing.Image;
             }
             var item = new GpuRenderCacheItem(
                 image, Interlocked.Increment(ref _renderCacheSequence));
@@ -2619,8 +2885,9 @@ internal sealed class AsyncViewerPanel : Panel
                 (key.ContextVersion, key.PageIndex, key.PageKey), item.Bytes, (_, bytes) => bytes + item.Bytes);
             _cachedPageCounts.AddOrUpdate(
                 (key.ContextVersion, key.PageIndex, key.PageKey), 1, (_, count) => count + 1);
-            return true;
         }
+        stale?.Dispose();
+        return true;
     }
 
     private bool AddPreviewOwned(RenderKey key, Bitmap bitmap)
@@ -2646,13 +2913,24 @@ internal sealed class AsyncViewerPanel : Panel
     private bool AddGpuPreviewOwned(RenderKey key, GpuRenderedImage image)
     {
         if (Volatile.Read(ref _previewCacheLimitBytes) <= 0 ||
-            key.ContextVersion != Volatile.Read(ref _renderContextVersion)) return false;
+            key.ContextVersion != Volatile.Read(ref _renderContextVersion) ||
+            image.DeviceGeneration != GpuInteropDevice.Generation) return false;
+        GpuRenderedImage? stale = null;
         lock (_previewCacheGate)
         {
             if (_gpuPreviewCache.TryGetValue(key, out var existing))
             {
-                existing.Sequence = Interlocked.Increment(ref _renderCacheSequence);
-                return false;
+                if (existing.Image.DeviceGeneration == GpuInteropDevice.Generation)
+                {
+                    existing.Sequence = Interlocked.Increment(ref _renderCacheSequence);
+                    return false;
+                }
+                _gpuPreviewCache.Remove(key);
+                _gpuPreviewLookup.Remove(new RenderLookupKey(
+                    key.PageIndex, key.PageKey, key.VisiblePageCount, key.ContextVersion));
+                _previewCacheBytes -= existing.Bytes;
+                existing.Retired = true;
+                if (existing.ActiveReaders == 0) stale = existing.Image;
             }
             var item = new GpuRenderCacheItem(
                 image, Interlocked.Increment(ref _renderCacheSequence));
@@ -2660,8 +2938,9 @@ internal sealed class AsyncViewerPanel : Panel
             _gpuPreviewLookup[new RenderLookupKey(
                 key.PageIndex, key.PageKey, key.VisiblePageCount, key.ContextVersion)] = key;
             _previewCacheBytes += item.Bytes;
-            return true;
         }
+        stale?.Dispose();
+        return true;
     }
 
     // Called while _renderCacheGate is held. Readers enumerate the concurrent

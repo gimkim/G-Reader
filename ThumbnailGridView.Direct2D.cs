@@ -23,11 +23,24 @@ internal sealed partial class ThumbnailGridView
         public LinkedListNode<Bitmap> LruNode { get; } = lruNode;
     }
     private sealed class NativeThumbnailGpuCacheItem(
-        ID2D1Bitmap texture, long bytes, LinkedListNode<GpuRenderedImage> lruNode)
+        ID2D1Bitmap texture, GpuRenderedImage.UsageLease usage,
+        long bytes, LinkedListNode<GpuRenderedImage> lruNode) : IDisposable
     {
         public ID2D1Bitmap Texture { get; } = texture;
         public long Bytes { get; } = bytes;
         public LinkedListNode<GpuRenderedImage> LruNode { get; } = lruNode;
+        public void Dispose()
+        {
+            try { Texture.Dispose(); }
+            finally { usage.Dispose(); }
+        }
+    }
+    private sealed class RetiredThumbnailGpuBatch(
+        Queue<(IDisposable Resource, long Bytes)> resources,
+        TaskCompletionSource completion)
+    {
+        public Queue<(IDisposable Resource, long Bytes)> Resources { get; } = resources;
+        public TaskCompletionSource Completion { get; } = completion;
     }
 
     private const long MinimumGpuCacheBytes = 64L * 1024 * 1024;
@@ -67,6 +80,10 @@ internal sealed partial class ThumbnailGridView
     private readonly LinkedList<GpuRenderedImage> _nativeThumbnailGpuLru = [];
     private readonly System.Windows.Forms.Timer _thumbnailGpuUploadTimer = new() { Interval = 16 };
     private readonly System.Windows.Forms.Timer _thumbnailGpuTrimTimer = new() { Interval = 650 };
+    private readonly System.Windows.Forms.Timer _thumbnailGpuRetireTimer = new() { Interval = 30 };
+    private readonly System.Windows.Forms.Timer _thumbnailDeviceRecoveryTimer = new() { Interval = 50 };
+    private readonly System.Windows.Forms.Timer _thumbnailPresentRetryTimer = new() { Interval = 8 };
+    private readonly Queue<RetiredThumbnailGpuBatch> _retiredThumbnailGpuBatches = [];
     private readonly Dictionary<string, ID2D1ColorContext> _thumbnailColorContexts = [];
     private readonly Dictionary<ID2D1Bitmap, ID2D1Effect> _thumbnailColorEffects =
         new(ReferenceEqualityComparer.Instance);
@@ -81,6 +98,7 @@ internal sealed partial class ThumbnailGridView
     private IDWriteTextFormat _thumbnailPlaceholderFormat = null!;
     private ID2D1HwndRenderTarget? _thumbnailRenderTarget;
     private ID2D1Device? _thumbnailD2DDevice;
+    private GpuInteropDevice.DeviceUsageLease? _thumbnailSharedDeviceUsage;
     private ID2D1DeviceContext? _thumbnailDeviceContext;
     private IDXGISwapChain1? _thumbnailSwapChain;
     private ID2D1Bitmap1? _thumbnailSwapChainTarget;
@@ -114,6 +132,13 @@ internal sealed partial class ThumbnailGridView
 
     private long _thumbnailGpuCacheBytes;
     private long _thumbnailGpuCacheLimitBytes = 256L * 1024 * 1024;
+    private long _retiredGpuNotBeforeTick;
+    private int _gpuSourceRecoveryPending;
+    private int _thumbnailDeviceRecoveryAttempt;
+    private int _thumbnailPresentBusyCount;
+    private long _thumbnailPresentBusySince;
+    private bool _thumbnailSharedDeviceResetRequired;
+    private long _thumbnailDeviceGeneration = -1;
     private double _measuredUploadBytesPerSecond = 2.0 * 1024 * 1024 * 1024;
     private long _lastScrollingPresentTick;
 
@@ -123,10 +148,11 @@ internal sealed partial class ThumbnailGridView
             Vortice.Direct2D1.FactoryType.SingleThreaded, DebugLevel.None);
         _thumbnailWriteFactory = Vortice.DirectWrite.DWrite.DWriteCreateFactory<IDWriteFactory>(
             Vortice.DirectWrite.FactoryType.Shared);
-        _thumbnailNameFormat = CreateTextFormat(11.5f, FontWeight.Normal, noWrap: false);
-        _thumbnailNumberFormat = CreateTextFormat(11f, FontWeight.Bold, noWrap: true);
-        _thumbnailIconFormat = CreateTextFormat(13f, FontWeight.Bold, noWrap: true);
-        _thumbnailPlaceholderFormat = CreateTextFormat(12f, FontWeight.Normal, noWrap: false);
+        _thumbnailNameFormat = CreateTextFormat(13f, FontWeight.Bold, noWrap: false);
+        _thumbnailNameFormat.TextAlignment = Vortice.DirectWrite.TextAlignment.Leading;
+        _thumbnailNumberFormat = CreateTextFormat(10f, FontWeight.Bold, noWrap: true);
+        _thumbnailIconFormat = CreateTextFormat(12f, FontWeight.Bold, noWrap: true);
+        _thumbnailPlaceholderFormat = CreateTextFormat(11f, FontWeight.Normal, noWrap: false);
 
         _thumbnailGpuUploadTimer.Tick += (_, _) =>
         {
@@ -137,6 +163,13 @@ internal sealed partial class ThumbnailGridView
         {
             _thumbnailGpuTrimTimer.Stop();
             TrimGpuTextureCache();
+        };
+        _thumbnailGpuRetireTimer.Tick += (_, _) => DrainRetiredGpuResources();
+        _thumbnailDeviceRecoveryTimer.Tick += (_, _) => RecoverThumbnailDeviceResources();
+        _thumbnailPresentRetryTimer.Tick += (_, _) =>
+        {
+            _thumbnailPresentRetryTimer.Stop();
+            if (!IsDisposed && !Disposing && IsHandleCreated) Invalidate();
         };
     }
 
@@ -189,6 +222,20 @@ internal sealed partial class ThumbnailGridView
 
     private void EnsureThumbnailRenderTarget()
     {
+        if (_thumbnailSharedDeviceResetRequired)
+        {
+            if (ThumbnailTarget is not null) DiscardThumbnailDeviceResources();
+            return;
+        }
+        if (_thumbnailDeviceContext is not null &&
+            _thumbnailDeviceGeneration != GpuInteropDevice.Generation)
+        {
+            ExtendedDiagnostics.Breadcrumb(
+                $"Thumbnail Direct2D generation changed: " +
+                $"old={_thumbnailDeviceGeneration}; " +
+                $"new={GpuInteropDevice.Generation}");
+            DiscardThumbnailDeviceResources();
+        }
         if (ThumbnailTarget is not null || !IsHandleCreated ||
             ClientSize.Width <= 0 || ClientSize.Height <= 0) return;
 
@@ -216,7 +263,9 @@ internal sealed partial class ThumbnailGridView
 
     private bool TryCreateThumbnailDeviceContext()
     {
-        if (GpuInteropDevice.Device is not { } d3dDevice) return false;
+        var deviceUsage = GpuInteropDevice.AcquireUsage();
+        if (deviceUsage is null) return false;
+        var d3dDevice = deviceUsage.Device;
         try
         {
             using var dxgiDevice = d3dDevice.QueryInterface<IDXGIDevice>();
@@ -239,6 +288,9 @@ internal sealed partial class ThumbnailGridView
                     d3dDevice, Handle, description);
             }
             RecreateThumbnailSwapChainTarget(resize: false);
+            _thumbnailSharedDeviceUsage = deviceUsage;
+            deviceUsage = null;
+            _thumbnailDeviceGeneration = _thumbnailSharedDeviceUsage.Generation;
             return _thumbnailSwapChainTarget is not null;
         }
         catch
@@ -246,6 +298,7 @@ internal sealed partial class ThumbnailGridView
             DisposeThumbnailDeviceContext();
             return false;
         }
+        finally { deviceUsage?.Dispose(); }
     }
 
     private void RecreateThumbnailSwapChainTarget(bool resize)
@@ -290,16 +343,16 @@ internal sealed partial class ThumbnailGridView
     private void CreateThumbnailDeviceBrushes()
     {
         if (ThumbnailTarget is not { } target) return;
-        _normalTileBrush = target.CreateSolidColorBrush(Color(42, 45, 52));
-        _selectedTileBrush = target.CreateSolidColorBrush(Color(65, 103, 170));
-        _tileBorderBrush = target.CreateSolidColorBrush(Color(78, 82, 92));
-        _selectedBorderBrush = target.CreateSolidColorBrush(Color(107, 166, 255));
-        _textBrush = target.CreateSolidColorBrush(Color(220, 220, 220));
-        _mutedTextBrush = target.CreateSolidColorBrush(Color(170, 180, 196));
-        _badgeBrush = target.CreateSolidColorBrush(Color(20, 22, 27, 205));
-        _badgeBorderBrush = target.CreateSolidColorBrush(Color(160, 170, 190, 125));
-        _placeholderBrushD2D = target.CreateSolidColorBrush(Color(34, 37, 44));
-        _placeholderBorderBrushD2D = target.CreateSolidColorBrush(Color(82, 89, 103));
+        _normalTileBrush = target.CreateSolidColorBrush(Color(23, 34, 51));
+        _selectedTileBrush = target.CreateSolidColorBrush(Color(29, 60, 96));
+        _tileBorderBrush = target.CreateSolidColorBrush(Color(42, 59, 80));
+        _selectedBorderBrush = target.CreateSolidColorBrush(Color(111, 178, 255));
+        _textBrush = target.CreateSolidColorBrush(Color(231, 239, 249));
+        _mutedTextBrush = target.CreateSolidColorBrush(Color(145, 168, 193));
+        _badgeBrush = target.CreateSolidColorBrush(Color(10, 21, 35, 225));
+        _badgeBorderBrush = target.CreateSolidColorBrush(Color(111, 178, 255, 145));
+        _placeholderBrushD2D = target.CreateSolidColorBrush(Color(20, 32, 51));
+        _placeholderBorderBrushD2D = target.CreateSolidColorBrush(Color(47, 67, 91));
         _folderBrushD2D = target.CreateSolidColorBrush(Color(224, 174, 65));
         _parentFolderBrushD2D = target.CreateSolidColorBrush(Color(111, 151, 205));
         _archiveBrushD2D = target.CreateSolidColorBrush(Color(103, 137, 188));
@@ -311,9 +364,9 @@ internal sealed partial class ThumbnailGridView
         _cb7BrushD2D = target.CreateSolidColorBrush(Color(86, 154, 92));
         _pdfBrushD2D = target.CreateSolidColorBrush(Color(198, 72, 72));
         _iconBorderBrushD2D = target.CreateSolidColorBrush(Color(235, 238, 244));
-        _scrollTrackBrush = target.CreateSolidColorBrush(Color(8, 10, 14, 48));
-        _scrollThumbBrush = target.CreateSolidColorBrush(Color(170, 188, 218, 155));
-        _scrollThumbActiveBrush = target.CreateSolidColorBrush(Color(185, 202, 231, 220));
+        _scrollTrackBrush = target.CreateSolidColorBrush(Color(7, 13, 23, 90));
+        _scrollThumbBrush = target.CreateSolidColorBrush(Color(111, 178, 255, 150));
+        _scrollThumbActiveBrush = target.CreateSolidColorBrush(Color(137, 193, 255, 220));
     }
 
     private void DrawDirect2DThumbnailFrame()
@@ -328,7 +381,7 @@ internal sealed partial class ThumbnailGridView
         try
         {
             target.BeginDraw();
-            target.Clear(Color(26, 28, 33));
+            target.Clear(Color(13, 19, 30));
             if (ItemCount > 0)
             {
                 var scrollY = ScrollOffset;
@@ -347,21 +400,87 @@ internal sealed partial class ThumbnailGridView
                             ref uploadBudget, ref pendingUploads);
                     }
             }
+            if (!string.IsNullOrWhiteSpace(_emptyMessage))
+            {
+                var messageBounds = new Rectangle(
+                    Math.Max(16, ClientSize.Width / 8),
+                    Math.Max(16, ClientSize.Height / 3),
+                    Math.Max(1, ClientSize.Width * 3 / 4),
+                    Math.Max(1, ClientSize.Height / 3));
+                DrawDirect2DText(_emptyMessage, messageBounds,
+                    _thumbnailNameFormat, _mutedTextBrush!);
+            }
             DrawDirect2DScrollbar();
             var result = target.EndDraw();
             if (result.Failure)
             {
+                var deviceRemoved = GpuInteropDevice.TryGetDeviceRemovalReason(
+                    out var removalReason);
+                ExtendedDiagnostics.Breadcrumb(
+                    $"Thumbnail Direct2D EndDraw failed: {result}; " +
+                    $"deviceRemoved={deviceRemoved}; removalReason={removalReason}");
                 DiscardThumbnailDeviceResources();
-                Invalidate();
+                ScheduleThumbnailDeviceRecovery(
+                    "EndDraw", recreateSharedDevice: deviceRemoved);
                 return;
             }
             if (_thumbnailSwapChain is not null)
-                _thumbnailSwapChain.Present(0, PresentFlags.None);
+            {
+                // Painting runs on the UI thread. Never wait inside the display
+                // driver when the GPU queue is saturated; retry the latest frame.
+                var presentResult = _thumbnailSwapChain.Present(0, PresentFlags.DoNotWait);
+                if (presentResult == Vortice.DXGI.ResultCode.WasStillDrawing)
+                {
+                    if (_thumbnailPresentBusyCount++ == 0)
+                        _thumbnailPresentBusySince = Stopwatch.GetTimestamp();
+                    var busyMilliseconds = (Stopwatch.GetTimestamp() -
+                        _thumbnailPresentBusySince) * 1000d / Stopwatch.Frequency;
+                    if (_thumbnailPresentBusyCount >= 16 && busyMilliseconds >= 750d)
+                    {
+                        var deviceRemoved = GpuInteropDevice.TryGetDeviceRemovalReason(
+                            out var removalReason);
+                        ExtendedDiagnostics.Breadcrumb(
+                            $"Thumbnail DXGI Present remained busy: " +
+                            $"retries={_thumbnailPresentBusyCount}; " +
+                            $"elapsedMs={busyMilliseconds:F0}; " +
+                            $"deviceRemoved={deviceRemoved}; " +
+                            $"removalReason={removalReason}");
+                        _thumbnailPresentBusyCount = 0;
+                        _thumbnailPresentBusySince = 0;
+                        DiscardThumbnailDeviceResources();
+                        ScheduleThumbnailDeviceRecovery(
+                            "Present remained busy", recreateSharedDevice: deviceRemoved);
+                        return;
+                    }
+                    _thumbnailPresentRetryTimer.Stop();
+                    _thumbnailPresentRetryTimer.Start();
+                    return;
+                }
+                _thumbnailPresentBusyCount = 0;
+                _thumbnailPresentBusySince = 0;
+                if (presentResult.Failure)
+                {
+                    var deviceRemoved = GpuInteropDevice.TryGetDeviceRemovalReason(
+                        out var removalReason);
+                    ExtendedDiagnostics.Breadcrumb(
+                        $"Thumbnail DXGI Present failed: {presentResult.Code}; " +
+                        $"deviceRemoved={deviceRemoved}; removalReason={removalReason}");
+                    DiscardThumbnailDeviceResources();
+                    ScheduleThumbnailDeviceRecovery(
+                        $"Present {presentResult.Code}", recreateSharedDevice: deviceRemoved);
+                    return;
+                }
+            }
         }
-        catch
+        catch (Exception exception)
         {
+            var deviceRemoved = IsGpuDeviceRemoval(exception) ||
+                GpuInteropDevice.TryGetDeviceRemovalReason(out _);
+            ExtendedDiagnostics.LogException(
+                "Thumbnail Direct2D frame failed", exception);
             DiscardThumbnailDeviceResources();
-            Invalidate();
+            ScheduleThumbnailDeviceRecovery(
+                "frame exception", recreateSharedDevice: deviceRemoved);
             return;
         }
 
@@ -393,35 +512,41 @@ internal sealed partial class ThumbnailGridView
         ref bool pendingUploads)
     {
         var target = ThumbnailTarget!;
-        var selected = item == _selectedItem;
-        target.FillRectangle(ToRect(bounds), selected ? _selectedTileBrush! : _normalTileBrush!);
-        target.DrawRectangle(ToRect(bounds), selected ? _selectedBorderBrush! : _tileBorderBrush!,
-            selected ? 2f : 1f);
+        var selected = IsItemSelected(item);
+        var active = item == _selectedItem;
+        var card = new RoundedRectangle(
+            new RectangleF(bounds.X, bounds.Y, bounds.Width, bounds.Height), 8f, 8f);
+        target.FillRoundedRectangle(card,
+            selected ? _selectedTileBrush! : _normalTileBrush!);
+        target.DrawRoundedRectangle(card,
+            selected ? _selectedBorderBrush! : _tileBorderBrush!,
+            active ? 2.5f : selected ? 1.8f : 1f);
 
         var browseItem = item < _folders.Length;
         // Browse entries still allow several wrapped filename lines, but avoid
         // reserving a tall empty strip between the preview and its label.
-        var labelHeight = browseItem ? 48 : 34;
-        var imageArea = Rectangle.Inflate(bounds, browseItem ? -4 : -8,
-            browseItem ? -4 : -8);
+        var labelHeight = browseItem ? 42 : 30;
+        var imageArea = Rectangle.Inflate(bounds, browseItem ? -5 : -7,
+            browseItem ? -5 : -7);
         imageArea.Height -= labelHeight;
         if (browseItem)
         {
+            var browseSource = _folderSourceIndices[item];
             using var browseGpuFull = _gpuBrowseFullPreviewCache.AcquireBest(
-                item, _renderTargetSize);
+                browseSource, _renderTargetSize);
             using var browseGpuFast = _gpuBrowseFastPreviewCache.AcquireBest(
-                item, _renderTargetSize);
+                browseSource, _renderTargetSize);
             using var browseFull = _browseFullPreviewCache.AcquireBest(
-                item, _renderTargetSize);
+                browseSource, _renderTargetSize);
             using var browseFast = _browseFastPreviewCache.AcquireBest(
-                item, _renderTargetSize);
+                browseSource, _renderTargetSize);
             // Quality wins across CPU/GPU storage: a CPU Lanczos sheet must not
             // remain hidden behind an earlier GPU fast preview.
             var gpuPreview = browseGpuFull ??
                 (browseFull is null ? browseGpuFast : null);
-            var preview = browseFull ??
-                (browseGpuFull is null && browseGpuFast is null ? browseFast : null);
+            var preview = browseFull ?? browseFast;
             var iconArea = imageArea;
+            var previewDrawn = false;
             if (gpuPreview is not null)
             {
                 var texture = GetOrCreateNativeGpuTexture(gpuPreview.Image);
@@ -432,9 +557,10 @@ internal sealed partial class ThumbnailGridView
                     iconArea = new Rectangle(imageArea.Left + imageArea.Width / 18,
                         imageArea.Top + imageArea.Height * 5 / 9,
                         imageArea.Width * 4 / 9, imageArea.Height * 4 / 9);
+                    previewDrawn = true;
                 }
             }
-            else if (preview is not null)
+            if (!previewDrawn && preview is not null)
             {
                 var texture = GetOrCreateGpuTexture(
                     preview.Bitmap, ref uploadBudget, ref pendingUploads);
@@ -447,17 +573,19 @@ internal sealed partial class ThumbnailGridView
                         imageArea.Top + imageArea.Height * 5 / 9,
                         imageArea.Width * 4 / 9,
                         imageArea.Height * 4 / 9);
+                    previewDrawn = true;
                 }
             }
             DrawDirect2DBrowseIcon(iconArea, _folders[item]);
             var label = new Rectangle(
-                bounds.X + 6, bounds.Bottom - labelHeight,
-                bounds.Width - 12, labelHeight);
+                bounds.X + 9, bounds.Bottom - labelHeight + 1,
+                bounds.Width - 18, labelHeight - 3);
             DrawDirect2DText(_folders[item].Label, label, _thumbnailNameFormat, _textBrush!);
             return;
         }
 
-        var page = item - _folders.Length;
+        var displayPage = item - _folders.Length;
+        var page = _pageSourceIndices[displayPage];
         using var gpuFull = _gpuFullCache.AcquireBest(page, _renderTargetSize);
         GpuThumbnailRenderCache.Lease? gpuFast = null;
         var selectedGpu = gpuFull;
@@ -476,6 +604,7 @@ internal sealed partial class ThumbnailGridView
         }
         try
         {
+            var thumbnailDrawn = false;
             if (selectedGpu is not null)
             {
                 var image = selectedGpu.Image;
@@ -491,9 +620,10 @@ internal sealed partial class ThumbnailGridView
                         imageArea.Y + (imageArea.Height - height) / 2, width, height);
                     DrawManagedThumbnail(texture, destination,
                         _pageColorProfiles.GetValueOrDefault(page));
+                    thumbnailDrawn = true;
                 }
             }
-            else if (selectedThumbnail is not null)
+            if (!thumbnailDrawn && selectedThumbnail is not null)
             {
                 var bitmap = selectedThumbnail.Bitmap;
                 var texture = GetOrCreateGpuTexture(
@@ -510,38 +640,46 @@ internal sealed partial class ThumbnailGridView
                         width, height);
                     DrawManagedThumbnail(texture, destination,
                         _pageColorProfiles.GetValueOrDefault(page));
+                    thumbnailDrawn = true;
                 }
-                else
-                    DrawDirect2DPlaceholder(imageArea, "Uploading to GPU…");
             }
-            else
+            if (!thumbnailDrawn)
             {
-                var state = _generationStates.GetValueOrDefault(
-                    page, "Waiting for preview…");
+                var state = selectedThumbnail is not null
+                    ? "Uploading to GPU…"
+                    : _generationStates.GetValueOrDefault(
+                        page, "Waiting for preview…");
                 DrawDirect2DPlaceholder(imageArea, state);
             }
         }
         finally { fast?.Dispose(); gpuFast?.Dispose(); }
 
         var nameBounds = new Rectangle(
-            bounds.X + 6, bounds.Bottom - labelHeight, bounds.Width - 12, labelHeight - 2);
-        DrawDirect2DText(_pageNames[page], nameBounds, _thumbnailNameFormat, _textBrush!);
+            bounds.X + 9, bounds.Bottom - labelHeight + 1,
+            bounds.Width - 18, labelHeight - 3);
+        DrawDirect2DText(_pageNames[displayPage], nameBounds,
+            _thumbnailNameFormat, _textBrush!);
 
         var number = (page + 1).ToString();
         var badgeWidth = Math.Max(20, 10 + number.Length * 8);
-        var badge = new Rectangle(bounds.Right - badgeWidth - 5, bounds.Bottom - 23,
-            badgeWidth, 19);
-        target.FillRectangle(ToRect(badge), _badgeBrush!);
-        target.DrawRectangle(ToRect(badge), _badgeBorderBrush!, 1f);
+        var badge = new Rectangle(bounds.Right - badgeWidth - 7, bounds.Top + 7,
+            badgeWidth, 17);
+        var roundedBadge = new RoundedRectangle(
+            new RectangleF(badge.X, badge.Y, badge.Width, badge.Height), 4f, 4f);
+        target.FillRoundedRectangle(roundedBadge, _badgeBrush!);
+        target.DrawRoundedRectangle(roundedBadge, _badgeBorderBrush!, 1f);
         DrawDirect2DText(number, badge, _thumbnailNumberFormat, _textBrush!);
     }
 
     private void DrawDirect2DPlaceholder(Rectangle area, string text)
     {
         var placeholder = Rectangle.Inflate(area, -10, -10);
-        ThumbnailTarget!.FillRectangle(ToRect(placeholder), _placeholderBrushD2D!);
-        ThumbnailTarget.DrawRectangle(
-            ToRect(placeholder), _placeholderBorderBrushD2D!, 1.2f);
+        var rounded = new RoundedRectangle(
+            new RectangleF(placeholder.X, placeholder.Y,
+                placeholder.Width, placeholder.Height), 5f, 5f);
+        ThumbnailTarget!.FillRoundedRectangle(rounded, _placeholderBrushD2D!);
+        ThumbnailTarget.DrawRoundedRectangle(rounded,
+            _placeholderBorderBrushD2D!, 1.2f);
         DrawDirect2DText(text, placeholder, _thumbnailPlaceholderFormat, _mutedTextBrush!);
     }
 
@@ -724,24 +862,50 @@ internal sealed partial class ThumbnailGridView
 
     private ID2D1Bitmap? GetOrCreateNativeGpuTexture(GpuRenderedImage source)
     {
-        if (_thumbnailDeviceContext is null) return null;
-        if (_nativeThumbnailGpuCache.TryGetValue(source, out var cached))
+        if (!NativeGpuSourcesEnabled) return null;
+        if (source.DeviceGeneration != GpuInteropDevice.Generation) return null;
+        if (_thumbnailDeviceContext is null)
         {
-            _nativeThumbnailGpuLru.Remove(cached.LruNode);
-            _nativeThumbnailGpuLru.AddLast(cached.LruNode);
-            return cached.Texture;
+            ScheduleGpuSourceRecovery();
+            return null;
         }
-        using var surface = source.Texture.QueryInterface<IDXGISurface>();
-        var properties = new BitmapProperties1(
-            new Vortice.DCommon.PixelFormat(
-                Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Ignore),
-            96f, 96f, BitmapOptions.None);
-        var texture = _thumbnailDeviceContext.CreateBitmapFromDxgiSurface(surface, properties);
-        var node = _nativeThumbnailGpuLru.AddLast(source);
-        var item = new NativeThumbnailGpuCacheItem(texture, source.Bytes, node);
-        _nativeThumbnailGpuCache[source] = item;
-        _thumbnailGpuCacheBytes += item.Bytes;
-        return texture;
+        GpuRenderedImage.UsageLease? usage = null;
+        try
+        {
+            if (_nativeThumbnailGpuCache.TryGetValue(source, out var cached))
+            {
+                _nativeThumbnailGpuLru.Remove(cached.LruNode);
+                _nativeThumbnailGpuLru.AddLast(cached.LruNode);
+                return cached.Texture;
+            }
+            usage = source.AcquireUsage();
+            if (usage is null) return null;
+            using var surface = source.Texture.QueryInterface<IDXGISurface>();
+            var properties = new BitmapProperties1(
+                new Vortice.DCommon.PixelFormat(
+                    Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Ignore),
+                96f, 96f, BitmapOptions.None);
+            var texture = _thumbnailDeviceContext.CreateBitmapFromDxgiSurface(surface, properties);
+            var node = _nativeThumbnailGpuLru.AddLast(source);
+            var item = new NativeThumbnailGpuCacheItem(texture, usage, source.Bytes, node);
+            usage = null;
+            _nativeThumbnailGpuCache[source] = item;
+            _thumbnailGpuCacheBytes += item.Bytes;
+            return texture;
+        }
+        catch (Exception exception)
+        {
+            usage?.Dispose();
+            ExtendedDiagnostics.LogException(
+                "Native GPU thumbnail import failed", exception,
+                $"source={source.Width}x{source.Height}; bytes={source.Bytes}");
+            if (IsGpuDeviceRemoval(exception))
+                ScheduleThumbnailDeviceRecovery(
+                    "native GPU import device loss", recreateSharedDevice: true);
+            else
+                ScheduleGpuSourceRecovery();
+            return null;
+        }
     }
 
     private void DrawManagedThumbnail(
@@ -872,19 +1036,105 @@ internal sealed partial class ThumbnailGridView
             _thumbnailGpuCacheBytes -= item.Bytes;
             bytes += item.Bytes;
             items++;
-            item.Texture.Dispose();
+            item.Dispose();
         }
         if (_thumbnailGpuCacheBytes > _thumbnailGpuCacheLimitBytes)
             _thumbnailGpuTrimTimer.Start();
     }
 
-    private void ClearGpuTextureCache()
+    private Task RetireGpuTextureCache()
     {
+        _thumbnailGpuUploadTimer.Stop();
+        _thumbnailGpuTrimTimer.Stop();
+        var resources = new Queue<(IDisposable Resource, long Bytes)>();
+        foreach (var effect in _thumbnailColorEffects.Values)
+            resources.Enqueue((effect, 0));
+        _thumbnailColorEffects.Clear();
+        foreach (var item in _thumbnailGpuCache.Values)
+            resources.Enqueue((item.Texture, item.Bytes));
+        foreach (var item in _nativeThumbnailGpuCache.Values)
+            resources.Enqueue((item, item.Bytes));
+        _thumbnailGpuCache.Clear();
+        _thumbnailGpuLru.Clear();
+        _nativeThumbnailGpuCache.Clear();
+        _nativeThumbnailGpuLru.Clear();
+        _thumbnailGpuCacheBytes = 0;
+        if (resources.Count == 0) return Task.CompletedTask;
+
+        ExtendedDiagnostics.Breadcrumb(
+            $"Thumbnail D2D retirement batch queued: resources={resources.Count}; " +
+            $"batches={_retiredThumbnailGpuBatches.Count + 1}");
+
+        var completion = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var wasEmpty = _retiredThumbnailGpuBatches.Count == 0;
+        _retiredThumbnailGpuBatches.Enqueue(
+            new RetiredThumbnailGpuBatch(resources, completion));
+        // Let the replacement grid paint and upload its first visible textures
+        // before old COM resources consume any UI-thread time. Never extend an
+        // existing grace period: continuous thumbnail uploads/navigation must
+        // not starve retirement and retain whole books in RAM/VRAM.
+        if (wasEmpty) DelayRetiredGpuResources(250);
+        _thumbnailGpuRetireTimer.Start();
+        return completion.Task;
+    }
+
+    private void DelayRetiredGpuResources(int milliseconds)
+    {
+        var delayedUntil = Stopwatch.GetTimestamp() + Math.Max(1,
+            Stopwatch.Frequency * milliseconds / 1000);
+        if (delayedUntil > _retiredGpuNotBeforeTick)
+            _retiredGpuNotBeforeTick = delayedUntil;
+    }
+
+    private void DrainRetiredGpuResources()
+    {
+        if (Stopwatch.GetTimestamp() < _retiredGpuNotBeforeTick) return;
+        const int maximumItemsPerTick = 4;
+        const long maximumBytesPerTick = 16L * 1024 * 1024;
+        var deadline = Stopwatch.GetTimestamp() + Math.Max(1,
+            Stopwatch.Frequency / 1000);
+        var items = 0;
+        long bytes = 0;
+        while (_retiredThumbnailGpuBatches.TryPeek(out var batch))
+        {
+            while (batch.Resources.TryPeek(out var item) &&
+                   items < maximumItemsPerTick &&
+                   (items == 0 || bytes + item.Bytes <= maximumBytesPerTick) &&
+                   Stopwatch.GetTimestamp() < deadline)
+            {
+                batch.Resources.Dequeue();
+                try { item.Resource.Dispose(); }
+                catch { }
+                items++;
+                bytes += item.Bytes;
+            }
+            if (batch.Resources.Count != 0) break;
+            _retiredThumbnailGpuBatches.Dequeue();
+            batch.Completion.TrySetResult();
+        }
+        if (_retiredThumbnailGpuBatches.Count == 0)
+            _thumbnailGpuRetireTimer.Stop();
+    }
+
+    private void ClearGpuTextureCacheImmediate()
+    {
+        _thumbnailGpuRetireTimer.Stop();
+        while (_retiredThumbnailGpuBatches.Count > 0)
+        {
+            var batch = _retiredThumbnailGpuBatches.Dequeue();
+            while (batch.Resources.TryDequeue(out var item))
+            {
+                try { item.Resource.Dispose(); }
+                catch { }
+            }
+            batch.Completion.TrySetResult();
+        }
         DisposeThumbnailColorEffects();
         _thumbnailGpuUploadTimer.Stop();
         _thumbnailGpuTrimTimer.Stop();
         foreach (var item in _thumbnailGpuCache.Values) item.Texture.Dispose();
-        foreach (var item in _nativeThumbnailGpuCache.Values) item.Texture.Dispose();
+        foreach (var item in _nativeThumbnailGpuCache.Values) item.Dispose();
         _thumbnailGpuCache.Clear();
         _thumbnailGpuLru.Clear();
         _nativeThumbnailGpuCache.Clear();
@@ -892,9 +1142,150 @@ internal sealed partial class ThumbnailGridView
         _thumbnailGpuCacheBytes = 0;
     }
 
+    private void ScheduleGpuSourceRecovery()
+    {
+        if (!NativeGpuSourcesEnabled) return;
+        if (Interlocked.Exchange(ref _gpuSourceRecoveryPending, 1) != 0) return;
+        if (IsDisposed || Disposing || !IsHandleCreated)
+        {
+            Interlocked.Exchange(ref _gpuSourceRecoveryPending, 0);
+            return;
+        }
+        try
+        {
+            BeginInvoke(() =>
+            {
+                try
+                {
+                    if (!NativeGpuSourcesEnabled) return;
+                    // A native D2D import or EndDraw failure can leave every cached
+                    // CUDA/D3D image tied to a lost device. Drop those GPU sources
+                    // after the active paint has released its leases, then request
+                    // fresh GPU renders. CPU previews remain available meanwhile.
+                    var retirement = RetireGpuTextureCache();
+                    _gpuFullCache.Clear(retirement);
+                    _gpuFastPreviewCache.Clear(retirement);
+                    _gpuBrowseFullPreviewCache.Clear(retirement);
+                    _gpuBrowseFastPreviewCache.Clear(retirement);
+                    Invalidate();
+                    ThumbnailRefreshRequested?.Invoke(this, EventArgs.Empty);
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _gpuSourceRecoveryPending, 0);
+                }
+            });
+        }
+        catch (InvalidOperationException)
+        {
+            Interlocked.Exchange(ref _gpuSourceRecoveryPending, 0);
+        }
+    }
+
+    private static bool IsGpuDeviceRemoval(Exception exception)
+    {
+        for (Exception? current = exception; current is not null;
+             current = current.InnerException)
+        {
+            if (current.HResult is unchecked((int)0x887A0005) or
+                unchecked((int)0x887A0006) or
+                unchecked((int)0x887A0007) or
+                unchecked((int)0x887A0020))
+                return true;
+        }
+        return false;
+    }
+
+    private void ScheduleThumbnailDeviceRecovery(
+        string reason, bool recreateSharedDevice = false)
+    {
+        if (IsDisposed || Disposing || !IsHandleCreated) return;
+        _thumbnailSharedDeviceResetRequired |= recreateSharedDevice;
+        _thumbnailDeviceRecoveryAttempt = Math.Min(
+            _thumbnailDeviceRecoveryAttempt + 1, 6);
+        _thumbnailDeviceRecoveryTimer.Stop();
+        _thumbnailDeviceRecoveryTimer.Interval = Math.Min(
+            1000, 50 << Math.Min(4, _thumbnailDeviceRecoveryAttempt - 1));
+        ExtendedDiagnostics.Breadcrumb(
+            $"Thumbnail Direct2D recovery scheduled: reason={reason}; " +
+            $"attempt={_thumbnailDeviceRecoveryAttempt}; " +
+            $"resetSharedDevice={_thumbnailSharedDeviceResetRequired}; " +
+            $"delayMs={_thumbnailDeviceRecoveryTimer.Interval}");
+        _thumbnailDeviceRecoveryTimer.Start();
+    }
+
+    private void RecoverThumbnailDeviceResources()
+    {
+        _thumbnailDeviceRecoveryTimer.Stop();
+        if (IsDisposed || Disposing || !IsHandleCreated || !Visible) return;
+        try
+        {
+            var resetSharedDevice = _thumbnailSharedDeviceResetRequired;
+            if (resetSharedDevice)
+            {
+                // Rebuilding only the Direct2D target cannot revive a removed
+                // D3D11 device. Release imported views before replacing the
+                // shared device and all GPU sources created from its generation.
+                // Cancel queued work before changing generations so an aggressive
+                // cold-cache pass cannot keep saturating the removed device while
+                // the replacement target is trying to present its first frame.
+                ThumbnailInteractionStarted?.Invoke(this, EventArgs.Empty);
+                DiscardThumbnailDeviceResources();
+                var recreated = GpuInteropDevice.RecreateAfterDeviceLoss();
+                _thumbnailSharedDeviceResetRequired = false;
+                var retirement = RetireGpuTextureCache();
+                _gpuFullCache.Clear(retirement);
+                _gpuFastPreviewCache.Clear(retirement);
+                _gpuBrowseFullPreviewCache.Clear(retirement);
+                _gpuBrowseFastPreviewCache.Clear(retirement);
+                // A removed device has already demonstrated that native
+                // CUDA/D3D thumbnail sharing is unstable for this session.
+                // Continue with CPU-owned previews uploaded by Direct2D; this
+                // keeps hardware presentation while avoiding a recovery loop.
+                Volatile.Write(ref _nativeGpuSourcesEnabled, false);
+                ExtendedDiagnostics.Breadcrumb(
+                    $"Thumbnail shared D3D device reset: recreated={recreated}; " +
+                    $"generation={GpuInteropDevice.Generation}");
+            }
+
+            EnsureThumbnailRenderTarget();
+            if (ThumbnailTarget is null)
+            {
+                ScheduleThumbnailDeviceRecovery("target unavailable");
+                return;
+            }
+
+            // Invalidate issued from inside WM_PAINT can be coalesced away. Force
+            // one new paint from this later timer turn so a recreated target does
+            // not leave the grid frozen while sibling toolbar controls still work.
+            Invalidate();
+            Update();
+            if (ThumbnailTarget is null)
+            {
+                ScheduleThumbnailDeviceRecovery("retry presentation failed");
+                return;
+            }
+            ExtendedDiagnostics.Breadcrumb(
+                $"Thumbnail Direct2D recovery completed: attempts={_thumbnailDeviceRecoveryAttempt}");
+            _thumbnailDeviceRecoveryAttempt = 0;
+            if (resetSharedDevice)
+                ThumbnailRefreshRequested?.Invoke(this, EventArgs.Empty);
+        }
+        catch (Exception exception)
+        {
+            ExtendedDiagnostics.LogException(
+                "Thumbnail Direct2D recovery failed", exception,
+                $"attempt={_thumbnailDeviceRecoveryAttempt}");
+            DiscardThumbnailDeviceResources();
+            ScheduleThumbnailDeviceRecovery("recreate exception");
+        }
+    }
+
     private void DiscardThumbnailDeviceResources()
     {
-        ClearGpuTextureCache();
+        _thumbnailPresentBusyCount = 0;
+        _thumbnailPresentBusySince = 0;
+        ClearGpuTextureCacheImmediate();
         DisposeThumbnailBrushes();
         DisposeThumbnailDeviceContext();
         _thumbnailRenderTarget?.Dispose();
@@ -913,6 +1304,9 @@ internal sealed partial class ThumbnailGridView
         _thumbnailDeviceContext = null;
         _thumbnailD2DDevice?.Dispose();
         _thumbnailD2DDevice = null;
+        _thumbnailSharedDeviceUsage?.Dispose();
+        _thumbnailSharedDeviceUsage = null;
+        _thumbnailDeviceGeneration = -1;
     }
 
     private void DisposeThumbnailBrushes()
@@ -948,6 +1342,9 @@ internal sealed partial class ThumbnailGridView
         DiscardThumbnailDeviceResources();
         _thumbnailGpuUploadTimer.Dispose();
         _thumbnailGpuTrimTimer.Dispose();
+        _thumbnailGpuRetireTimer.Dispose();
+        _thumbnailDeviceRecoveryTimer.Dispose();
+        _thumbnailPresentRetryTimer.Dispose();
         _thumbnailNameFormat.Dispose();
         _thumbnailNumberFormat.Dispose();
         _thumbnailIconFormat.Dispose();

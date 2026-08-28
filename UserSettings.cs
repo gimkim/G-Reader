@@ -1,12 +1,29 @@
 using System.Text.Json;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace CDisplayEx.CSharp;
 
+internal sealed class HistoryEntry
+{
+    public string Path { get; set; } = string.Empty;
+    public DateTime LastOpenedUtc { get; set; }
+}
+
 internal sealed class UserSettings
 {
-    public static string DefaultPersistentCachePath => Path.Combine(
+    private static string NewPersistentCachePath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "Fast Reader Viewer", "PreviewCache");
+
+    private static string PreviousPersistentCachePath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "G Reader", "PreviewCache");
+
+    public static string DefaultPersistentCachePath =>
+        Directory.Exists(NewPersistentCachePath) || !Directory.Exists(PreviousPersistentCachePath)
+            ? NewPersistentCachePath
+            : PreviousPersistentCachePath;
     public static int DefaultImageMagickThreadsPerImage =>
         Math.Clamp(Environment.ProcessorCount / 4, 2, 8);
     public static int DefaultZoomImageMagickThreadsPerImage =>
@@ -53,6 +70,8 @@ internal sealed class UserSettings
     public int ThumbnailUploadBudgetMB { get; set; } = 64;
     public int ThumbnailUploadsPerFrame { get; set; } = 128;
     public bool UseMonitorColorProfile { get; set; } = true;
+    public bool ExtendedLoggingEnabled { get; set; }
+    public DateTime? LastUpdateCheckUtc { get; set; }
     public bool AutoOptimizePerformance { get; set; }
     public bool UseBenchmarkProfile { get; set; }
     // 0 = generated temporary comprehensive dataset, 1 = custom folder.
@@ -87,6 +106,9 @@ internal sealed class UserSettings
     // Source path -> page entry name. Names survive sorting changes better than indexes.
     public Dictionary<string, string> RememberedReadingPositions { get; set; } =
         new(StringComparer.OrdinalIgnoreCase);
+    public bool HistoryEnabled { get; set; } = true;
+    public int HistoryMaximumItems { get; set; } = 100;
+    public List<HistoryEntry> HistoryEntries { get; set; } = [];
     public string RandomLibraryPath { get; set; } = string.Empty;
     public bool HasWindowBounds { get; set; }
     public bool WindowMaximized { get; set; }
@@ -95,7 +117,19 @@ internal sealed class UserSettings
     public int WindowWidth { get; set; } = 1100;
     public int WindowHeight { get; set; } = 760;
 
-    private static string FilePath => Path.Combine(
+    internal static string ProfileDirectory => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "Fast Reader Viewer");
+
+    internal static string FilePath => Path.Combine(ProfileDirectory, "settings.json");
+
+    private static string BackupFilePath => FilePath + ".previous";
+
+    private static readonly object SaveGate = new();
+    private static readonly string SaveMutexName = "Local\\FastReaderViewer.Settings." +
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(ProfileDirectory)))[..16];
+
+    private static string PreviousFilePath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
         "G Reader", "settings.json");
 
@@ -107,10 +141,13 @@ internal sealed class UserSettings
     {
         try
         {
-            var path = File.Exists(FilePath) ? FilePath : LegacyFilePath;
-            var settings = File.Exists(path)
-                ? JsonSerializer.Deserialize<UserSettings>(File.ReadAllText(path)) ?? new()
-                : CreateFirstRunDefaults();
+            var path = File.Exists(FilePath) || File.Exists(BackupFilePath) ? FilePath
+                : File.Exists(PreviousFilePath) ? PreviousFilePath
+                : LegacyFilePath;
+            var settings = TryRead(path) ??
+                (string.Equals(path, FilePath, StringComparison.OrdinalIgnoreCase)
+                    ? TryRead(BackupFilePath)
+                    : null) ?? CreateFirstRunDefaults();
             // Older benchmark builds could select 16 PDFium processes. Keep
             // manual values untouched, but repair that unsafe automatic result.
             if (settings.UseBenchmarkProfile && settings.PdfiumProcessCount > 8)
@@ -119,6 +156,16 @@ internal sealed class UserSettings
                 settings.GlobalFastPreviewConcurrency = Math.Clamp(
                     settings.FastPreviewWorkerCount * settings.FastPreviewThreadsPerWorker,
                     1, Math.Clamp(Environment.ProcessorCount, 1, 64));
+            settings.HistoryMaximumItems = Math.Clamp(
+                settings.HistoryMaximumItems, 1, 1000);
+            settings.HistoryEntries = (settings.HistoryEntries ?? [])
+                .Where(entry => !string.IsNullOrWhiteSpace(entry.Path))
+                .GroupBy(entry => NormalizeHistoryPath(entry.Path),
+                    StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.OrderByDescending(entry => entry.LastOpenedUtc).First())
+                .OrderByDescending(entry => entry.LastOpenedUtc)
+                .Take(settings.HistoryMaximumItems)
+                .ToList();
             return settings;
         }
         catch { return CreateFirstRunDefaults(); }
@@ -133,8 +180,77 @@ internal sealed class UserSettings
 
     public void Save()
     {
-        var folder = Path.GetDirectoryName(FilePath)!;
-        Directory.CreateDirectory(folder);
-        File.WriteAllText(FilePath, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
+        lock (SaveGate)
+        {
+            using var mutex = new Mutex(false, SaveMutexName);
+            var acquired = false;
+            try
+            {
+                // A stale/foreign writer must not make an interactive settings
+                // action or window close look like an application hang.
+                try { acquired = mutex.WaitOne(TimeSpan.FromSeconds(2)); }
+                catch (AbandonedMutexException) { acquired = true; }
+                if (!acquired)
+                    throw new IOException("Timed out waiting to save Fast Reader/Viewer settings.");
+
+                Directory.CreateDirectory(ProfileDirectory);
+                var temporary = FilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                try
+                {
+                    var json = JsonSerializer.Serialize(this,
+                        new JsonSerializerOptions { WriteIndented = true });
+                    using (var stream = new FileStream(temporary, FileMode.CreateNew,
+                               FileAccess.Write, FileShare.None, 64 * 1024,
+                               FileOptions.WriteThrough))
+                    using (var writer = new StreamWriter(stream, new UTF8Encoding(false)))
+                    {
+                        writer.Write(json);
+                        writer.Flush();
+                        stream.Flush(flushToDisk: true);
+                    }
+
+                    if (File.Exists(FilePath))
+                    {
+                        try { if (File.Exists(BackupFilePath)) File.Delete(BackupFilePath); }
+                        catch { }
+                        try { File.Replace(temporary, FilePath, BackupFilePath, true); }
+                        catch (PlatformNotSupportedException)
+                        {
+                            File.Move(temporary, FilePath, overwrite: true);
+                        }
+                    }
+                    else
+                    {
+                        File.Move(temporary, FilePath, overwrite: false);
+                    }
+                }
+                finally
+                {
+                    try { if (File.Exists(temporary)) File.Delete(temporary); }
+                    catch { }
+                }
+            }
+            finally
+            {
+                if (acquired) mutex.ReleaseMutex();
+            }
+        }
+    }
+
+    private static UserSettings? TryRead(string path)
+    {
+        try
+        {
+            return File.Exists(path)
+                ? JsonSerializer.Deserialize<UserSettings>(File.ReadAllText(path))
+                : null;
+        }
+        catch { return null; }
+    }
+
+    private static string NormalizeHistoryPath(string path)
+    {
+        try { return Path.TrimEndingDirectorySeparator(Path.GetFullPath(path)); }
+        catch { return path.Trim(); }
     }
 }

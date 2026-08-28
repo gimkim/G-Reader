@@ -17,6 +17,8 @@ internal static class GpuContactSheetRenderer
     private static ID2D1Factory1? _factory;
     private static ID2D1Device? _device;
     private static ID2D1DeviceContext? _context;
+    private static GpuInteropDevice.DeviceUsageLease? _deviceUsage;
+    private static long _deviceGeneration = -1;
 
     public static GpuRenderedImage? TryScale(
         Bitmap source, System.Drawing.Size bounds, CancellationToken cancellationToken)
@@ -28,42 +30,80 @@ internal static class GpuContactSheetRenderer
         var target = new System.Drawing.Size(
             Math.Max(1, (int)Math.Round(source.Width * scale)),
             Math.Max(1, (int)Math.Round(source.Height * scale)));
-        var converted = source.PixelFormat == DrawingPixelFormat.Format32bppPArgb
-            ? source : null;
-        using var owned = converted is null ? new Bitmap(source.Width, source.Height,
-            DrawingPixelFormat.Format32bppPArgb) : null;
-        if (owned is not null)
+        Bitmap? resized = null;
+        try
         {
-            using var graphics = Graphics.FromImage(owned);
-            graphics.DrawImageUnscaled(source, 0, 0);
-            converted = owned;
+            if (target.Width != source.Width || target.Height != source.Height)
+            {
+                // Do not use a second background Direct2D context for every
+                // thumbnail. The UI surface calls EndDraw on the same shared GPU
+                // device; hundreds of concurrent D2D scale jobs can make that
+                // EndDraw block inside the NVIDIA driver. NPP keeps the resize on
+                // the GPU while staging only the small result through host memory.
+                if (!NvJpegNativeDecoder.TryResizeBitmapStagedGpu(
+                        source, target, fastPreview: true, cancellationToken,
+                        out resized) || resized is null)
+                    return null;
+            }
+            else
+            {
+                resized = source.PixelFormat == DrawingPixelFormat.Format32bppPArgb
+                    ? new Bitmap(source)
+                    : ConvertToPArgb(source);
+            }
+            cancellationToken.ThrowIfCancellationRequested();
+            return UploadBitmap(resized);
         }
-        var stride = checked(converted!.Width * 4);
-        var pixels = new byte[checked(stride * converted.Height)];
-        var data = converted.LockBits(new Rectangle(0, 0, converted.Width, converted.Height),
+        finally { resized?.Dispose(); }
+    }
+
+    private static Bitmap ConvertToPArgb(Bitmap source)
+    {
+        var converted = new Bitmap(source.Width, source.Height,
+            DrawingPixelFormat.Format32bppPArgb);
+        try
+        {
+            using var graphics = Graphics.FromImage(converted);
+            graphics.DrawImageUnscaled(source, 0, 0);
+            return converted;
+        }
+        catch
+        {
+            converted.Dispose();
+            throw;
+        }
+    }
+
+    internal static GpuRenderedImage? Upload(Bitmap source) => UploadBitmap(source);
+
+    private static GpuRenderedImage? UploadBitmap(Bitmap source)
+    {
+        var stride = checked(source.Width * 4);
+        var pixels = new byte[checked(stride * source.Height)];
+        var data = source.LockBits(new Rectangle(0, 0, source.Width, source.Height),
             DrawingImageLockMode.ReadOnly, DrawingPixelFormat.Format32bppPArgb);
         try
         {
-            for (var y = 0; y < converted.Height; y++)
+            for (var y = 0; y < source.Height; y++)
                 Marshal.Copy(data.Scan0 + y * data.Stride, pixels, y * stride, stride);
         }
-        finally { converted.UnlockBits(data); }
-        cancellationToken.ThrowIfCancellationRequested();
-        using var uploaded = GpuInteropDevice.CreateImageFromBgra(
-            pixels, converted.Width, converted.Height);
-        return uploaded is null ? null : TryScale(uploaded, target);
+        finally { source.UnlockBits(data); }
+        return GpuInteropDevice.CreateImageFromBgra(
+            pixels, source.Width, source.Height);
     }
 
     private static GpuRenderedImage? TryScale(
         GpuRenderedImage source, System.Drawing.Size targetSize)
     {
+        if (source.DeviceGeneration != GpuInteropDevice.Generation) return null;
         lock (Gate)
         {
             try
             {
                 EnsureContext();
-                if (_context is null) return null;
-                var texture = GpuInteropDevice.CreateTexture(
+                if (_context is null || source.DeviceGeneration != _deviceGeneration) return null;
+                if (_deviceUsage is null) return null;
+                var texture = GpuInteropDevice.CreateTexture(_deviceUsage,
                     targetSize.Width, targetSize.Height, renderTarget: true);
                 if (texture is null) return null;
                 try
@@ -79,6 +119,7 @@ internal static class GpuContactSheetRenderer
                             Vortice.DCommon.AlphaMode.Premultiplied), 96f, 96f,
                             BitmapOptions.Target));
                     _context.Target = output;
+                    _context.Transform = Matrix3x2.Identity;
                     _context.BeginDraw();
                     _context.Clear(new Color4(0, 0, 0, 0));
                     _context.DrawBitmap(input, new RawRectF(0, 0,
@@ -86,15 +127,27 @@ internal static class GpuContactSheetRenderer
                         BitmapInterpolationMode.Linear, null);
                     var result = _context.EndDraw();
                     _context.Target = null;
-                    if (result.Failure) return null;
+                    if (result.Failure)
+                        throw new InvalidOperationException(
+                            $"Direct2D GPU scale EndDraw failed: {result.Code}");
                     var rendered = new GpuRenderedImage(texture, IntPtr.Zero,
-                        targetSize.Width, targetSize.Height, _ => { });
+                        targetSize.Width, targetSize.Height, _ => { }, _deviceUsage);
                     texture = null;
                     return rendered;
                 }
                 finally { _context.Target = null; texture?.Dispose(); }
             }
-            catch { return null; }
+            catch (Exception exception)
+            {
+                ExtendedDiagnostics.LogException(
+                    "Direct2D GPU scale failed", exception);
+                DiscardContext();
+                return null;
+            }
+            finally
+            {
+                if (_deviceGeneration != GpuInteropDevice.Generation) DiscardContext();
+            }
         }
     }
 
@@ -103,13 +156,17 @@ internal static class GpuContactSheetRenderer
     {
         if (images.Count == 0 || targetSize.Width <= 0 || targetSize.Height <= 0)
             return null;
+        if (images.Any(image => image.DeviceGeneration != GpuInteropDevice.Generation))
+            return null;
         lock (Gate)
         {
             try
             {
                 EnsureContext();
                 if (_context is null) return null;
-                var texture = GpuInteropDevice.CreateTexture(
+                if (images.Any(image => image.DeviceGeneration != _deviceGeneration)) return null;
+                if (_deviceUsage is null) return null;
+                var texture = GpuInteropDevice.CreateTexture(_deviceUsage,
                     targetSize.Width, targetSize.Height, renderTarget: true);
                 if (texture is null) return null;
                 try
@@ -131,6 +188,7 @@ internal static class GpuContactSheetRenderer
                                     96f, 96f, BitmapOptions.None)));
                         }
                         _context.Target = output;
+                        _context.Transform = Matrix3x2.Identity;
                         _context.BeginDraw();
                         _context.Clear(new Color4(0, 0, 0, 0));
                         // Use most of the preview area. The old 66% height cap left
@@ -138,7 +196,9 @@ internal static class GpuContactSheetRenderer
                         var maximumWidth = targetSize.Width * 0.76f;
                         var maximumHeight = targetSize.Height * 0.90f;
                         var count = inputs.Count;
-                        for (var index = 0; index < count; index++)
+                        // Match the CPU contact-sheet path: the first source is
+                        // the front card and later sources fan out behind it.
+                        for (var index = count - 1; index >= 0; index--)
                         {
                             var bitmap = inputs[index];
                             var scale = Math.Min(maximumWidth / bitmap.PixelSize.Width,
@@ -168,9 +228,11 @@ internal static class GpuContactSheetRenderer
                         _context.Transform = Matrix3x2.Identity;
                         var result = _context.EndDraw();
                         _context.Target = null;
-                        if (result.Failure) { texture.Dispose(); return null; }
+                        if (result.Failure)
+                            throw new InvalidOperationException(
+                                $"Direct2D GPU composition EndDraw failed: {result.Code}");
                         var owned = new GpuRenderedImage(texture, IntPtr.Zero,
-                            targetSize.Width, targetSize.Height, _ => { });
+                            targetSize.Width, targetSize.Height, _ => { }, _deviceUsage);
                         texture = null;
                         return owned;
                     }
@@ -182,17 +244,54 @@ internal static class GpuContactSheetRenderer
                 }
                 finally { texture?.Dispose(); }
             }
-            catch { return null; }
+            catch (Exception exception)
+            {
+                ExtendedDiagnostics.LogException(
+                    "Direct2D GPU composition failed", exception);
+                DiscardContext();
+                return null;
+            }
+            finally
+            {
+                if (_deviceGeneration != GpuInteropDevice.Generation) DiscardContext();
+            }
         }
     }
 
     private static void EnsureContext()
     {
-        if (_context is not null || GpuInteropDevice.Device is not { } d3d) return;
-        _factory = D2D1CreateFactory<ID2D1Factory1>(FactoryType.MultiThreaded,
-            DebugLevel.None);
-        using var dxgi = d3d.QueryInterface<IDXGIDevice>();
-        _device = _factory.CreateDevice(dxgi);
-        _context = _device.CreateDeviceContext(DeviceContextOptions.None);
+        var generation = GpuInteropDevice.Generation;
+        if (_context is not null && _deviceGeneration == generation) return;
+        if (_deviceGeneration != generation)
+            DiscardContext();
+        var usage = GpuInteropDevice.AcquireUsage();
+        if (usage is null) return;
+        var d3d = usage.Device;
+        try
+        {
+            _factory = D2D1CreateFactory<ID2D1Factory1>(FactoryType.MultiThreaded,
+                DebugLevel.None);
+            using var dxgi = d3d.QueryInterface<IDXGIDevice>();
+            _device = _factory.CreateDevice(dxgi);
+            _context = _device.CreateDeviceContext(DeviceContextOptions.None);
+            _deviceUsage = usage;
+            usage = null;
+            _deviceGeneration = _deviceUsage.Generation;
+        }
+        finally { usage?.Dispose(); }
+    }
+
+    private static void DiscardContext()
+    {
+        if (_context is not null) _context.Target = null;
+        _context?.Dispose();
+        _device?.Dispose();
+        _factory?.Dispose();
+        _deviceUsage?.Dispose();
+        _context = null;
+        _device = null;
+        _factory = null;
+        _deviceUsage = null;
+        _deviceGeneration = -1;
     }
 }

@@ -1,12 +1,12 @@
 # Third-party notices
 
-G Reader depends on third-party software distributed under its own terms. The
+Fast Reader/Viewer depends on third-party software distributed under its own terms. The
 NuGet lock data generated during restore is the authoritative list of resolved
 transitive package versions for a particular build.
 
 ## PDFiumCore and PDFium
 
-G Reader uses `PDFiumCore` 152.0.7947 and the matching
+Fast Reader/Viewer uses `PDFiumCore` 152.0.7947 and the matching
 `bblanchon.PDFium.Win32` native binary. PDFiumCore and its binary packaging are
 distributed under Apache License 2.0; PDFium itself retains its BSD-style
 copyright and redistribution notice.

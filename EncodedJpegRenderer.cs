@@ -21,7 +21,7 @@ internal static class EncodedJpegRenderer
         PageEntry page, int rotation, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        using var stream = page.Open();
+        using var stream = page.OpenStream(cancellationToken);
         var info = new MagickImageInfo(stream);
         var rotated = Math.Abs(NormalizeRotation(rotation)) % 180 == 90;
         return rotated ? info.Height > info.Width : info.Width > info.Height;
@@ -31,7 +31,7 @@ internal static class EncodedJpegRenderer
         PageEntry page, int rotation, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        using var stream = page.Open();
+        using var stream = page.OpenStream(cancellationToken);
         var info = new MagickImageInfo(stream);
         var width = checked((int)info.Width);
         var height = checked((int)info.Height);
@@ -46,7 +46,7 @@ internal static class EncodedJpegRenderer
     {
         cancellationToken.ThrowIfCancellationRequested();
         Size rawSize;
-        using (var infoStream = page.Open())
+        using (var infoStream = page.OpenStream(cancellationToken))
         {
             var info = new MagickImageInfo(infoStream);
             rawSize = new Size(checked((int)info.Width), checked((int)info.Height));
@@ -64,7 +64,7 @@ internal static class EncodedJpegRenderer
             ExtractArea = new MagickGeometry(
                 rawCrop.X, rawCrop.Y, (uint)rawCrop.Width, (uint)rawCrop.Height)
         };
-        using var stream = page.Open();
+        using var stream = page.OpenStream(cancellationToken);
         using var image = new MagickImage(stream, readSettings);
         image.ResetPage();
         if (normalizedRotation != 0) image.Rotate(normalizedRotation);
@@ -123,6 +123,24 @@ internal static class EncodedJpegRenderer
         bool fastPreview, CancellationToken cancellationToken) =>
         Render(page, bounds, rotation, quality, fastPreview, cancellationToken);
 
+    public static Result RenderThumbnailStagedGpu(
+        PageEntry page, Size bounds, int rotation, int quality,
+        bool fastPreview, CancellationToken cancellationToken)
+    {
+        // Cold-cache PDF scrolling creates hundreds of short-lived thumbnails.
+        // Keep nvJPEG and NPP on the GPU, but stage the completed small BGRA image
+        // through pinned host memory before Direct2D uploads it. This avoids the
+        // NVIDIA CUDA-D3D registration API which can AV inside nvwgf2umx.dll under
+        // rapid resource churn, without moving decode or resize work to the CPU.
+        var target = new Size(Math.Max(32, bounds.Width), Math.Max(32, bounds.Height));
+        if (NvJpegNativeDecoder.TryDecodeThumbnailStaged(
+                page, target, rotation, oversample: 1, fastPreview,
+                cancellationToken, out var decoded, out var landscape) &&
+            decoded is not null)
+            return new Result(decoded, landscape);
+        return Render(page, bounds, rotation, quality, fastPreview, cancellationToken);
+    }
+
     private static Result Render(
         PageEntry page, Size bounds, int rotation, int quality,
         bool fastPreview, CancellationToken cancellationToken)
@@ -165,14 +183,14 @@ internal static class EncodedJpegRenderer
             }
         }
 
-        // G Reader is always fit-to-screen. Ask libjpeg for a decoder-scaled
+        // Fast Reader/Viewer is always fit-to-screen. Ask libjpeg for a decoder-scaled
         // source near the useful output resolution instead of expanding a 45MP
         // photograph only to discard almost all pixels. The quality pass keeps
         // roughly 2x linear oversampling before its final Lanczos resize.
         var decodeScale = fastPreview ? 1u : 2u;
         var decodeWidth = (uint)Math.Min(ushort.MaxValue, (long)width * decodeScale);
         var decodeHeight = (uint)Math.Min(ushort.MaxValue, (long)height * decodeScale);
-        using var stream = page.Open();
+        using var stream = page.OpenStream(cancellationToken);
         using var image = new MagickImage(stream, new MagickReadSettings(new JpegReadDefines
             {
                 Size = new MagickGeometry(decodeWidth, decodeHeight),
