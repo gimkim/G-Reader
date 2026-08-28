@@ -19,9 +19,9 @@
     <AssemblyTitle>Fast Reader/Viewer</AssemblyTitle>
     <Product>Fast Reader/Viewer</Product>
     <Description>Hardware-accelerated comic and image reader</Description>
-    <Version>1.9.7</Version>
-    <AssemblyVersion>1.9.7.0</AssemblyVersion>
-    <FileVersion>1.9.7.0</FileVersion>
+    <Version>2.0</Version>
+    <AssemblyVersion>2.0.0.0</AssemblyVersion>
+    <FileVersion>2.0.0.0</FileVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>

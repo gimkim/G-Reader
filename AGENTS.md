@@ -70,6 +70,15 @@ every corresponding render and cache path.
 
 ## Engineering invariants
 
+- The normal desktop architecture is one profile-owning process with multiple
+  top-level reader windows. Later launches forward open requests to that process;
+  settings, global schedulers, GPU/PDF admission, history, and disk cache are
+  shared. Keep each window's book, selection, view mode, cancellation, and
+  Direct2D presentation resources independent.
+- Treat configured memory cache values as process budgets, not per-window
+  allowances. With multiple windows, favor the active window and keep inactive
+  work at idle priority. Serialize destructive source edits by canonical path,
+  and coordinate persistent-cache maintenance against writers across processes.
 - Never block the WinForms UI thread on image/PDF decoding, resizing, cache
   discovery, filesystem/archive enumeration, worker startup, or GPU retirement.
   All expensive work is cancellable, bounded, and scheduled away from paint and

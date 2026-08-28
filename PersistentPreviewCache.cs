@@ -34,6 +34,7 @@ internal static class PersistentPreviewCache
     private sealed class CacheWrite : IDisposable
     {
         public required PersistentPreviewKind Kind { get; init; }
+        public required string Root { get; init; }
         public required string Path { get; init; }
         public required int Epoch { get; init; }
         public Bitmap? Bitmap { get; init; }
@@ -98,6 +99,12 @@ internal static class PersistentPreviewCache
     public static void NotifyUserActivity() =>
         Volatile.Write(ref _lastUserActivityTick, Environment.TickCount64);
 
+    public static void InvalidateBrowseSource(string sourcePath)
+    {
+        try { BrowseIdentities.TryRemove(Path.GetFullPath(sourcePath), out _); }
+        catch { }
+    }
+
     public static void Configure(
         string? root, int fullViewLimitMB, int thumbnailLimitMB)
     {
@@ -112,7 +119,8 @@ internal static class PersistentPreviewCache
     public static async Task<ClearResult> ClearAllAsync(string? root)
     {
         Interlocked.Increment(ref _cacheEpoch);
-        var cacheRoot = Path.Combine(ResolveRoot(root), "v2");
+        var resolvedRoot = ResolveRoot(root);
+        var cacheRoot = Path.Combine(resolvedRoot, "v2");
         var acquired = 0;
         try
         {
@@ -121,6 +129,8 @@ internal static class PersistentPreviewCache
             // the caller's UI context before doing filesystem work.
             for (; acquired < WriterConcurrency; acquired++)
                 await Writers.WaitAsync().ConfigureAwait(false);
+            await using var processLease = await CacheProcessCoordinator
+                .AcquireMaintenanceAsync(resolvedRoot).ConfigureAwait(false);
 
             if (!Directory.Exists(cacheRoot)) return new ClearResult(0, 0, 0);
             var fileCount = 0;
@@ -176,6 +186,8 @@ internal static class PersistentPreviewCache
         {
             for (; acquired < WriterConcurrency; acquired++)
                 await Writers.WaitAsync().ConfigureAwait(false);
+            await using var processLease = await CacheProcessCoordinator
+                .AcquireMaintenanceAsync(configuration.Root).ConfigureAwait(false);
             var entries = new List<PdfRemapEntry>();
             foreach (var pair in oldToNewPage)
             {
@@ -218,6 +230,8 @@ internal static class PersistentPreviewCache
         {
             for (; acquired < WriterConcurrency; acquired++)
                 await Writers.WaitAsync().ConfigureAwait(false);
+            await using var processLease = await CacheProcessCoordinator
+                .AcquireMaintenanceAsync(configuration.Root).ConfigureAwait(false);
             foreach (var entry in plan.Entries)
             {
                 try
@@ -321,6 +335,7 @@ internal static class PersistentPreviewCache
         EnqueueWrite(new CacheWrite
         {
             Kind = kind,
+            Root = configuration.Root,
             Path = path,
             Epoch = Volatile.Read(ref _cacheEpoch),
             Bitmap = copy
@@ -339,6 +354,7 @@ internal static class PersistentPreviewCache
         EnqueueWrite(new CacheWrite
         {
             Kind = kind,
+            Root = configuration.Root,
             Path = path,
             Epoch = Volatile.Read(ref _cacheEpoch),
             Encoded = encodedJpeg
@@ -383,6 +399,7 @@ internal static class PersistentPreviewCache
             await Writers.WaitAsync().ConfigureAwait(false);
             try
             {
+                using var processLease = CacheProcessCoordinator.AcquireWriter(write.Root);
                 if (write.Epoch != Volatile.Read(ref _cacheEpoch) || File.Exists(write.Path))
                     continue;
                 Directory.CreateDirectory(Path.GetDirectoryName(write.Path)!);
@@ -482,6 +499,7 @@ internal static class PersistentPreviewCache
             Kind = fastPreview
                 ? PersistentPreviewKind.BrowseThumbnailFast
                 : PersistentPreviewKind.BrowseThumbnailFinal,
+            Root = configuration.Root,
             Path = path,
             Epoch = Volatile.Read(ref _cacheEpoch),
             Bitmap = copy
@@ -652,6 +670,8 @@ internal static class PersistentPreviewCache
                            ref _lastUserActivityTick) < 5000)
                     await Task.Delay(1000).ConfigureAwait(false);
                 var configuration = Volatile.Read(ref _configuration);
+                await using var processLease = await CacheProcessCoordinator
+                    .AcquireMaintenanceAsync(configuration.Root).ConfigureAwait(false);
                 var more = TrimCategory(Path.Combine(configuration.Root, "v2", "full-view"),
                     configuration.FullViewLimitBytes);
                 more |= TrimCategory(Path.Combine(configuration.Root, "v2", "thumbnails"),

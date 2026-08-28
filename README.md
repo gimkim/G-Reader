@@ -93,6 +93,8 @@ Fast Reader/Viewer can remember the last page separately for every folder, archi
 ## Opening and Windows integration
 
 - Open a file or folder from the toolbar.
+- Fast Reader/Viewer keeps one profile-owning process and can host multiple independent reader windows. Use `Ctrl+N` for a new window, `Ctrl+W` to close one window, and `Ctrl+Q` to exit all windows.
+- Starting the executable again, opening an associated file from Explorer, or using the command line forwards the request to that existing process and opens a new window. Settings, worker pools, GPU/PDF admission, history, and persistent caches are shared instead of being multiplied by every launch.
 - Drag a file or folder onto the window; Fast Reader/Viewer activates and takes focus after the drop.
 - Configure a library root and use **Open random** to choose an eligible folder, archive, or PDF recursively.
 - Use **Open in Explorer** to select the current image or archive/PDF source file. In Thumbnail view, a selected folder, archive, or PDF tile is selected in Explorer instead.
@@ -114,7 +116,9 @@ Command-line examples:
 
 Fast Reader/Viewer separates interactive display work from decoding, preview generation, Lanczos resizing, and cache cleanup.
 
-- Embedded ICC metadata and the active Windows monitor profile are read off the UI thread. Direct2D applies cached source-to-monitor transforms on the GPU for full-page, zoom, and image-thumbnail rendering; color management can be disabled in Settings.
+- Memory cache limits are process-wide across reader windows: one window can use the full configured budget; with multiple windows the active window receives 60% and inactive windows share the remaining 40%. Inactive or minimized windows submit lower-priority work so the focused reader remains responsive.
+- Settings are saved atomically with a recoverable previous copy. Destructive edits are serialized by canonical source path, and cache maintenance coordinates with active writers across compatible Fast Reader/Viewer processes that share the same cache folder.
+- Embedded ICC metadata and the active Windows monitor profile are read off the UI thread. Embedded profiles are structurally validated before Direct2D sees them; profiles with out-of-bounds or partially overlapping tag data fall back to sRGB for that image only. Direct2D applies cached source-to-monitor transforms on the GPU for full-page, zoom, and image-thumbnail rendering; color management can be disabled in Settings.
 - Changing folders, archives, or PDFs retains decoded and resized pages from recent books as low-priority cache entries. Returning can reuse ready pages, while retained entries are evicted before active-book data whenever the configured memory budget is needed.
 - Full-page presentation and the thumbnail grid use independent Direct2D HWND render targets.
 - Thumbnail images and contact sheets upload lazily into a dedicated GPU texture LRU. An adaptive uploader measures observed transfer throughput and limits each frame by both elapsed upload time and bytes: idle frames receive a larger budget to fill high-resolution grids quickly, while scrolling uses a smaller latency budget to preserve input responsiveness.

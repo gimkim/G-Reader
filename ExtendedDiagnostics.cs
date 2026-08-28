@@ -48,7 +48,8 @@ internal static class ExtendedDiagnostics
     private static long _hangStarted;
     private static string _uiContext = "UI not attached";
     private static string? _sessionLogPath;
-    private static System.Windows.Forms.Timer? _heartbeatTimer;
+    private static readonly object UiHeartbeatGate = new();
+    private static readonly Dictionary<Control, System.Windows.Forms.Timer> UiHeartbeatTimers = [];
     private static int _logWriterStarted;
 
     public static string FolderPath => DiagnosticsFolder;
@@ -132,18 +133,30 @@ internal static class ExtendedDiagnostics
 
     public static void AttachUi(Control owner, Func<string> contextProvider)
     {
-        _heartbeatTimer?.Dispose();
         var timer = new System.Windows.Forms.Timer { Interval = 500 };
         timer.Tick += (_, _) =>
         {
             Volatile.Write(ref _lastUiHeartbeat, Environment.TickCount64);
-            try { Volatile.Write(ref _uiContext, contextProvider()); }
+            try
+            {
+                if (owner.FindForm()?.ContainsFocus == true ||
+                    string.Equals(_uiContext, "UI not attached", StringComparison.Ordinal))
+                    Volatile.Write(ref _uiContext, contextProvider());
+            }
             catch { }
         };
         owner.HandleCreated += (_, _) => timer.Start();
         owner.HandleDestroyed += (_, _) => timer.Stop();
-        owner.Disposed += (_, _) => timer.Dispose();
-        _heartbeatTimer = timer;
+        owner.Disposed += (_, _) =>
+        {
+            timer.Dispose();
+            lock (UiHeartbeatGate) UiHeartbeatTimers.Remove(owner);
+        };
+        lock (UiHeartbeatGate)
+        {
+            if (UiHeartbeatTimers.Remove(owner, out var previous)) previous.Dispose();
+            UiHeartbeatTimers[owner] = timer;
+        }
         if (owner.IsHandleCreated) timer.Start();
     }
 

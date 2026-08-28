@@ -1,4 +1,6 @@
 using System.Text.Json;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace CDisplayEx.CSharp;
 
@@ -115,9 +117,17 @@ internal sealed class UserSettings
     public int WindowWidth { get; set; } = 1100;
     public int WindowHeight { get; set; } = 760;
 
-    private static string FilePath => Path.Combine(
+    internal static string ProfileDirectory => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-        "Fast Reader Viewer", "settings.json");
+        "Fast Reader Viewer");
+
+    internal static string FilePath => Path.Combine(ProfileDirectory, "settings.json");
+
+    private static string BackupFilePath => FilePath + ".previous";
+
+    private static readonly object SaveGate = new();
+    private static readonly string SaveMutexName = "Local\\FastReaderViewer.Settings." +
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(ProfileDirectory)))[..16];
 
     private static string PreviousFilePath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -131,12 +141,13 @@ internal sealed class UserSettings
     {
         try
         {
-            var path = File.Exists(FilePath) ? FilePath
+            var path = File.Exists(FilePath) || File.Exists(BackupFilePath) ? FilePath
                 : File.Exists(PreviousFilePath) ? PreviousFilePath
                 : LegacyFilePath;
-            var settings = File.Exists(path)
-                ? JsonSerializer.Deserialize<UserSettings>(File.ReadAllText(path)) ?? new()
-                : CreateFirstRunDefaults();
+            var settings = TryRead(path) ??
+                (string.Equals(path, FilePath, StringComparison.OrdinalIgnoreCase)
+                    ? TryRead(BackupFilePath)
+                    : null) ?? CreateFirstRunDefaults();
             // Older benchmark builds could select 16 PDFium processes. Keep
             // manual values untouched, but repair that unsafe automatic result.
             if (settings.UseBenchmarkProfile && settings.PdfiumProcessCount > 8)
@@ -169,9 +180,72 @@ internal sealed class UserSettings
 
     public void Save()
     {
-        var folder = Path.GetDirectoryName(FilePath)!;
-        Directory.CreateDirectory(folder);
-        File.WriteAllText(FilePath, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
+        lock (SaveGate)
+        {
+            using var mutex = new Mutex(false, SaveMutexName);
+            var acquired = false;
+            try
+            {
+                // A stale/foreign writer must not make an interactive settings
+                // action or window close look like an application hang.
+                try { acquired = mutex.WaitOne(TimeSpan.FromSeconds(2)); }
+                catch (AbandonedMutexException) { acquired = true; }
+                if (!acquired)
+                    throw new IOException("Timed out waiting to save Fast Reader/Viewer settings.");
+
+                Directory.CreateDirectory(ProfileDirectory);
+                var temporary = FilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                try
+                {
+                    var json = JsonSerializer.Serialize(this,
+                        new JsonSerializerOptions { WriteIndented = true });
+                    using (var stream = new FileStream(temporary, FileMode.CreateNew,
+                               FileAccess.Write, FileShare.None, 64 * 1024,
+                               FileOptions.WriteThrough))
+                    using (var writer = new StreamWriter(stream, new UTF8Encoding(false)))
+                    {
+                        writer.Write(json);
+                        writer.Flush();
+                        stream.Flush(flushToDisk: true);
+                    }
+
+                    if (File.Exists(FilePath))
+                    {
+                        try { if (File.Exists(BackupFilePath)) File.Delete(BackupFilePath); }
+                        catch { }
+                        try { File.Replace(temporary, FilePath, BackupFilePath, true); }
+                        catch (PlatformNotSupportedException)
+                        {
+                            File.Move(temporary, FilePath, overwrite: true);
+                        }
+                    }
+                    else
+                    {
+                        File.Move(temporary, FilePath, overwrite: false);
+                    }
+                }
+                finally
+                {
+                    try { if (File.Exists(temporary)) File.Delete(temporary); }
+                    catch { }
+                }
+            }
+            finally
+            {
+                if (acquired) mutex.ReleaseMutex();
+            }
+        }
+    }
+
+    private static UserSettings? TryRead(string path)
+    {
+        try
+        {
+            return File.Exists(path)
+                ? JsonSerializer.Deserialize<UserSettings>(File.ReadAllText(path))
+                : null;
+        }
+        catch { return null; }
     }
 
     private static string NormalizeHistoryPath(string path)
