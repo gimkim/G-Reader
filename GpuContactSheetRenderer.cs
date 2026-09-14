@@ -47,31 +47,12 @@ internal static class GpuContactSheetRenderer
             }
             else
             {
-                resized = source.PixelFormat == DrawingPixelFormat.Format32bppPArgb
-                    ? new Bitmap(source)
-                    : ConvertToPArgb(source);
+                resized = BitmapAlphaUtility.CloneToPArgb(source);
             }
             cancellationToken.ThrowIfCancellationRequested();
             return UploadBitmap(resized);
         }
         finally { resized?.Dispose(); }
-    }
-
-    private static Bitmap ConvertToPArgb(Bitmap source)
-    {
-        var converted = new Bitmap(source.Width, source.Height,
-            DrawingPixelFormat.Format32bppPArgb);
-        try
-        {
-            using var graphics = Graphics.FromImage(converted);
-            graphics.DrawImageUnscaled(source, 0, 0);
-            return converted;
-        }
-        catch
-        {
-            converted.Dispose();
-            throw;
-        }
     }
 
     internal static GpuRenderedImage? Upload(Bitmap source) => UploadBitmap(source);
@@ -89,7 +70,7 @@ internal static class GpuContactSheetRenderer
         }
         finally { source.UnlockBits(data); }
         return GpuInteropDevice.CreateImageFromBgra(
-            pixels, source.Width, source.Height);
+            pixels, source.Width, source.Height, pixelsArePremultiplied: true);
     }
 
     private static GpuRenderedImage? TryScale(
@@ -184,7 +165,7 @@ internal static class GpuContactSheetRenderer
                             using var surface = image.Texture.QueryInterface<IDXGISurface>();
                             inputs.Add(_context.CreateBitmapFromDxgiSurface(surface,
                                 new BitmapProperties1(new PixelFormat(
-                                    Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Ignore),
+                                    Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Premultiplied),
                                     96f, 96f, BitmapOptions.None)));
                         }
                         _context.Target = output;

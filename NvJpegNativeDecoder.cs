@@ -678,10 +678,7 @@ internal static unsafe class NvJpegNativeDecoder
             var input = source;
             if (source.PixelFormat != PixelFormat.Format32bppPArgb)
             {
-                converted = new Bitmap(source.Width, source.Height,
-                    PixelFormat.Format32bppPArgb);
-                using var graphics = Graphics.FromImage(converted);
-                graphics.DrawImageUnscaled(source, 0, 0);
+                converted = BitmapAlphaUtility.CloneToPArgb(source);
                 input = converted;
             }
             try
@@ -732,10 +729,7 @@ internal static unsafe class NvJpegNativeDecoder
             var input = source;
             if (source.PixelFormat != PixelFormat.Format32bppPArgb)
             {
-                converted = new Bitmap(source.Width, source.Height,
-                    PixelFormat.Format32bppPArgb);
-                using var graphics = Graphics.FromImage(converted);
-                graphics.DrawImageUnscaled(source, 0, 0);
+                converted = BitmapAlphaUtility.CloneToPArgb(source);
                 input = converted;
             }
             try

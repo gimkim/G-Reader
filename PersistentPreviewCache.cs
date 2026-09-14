@@ -292,7 +292,7 @@ internal static class PersistentPreviewCache
                 FileOptions.SequentialScan);
             using var image = Image.FromStream(stream, useEmbeddedColorManagement: false,
                 validateImageData: false);
-            bitmap = new Bitmap(image);
+            bitmap = BitmapAlphaUtility.CloneToPArgb(image);
             return true;
         }
         catch (OperationCanceledException)
@@ -317,7 +317,7 @@ internal static class PersistentPreviewCache
         var configuration = Volatile.Read(ref _configuration);
         if (GetLimit(configuration, kind) <= 0) return;
         Bitmap copy;
-        try { copy = new Bitmap(preview); }
+        try { copy = BitmapAlphaUtility.CloneToPArgb(preview); }
         catch { return; }
 
         string path;
@@ -410,7 +410,9 @@ internal static class PersistentPreviewCache
                         await File.WriteAllBytesAsync(temporary, encoded).ConfigureAwait(false);
                     else if (write.Bitmap is { } bitmap)
                         SaveImage(bitmap, temporary, write.Kind,
-                            write.Kind == PersistentPreviewKind.ThumbnailFinal ? 92L : 82L);
+                            write.Kind == PersistentPreviewKind.ThumbnailFinal ? 92L : 82L,
+                            Path.GetExtension(write.Path).Equals(
+                                ".png", StringComparison.OrdinalIgnoreCase));
                     else
                         continue;
                     try { File.Move(temporary, write.Path, overwrite: false); }
@@ -456,7 +458,7 @@ internal static class PersistentPreviewCache
                 FileOptions.SequentialScan);
             using var image = Image.FromStream(stream, useEmbeddedColorManagement: false,
                 validateImageData: false);
-            bitmap = new Bitmap(image);
+            bitmap = BitmapAlphaUtility.CloneToPArgb(image);
             return true;
         }
         catch (OperationCanceledException)
@@ -481,7 +483,7 @@ internal static class PersistentPreviewCache
         var configuration = Volatile.Read(ref _configuration);
         if (configuration.ThumbnailLimitBytes <= 0) return;
         Bitmap copy;
-        try { copy = new Bitmap(preview); }
+        try { copy = BitmapAlphaUtility.CloneToPArgb(preview); }
         catch { return; }
         string path;
         try
@@ -520,17 +522,20 @@ internal static class PersistentPreviewCache
         return PagePaths.GetOrCreateValue(book).GetOrAdd(key, _ =>
         {
             var source = book.GetCacheSourceIdentity(pageIndex);
-        // v3 invalidates previews produced before the nvJPEG RGBI/BGRI channel
-        // order correction; keeping the same category lets quota cleanup remove
-        // old v2 files normally.
-            var identity = string.Join('\n', "greader-preview-v3-color", kind,
+            // Alpha-capable formats use a lossless PNG cache so transparency is
+            // not flattened by the JPEG encoder. Opaque formats keep their v3
+            // identity and existing cache entries.
+            var preserveAlpha = SupportsTransparency(source.PageName);
+            var identity = string.Join('\n', preserveAlpha
+                    ? "greader-preview-v4-premultiplied-alpha"
+                    : "greader-preview-v3-color", kind,
                 source.SourcePath, source.PageName, source.Length, source.ModifiedTicks,
                 normalizedRotation, widthBucket, heightBucket, normalizedQuality,
                 GetPdfEngineIdentity(source.SourcePath));
             var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)))
                 .ToLowerInvariant();
             return Path.Combine(GetCategoryRoot(configuration, kind),
-                hash[..2], hash + ".jpg");
+                hash[..2], hash + (preserveAlpha ? ".png" : ".jpg"));
         });
     }
 
@@ -622,9 +627,19 @@ internal static class PersistentPreviewCache
             ? 1
             : -1;
 
+    private static bool SupportsTransparency(string pageName) =>
+        Path.GetExtension(pageName).ToLowerInvariant() is
+            ".png" or ".webp" or ".gif" or ".tif" or ".tiff" or ".bmp";
+
     private static void SaveImage(
-        Bitmap bitmap, string path, PersistentPreviewKind kind, long quality)
+        Bitmap bitmap, string path, PersistentPreviewKind kind, long quality,
+        bool preserveAlpha)
     {
+        if (preserveAlpha)
+        {
+            bitmap.Save(path, ImageFormat.Png);
+            return;
+        }
         var codec = ImageCodecInfo.GetImageEncoders().FirstOrDefault(
             candidate => candidate.FormatID == ImageFormat.Jpeg.Guid);
         if (codec is null)

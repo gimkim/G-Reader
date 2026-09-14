@@ -2318,7 +2318,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     {
         var page = book.Pages[index];
         cancellationToken.ThrowIfCancellationRequested();
-        if (page.Decode is not null) return page.Decode(cancellationToken);
+        if (page.Decode is not null)
+            return BitmapAlphaUtility.EnsureOwnedPArgb(page.Decode(cancellationToken));
         using var formatLease = ImagePipelineTuning.EnterFormat(
             page.Name, cancellationToken);
         if (Path.GetExtension(page.Name).Equals(".webp", StringComparison.OrdinalIgnoreCase))
@@ -2337,7 +2338,11 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             }
         }
         using var stream = page.OpenStream(cancellationToken);
-        try { using var source = Image.FromStream(stream); return new Bitmap(source); }
+        try
+        {
+            using var source = Image.FromStream(stream);
+            return BitmapAlphaUtility.CloneToPArgb(source);
+        }
         catch (ArgumentException)
         {
             stream.Position = 0;
@@ -3246,7 +3251,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 // generic non-JPEG resize lane again only serialized PDF work
                 // behind FastPreviewWorkerCount (commonly 4) without improving
                 // its dimensions or quality.
-                result = new Bitmap(image);
+                result = BitmapAlphaUtility.CloneToPArgb(image);
                 PersistentPreviewCache.StoreCopyInBackground(
                     persistentKind, book, page, targetSize, rotation,
                     persistentQuality, result);

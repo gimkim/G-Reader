@@ -98,7 +98,7 @@ internal sealed class PageCache : IDisposable
                     "The page cache entry was retired.", cancellationToken);
             return await Task.Run(() =>
             {
-                lock (bitmap) return new Bitmap(bitmap);
+                lock (bitmap) return BitmapAlphaUtility.CloneToPArgb(bitmap);
             }, cancellationToken).ConfigureAwait(false);
         }
         finally

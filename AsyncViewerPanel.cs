@@ -2214,7 +2214,7 @@ internal sealed class AsyncViewerPanel : Panel
     {
         if (source is null || size.IsEmpty) return null;
         cancellationToken.ThrowIfCancellationRequested();
-        var preview = new Bitmap(size.Width, size.Height, PixelFormat.Format32bppArgb);
+        var preview = new Bitmap(size.Width, size.Height, PixelFormat.Format32bppPArgb);
         BitmapData? sourceData = null;
         BitmapData? destinationData = null;
         var completed = false;
@@ -2222,10 +2222,10 @@ internal sealed class AsyncViewerPanel : Panel
         {
             sourceData = source.LockBits(
                 new Rectangle(0, 0, source.Width, source.Height),
-                ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+                ImageLockMode.ReadOnly, PixelFormat.Format32bppPArgb);
             destinationData = preview.LockBits(
                 new Rectangle(0, 0, size.Width, size.Height),
-                ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+                ImageLockMode.WriteOnly, PixelFormat.Format32bppPArgb);
             var sourceScan0 = sourceData.Scan0;
             var destinationScan0 = destinationData.Scan0;
             var sourceStride = sourceData.Stride;
@@ -2371,6 +2371,8 @@ internal sealed class AsyncViewerPanel : Panel
         var rowBytes = checked(width * 4);
         var pixels = GC.AllocateUninitializedArray<byte>(checked(rowBytes * height));
         var bounds = new Rectangle(0, 0, width, height);
+        // Magick.NET consumes straight-alpha BGRA and performs alpha-aware
+        // filtering. GDI+ unassociates our PArgb source for that operation.
         var data = source.LockBits(bounds, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
         try
         {
@@ -2404,29 +2406,7 @@ internal sealed class AsyncViewerPanel : Panel
 
     private static Bitmap CreateBitmapFromBgra(byte[] pixels, int width, int height)
     {
-        var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
-        try
-        {
-            var bounds = new Rectangle(0, 0, width, height);
-            var data = bitmap.LockBits(bounds, ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
-            try
-            {
-                var rowBytes = checked(width * 4);
-                for (var y = 0; y < height; y++)
-                {
-                    var destinationRow = IntPtr.Add(data.Scan0, y * data.Stride);
-                    System.Runtime.InteropServices.Marshal.Copy(
-                        pixels, y * rowBytes, destinationRow, rowBytes);
-                }
-            }
-            finally { bitmap.UnlockBits(data); }
-            return bitmap;
-        }
-        catch
-        {
-            bitmap.Dispose();
-            throw;
-        }
+        return BitmapAlphaUtility.FromStraightBgra(pixels, width, height);
     }
 
     private bool TryPresentGpuCachedPages(
@@ -2978,7 +2958,7 @@ internal sealed class AsyncViewerPanel : Panel
             try
             {
                 Bitmap stored;
-                lock (bitmap) stored = new Bitmap(bitmap);
+                lock (bitmap) stored = BitmapAlphaUtility.CloneToPArgb(bitmap);
                 if (!AddRenderOwned(key, stored)) stored.Dispose();
             }
             finally { ReleaseSource(bitmap); }
@@ -2994,7 +2974,7 @@ internal sealed class AsyncViewerPanel : Panel
             try
             {
                 Bitmap stored;
-                lock (bitmap) stored = new Bitmap(bitmap);
+                lock (bitmap) stored = BitmapAlphaUtility.CloneToPArgb(bitmap);
                 if (!AddPreviewOwned(key, stored)) stored.Dispose();
             }
             finally { ReleaseSource(bitmap); }

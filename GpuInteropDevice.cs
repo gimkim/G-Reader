@@ -323,16 +323,19 @@ internal static class GpuInteropDevice
     }
 
     public static unsafe GpuRenderedImage? CreateImageFromBgra(
-        byte[] pixels, int width, int height)
+        byte[] pixels, int width, int height, bool pixelsArePremultiplied = false)
     {
         using var usage = AcquireUsage();
         if (usage is null || width <= 0 || height <= 0) return null;
         var rowPitch = checked(width * 4);
         if (pixels.Length < checked(rowPitch * height)) return null;
         ID3D11Texture2D? texture = null;
+        var uploadPixels = pixelsArePremultiplied
+            ? pixels
+            : BitmapAlphaUtility.PremultiplyBgraCopy(pixels, width, height);
         try
         {
-            fixed (byte* pointer = pixels)
+            fixed (byte* pointer = uploadPixels)
             {
                 var initial = new SubresourceData(
                     pointer, (uint)rowPitch, (uint)(rowPitch * height));

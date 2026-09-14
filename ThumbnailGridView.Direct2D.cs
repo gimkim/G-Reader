@@ -806,7 +806,7 @@ internal sealed partial class ThumbnailGridView
         try
         {
             data = source.LockBits(rectangle, ImageLockMode.ReadOnly,
-                System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+                System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
             if (data.Stride <= 0)
                 throw new InvalidOperationException("Direct2D requires a top-down bitmap surface.");
             var properties = new BitmapProperties(
@@ -883,7 +883,7 @@ internal sealed partial class ThumbnailGridView
             using var surface = source.Texture.QueryInterface<IDXGISurface>();
             var properties = new BitmapProperties1(
                 new Vortice.DCommon.PixelFormat(
-                    Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Ignore),
+                    Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Premultiplied),
                 96f, 96f, BitmapOptions.None);
             var texture = _thumbnailDeviceContext.CreateBitmapFromDxgiSurface(surface, properties);
             var node = _nativeThumbnailGpuLru.AddLast(source);
@@ -950,7 +950,7 @@ internal sealed partial class ThumbnailGridView
             var destinationPointer = destination.NativePointer;
             var intent = (int)ColorManagementRenderingIntent.RelativeColorimetric;
             var quality = (int)ColormanagementQuality.Best;
-            var alpha = (int)ColorManagementAlphaMode.Straight;
+            var alpha = (int)ColorManagementAlphaMode.Premultiplied;
             effect.SetValue((uint)ColorManagementProperties.SourceColorContext,
                 PropertyType.ColorContext, &sourcePointer, (uint)IntPtr.Size);
             effect.SetValue((uint)ColorManagementProperties.DestinationColorContext,

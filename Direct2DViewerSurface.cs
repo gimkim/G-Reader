@@ -269,7 +269,7 @@ internal sealed class Direct2DViewerSurface : Control
             using var surface = frame.Texture.QueryInterface<IDXGISurface>();
             bitmap = _deviceContext.CreateBitmapFromDxgiSurface(surface,
                 new BitmapProperties1(new Vortice.DCommon.PixelFormat(
-                    Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Ignore),
+                    Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Premultiplied),
                     96f, 96f, BitmapOptions.None));
             ID2D1Bitmap? oldBitmap;
             GpuRenderedImage? oldSource;
@@ -630,8 +630,16 @@ internal sealed class Direct2DViewerSurface : Control
             return cached.Bitmap;
         }
 
-        var rect = new Rectangle(0, 0, source.Width, source.Height);
-        var data = source.LockBits(rect, ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        Bitmap? converted = null;
+        var upload = source;
+        if (source.PixelFormat != System.Drawing.Imaging.PixelFormat.Format32bppPArgb)
+        {
+            converted = BitmapAlphaUtility.CloneToPArgb(source);
+            upload = converted;
+        }
+        var rect = new Rectangle(0, 0, upload.Width, upload.Height);
+        var data = upload.LockBits(rect, ImageLockMode.ReadOnly,
+            System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
         try
         {
             if (data.Stride <= 0) throw new InvalidOperationException("Direct2D requires a top-down bitmap surface.");
@@ -639,7 +647,7 @@ internal sealed class Direct2DViewerSurface : Control
             if (_deviceContext is not null)
             {
                 var properties = new BitmapProperties1(
-                    new Vortice.DCommon.PixelFormat(Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Ignore),
+                    new Vortice.DCommon.PixelFormat(Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Premultiplied),
                     96f, 96f, BitmapOptions.None);
                 bitmap = _deviceContext.CreateBitmap(
                     new SizeI(source.Width, source.Height), data.Scan0, (uint)data.Stride, properties);
@@ -647,7 +655,7 @@ internal sealed class Direct2DViewerSurface : Control
             else
             {
                 var properties = new BitmapProperties(
-                    new Vortice.DCommon.PixelFormat(Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Ignore), 96f, 96f);
+                    new Vortice.DCommon.PixelFormat(Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Premultiplied), 96f, 96f);
                 bitmap = _renderTarget!.CreateBitmap(
                     new SizeI(source.Width, source.Height), data.Scan0, (uint)data.Stride, properties);
             }
@@ -660,7 +668,8 @@ internal sealed class Direct2DViewerSurface : Control
         }
         finally
         {
-            source.UnlockBits(data);
+            upload.UnlockBits(data);
+            converted?.Dispose();
         }
     }
 
@@ -682,7 +691,7 @@ internal sealed class Direct2DViewerSurface : Control
             using var surface = source.Texture.QueryInterface<IDXGISurface>();
             var properties = new BitmapProperties1(
                 new Vortice.DCommon.PixelFormat(
-                    Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Ignore),
+                    Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Premultiplied),
                 96f, 96f, BitmapOptions.None);
             var bitmap = _deviceContext.CreateBitmapFromDxgiSurface(surface, properties);
             var node = _nativeGpuLru.AddLast(source);
@@ -994,7 +1003,7 @@ internal sealed class Direct2DViewerSurface : Control
             var destinationPointer = destination.NativePointer;
             var intent = (int)ColorManagementRenderingIntent.RelativeColorimetric;
             var quality = (int)ColormanagementQuality.Best;
-            var alpha = (int)ColorManagementAlphaMode.Straight;
+            var alpha = (int)ColorManagementAlphaMode.Premultiplied;
             effect.SetValue((uint)ColorManagementProperties.SourceColorContext,
                 PropertyType.ColorContext, &sourcePointer, (uint)IntPtr.Size);
             effect.SetValue((uint)ColorManagementProperties.DestinationColorContext,
