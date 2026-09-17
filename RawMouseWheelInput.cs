@@ -8,6 +8,9 @@ namespace CDisplayEx.CSharp;
 /// </summary>
 internal static class RawMouseWheelInput
 {
+    private static readonly object RegistrationGate = new();
+    private static readonly List<IntPtr> RegisteredWindows = [];
+    private static IntPtr _targetWindow;
     public const int WindowMessage = 0x00FF;
     private const uint RidInput = 0x10000003;
     private const uint RidevRemove = 0x00000001;
@@ -19,6 +22,22 @@ internal static class RawMouseWheelInput
     public static bool Register(IntPtr window)
     {
         if (window == IntPtr.Zero) return false;
+        lock (RegistrationGate)
+        {
+            RegisteredWindows.Remove(window);
+            RegisteredWindows.Add(window);
+            if (!RegisterTarget(window))
+            {
+                RegisteredWindows.Remove(window);
+                return false;
+            }
+            _targetWindow = window;
+            return true;
+        }
+    }
+
+    private static bool RegisterTarget(IntPtr window)
+    {
         var device = new RawInputDevice
         {
             UsagePage = UsagePageGenericDesktop,
@@ -30,7 +49,24 @@ internal static class RawMouseWheelInput
             [device], 1, (uint)Marshal.SizeOf<RawInputDevice>());
     }
 
-    public static void Unregister()
+    public static void Unregister(IntPtr window)
+    {
+        lock (RegistrationGate)
+        {
+            RegisteredWindows.Remove(window);
+            if (_targetWindow != window) return;
+            if (RegisteredWindows.Count > 0)
+            {
+                var next = RegisteredWindows[^1];
+                if (RegisterTarget(next)) _targetWindow = next;
+                return;
+            }
+            UnregisterAll();
+            _targetWindow = IntPtr.Zero;
+        }
+    }
+
+    private static void UnregisterAll()
     {
         var device = new RawInputDevice
         {

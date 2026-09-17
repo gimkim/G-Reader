@@ -127,14 +127,14 @@ internal static class TurboJpegNativeDecoder
                 var decodeWidth = Scale(sourceWidth, factor);
                 var decodeHeight = Scale(sourceHeight, factor);
                 var decoded = new Bitmap(
-                    decodeWidth, decodeHeight, PixelFormat.Format32bppArgb);
+                    decodeWidth, decodeHeight, PixelFormat.Format32bppPArgb);
                 BitmapData? data = null;
                 var completed = false;
                 try
                 {
                     data = decoded.LockBits(
                         new Rectangle(0, 0, decodeWidth, decodeHeight),
-                        ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+                        ImageLockMode.WriteOnly, PixelFormat.Format32bppPArgb);
                     if (data.Stride <= 0) return false;
                     cancellationToken.ThrowIfCancellationRequested();
                     if (Tj3Decompress8(handle, source, (nuint)encoded.Length,
@@ -199,7 +199,7 @@ internal static class TurboJpegNativeDecoder
     private static byte[] ReadAllBytes(
         PageEntry page, CancellationToken cancellationToken)
     {
-        using var source = page.Open();
+        using var source = page.OpenStream(cancellationToken);
         var capacity = 0;
         try
         {

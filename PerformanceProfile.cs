@@ -37,7 +37,7 @@ internal sealed record PerformanceProfile(
         if (availableBytes <= 0) availableBytes = 8L * 1024 * 1024 * 1024;
         var availableMB = Math.Max(2048L, availableBytes / (1024 * 1024));
 
-        // Keep most RAM outside G Reader for the OS, compressed source data,
+        // Keep most RAM outside Fast Reader/Viewer for the OS, compressed source data,
         // ImageMagick working buffers and transient relaxed-cache headroom.
         var pageCacheMB = RoundDown(Math.Clamp(availableMB / 4, 1024, 16384), 256);
         var aheadMB = RoundDown(pageCacheMB * 3 / 4, 128);
@@ -55,7 +55,10 @@ internal sealed record PerformanceProfile(
         if (availableMB < 8192) fastWorkers = Math.Min(fastWorkers, 3);
         var fastThreads = Math.Clamp(
             (logicalCpu + fastWorkers - 1) / fastWorkers, 1, 16);
-        var globalFastConcurrency = Math.Clamp(fastWorkers * fastThreads, 1, logicalCpu);
+        // Fast previews compete with the UI, PDF workers and final-quality work.
+        // The automatic recommendation therefore uses at most half of the
+        // machine's logical processors instead of saturating every core.
+        var globalFastConcurrency = Math.Max(1, logicalCpu / 2);
         var magickThreads = Math.Clamp(
             (logicalCpu + precacheWorkers - 1) / precacheWorkers, 2, 16);
         // Zoom normally has one latency-sensitive viewport job. Leave one

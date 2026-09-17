@@ -2,13 +2,15 @@ using System.ComponentModel;
 
 namespace CDisplayEx.CSharp;
 
-internal sealed record ToolbarHotkeyDefinition(string Id, string Label, Keys DefaultShortcut);
+internal sealed record ToolbarHotkeyDefinition(
+    string Id, string Label, string Category, Keys DefaultShortcut);
 
 internal static class ToolbarHotkeyCatalog
 {
     public const string OpenFile = "open_file";
     public const string OpenFolder = "open_folder";
     public const string OpenRandom = "open_random";
+    public const string History = "history";
     public const string OpenInExplorer = "open_in_explorer";
     public const string MoveUp = "move_up";
     public const string PreviousContainer = "previous_container";
@@ -26,23 +28,25 @@ internal static class ToolbarHotkeyCatalog
 
     public static IReadOnlyList<ToolbarHotkeyDefinition> All { get; } =
     [
-        new(OpenFile, "Open file", Keys.Control | Keys.L),
-        new(OpenFolder, "Open folder", Keys.Control | Keys.O),
-        new(OpenRandom, "Open random", Keys.Control | Keys.R),
-        new(OpenInExplorer, "Open in Explorer", Keys.Control | Keys.Shift | Keys.E),
-        new(MoveUp, "Move up", Keys.Alt | Keys.Up),
-        new(PreviousContainer, "Previous folder / archive", Keys.Control | Keys.Up),
-        new(NextContainer, "Next folder / archive", Keys.Control | Keys.Down),
-        new(Start, "Start", Keys.Home),
-        new(Left, "Left", Keys.Left),
-        new(Right, "Right", Keys.Right),
-        new(End, "End", Keys.End),
-        new(ViewMode, "Full page / Thumbnail grid", Keys.Control | Keys.T),
-        new(PageLayout, "Page layout", Keys.Control | Keys.D),
-        new(AutoSingleLandscape, "Auto-single landscape", Keys.Control | Keys.Shift | Keys.A),
-        new(ReadingDirection, "LTR / RTL", Keys.Control | Keys.J),
-        new(Fullscreen, "Toggle fullscreen", Keys.F11),
-        new(Settings, "Settings", Keys.Control | Keys.Oemcomma)
+        new(OpenFile, "Open file", "Files & library", Keys.Control | Keys.L),
+        new(OpenFolder, "Open folder", "Files & library", Keys.Control | Keys.O),
+        new(OpenRandom, "Open random", "Files & library", Keys.Control | Keys.R),
+        new(History, "Recently opened history", "Files & library",
+            Keys.Control | Keys.Shift | Keys.H),
+        new(OpenInExplorer, "Open in Explorer", "Files & library", Keys.Control | Keys.Shift | Keys.E),
+        new(MoveUp, "Move up", "Files & library", Keys.Alt | Keys.Up),
+        new(PreviousContainer, "Previous folder / archive", "Files & library", Keys.Control | Keys.Up),
+        new(NextContainer, "Next folder / archive", "Files & library", Keys.Control | Keys.Down),
+        new(Start, "Start", "Page navigation", Keys.Home),
+        new(Left, "Left", "Page navigation", Keys.Left),
+        new(Right, "Right", "Page navigation", Keys.Right),
+        new(End, "End", "Page navigation", Keys.End),
+        new(ViewMode, "Full page / Thumbnail grid", "Reading view", Keys.Control | Keys.T),
+        new(PageLayout, "Page layout", "Reading view", Keys.Control | Keys.D),
+        new(AutoSingleLandscape, "Auto-single landscape", "Reading view", Keys.Control | Keys.Shift | Keys.A),
+        new(ReadingDirection, "LTR / RTL", "Reading view", Keys.Control | Keys.J),
+        new(Fullscreen, "Toggle fullscreen", "Reading view", Keys.F11),
+        new(Settings, "Settings", "Application", Keys.Control | Keys.Oemcomma)
     ];
 
     public static IReadOnlyList<string> ThumbnailArrowPriorityActions { get; } =

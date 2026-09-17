@@ -143,7 +143,7 @@ internal static class AnimatedImageRenderer
     public static Bitmap DecodeWebPPoster(PageEntry page, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        using var stream = page.Open();
+        using var stream = page.OpenStream(cancellationToken);
         using var decoder = new AnimDecoder(stream, useThreads: true);
         var frame = decoder.GetNextFrame() ??
             throw new InvalidDataException("WebP contains no decodable frame.");
@@ -171,7 +171,7 @@ internal static class AnimatedImageRenderer
 
         // Use one stream for GIF detection and decode. Opening an archive-backed
         // PageEntry twice used to decompress/copy a large WebP twice.
-        using var stream = page.Open();
+        using var stream = page.OpenStream(cancellationToken);
         if (!IsAnimatedContainer(stream, Path.GetExtension(page.Name))) return;
         if (stream.CanSeek) stream.Position = 0;
         else throw new NotSupportedException("Animated image stream must be seekable.");
@@ -253,7 +253,7 @@ internal static class AnimatedImageRenderer
             return;
         }
 
-        using var stream = page.Open();
+        using var stream = page.OpenStream(cancellationToken);
         using var decoder = new AnimDecoder(stream, useThreads: true);
         if (decoder.Info.FrameCount <= 1) return;
         var frames = new AnimationFrameSet(1) { IsGpuStream = true };
@@ -293,7 +293,7 @@ internal static class AnimatedImageRenderer
         PageEntry page, Size clientSize, int visiblePageCount, int rotation,
         CancellationToken cancellationToken, Action<AnimationFrameSet> ready)
     {
-        using var stream = page.Open();
+        using var stream = page.OpenStream(cancellationToken);
         using var decoder = new AnimDecoder(stream, useThreads: true);
         if (decoder.Info.FrameCount <= 1) return;
         var normalizedRotation = NormalizeRotation(rotation);
