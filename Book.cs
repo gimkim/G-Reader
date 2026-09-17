@@ -316,6 +316,35 @@ internal sealed class Book : IDisposable
             containers);
     }
 
+    internal static (string Path, bool IsFolder)[] GetSiblingEntries(
+        string directory, PageSortMode sortMode, bool descending,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        // Directory enumeration already supplies timestamps and file sizes. Keep
+        // that metadata instead of issuing one more SMB request per sibling.
+        // Navigation needs no page entries or image EXIF from the parent book.
+        var metadata = new Dictionary<string, FileSystemInfo>(StringComparer.OrdinalIgnoreCase);
+        var folders = new List<string>();
+        var containers = new List<string>();
+        foreach (var entry in new DirectoryInfo(directory).EnumerateFileSystemInfos())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var isFolder = (entry.Attributes & FileAttributes.Directory) != 0;
+            if (!isFolder && !IsSupportedArchive(entry.Name) &&
+                !Path.GetExtension(entry.Name).Equals(".pdf", StringComparison.OrdinalIgnoreCase))
+                continue;
+            metadata[entry.FullName] = entry;
+            (isFolder ? folders : containers).Add(entry.FullName);
+        }
+        var result = SortBrowsePaths(folders, sortMode, descending, true, metadata, cancellationToken)
+            .Select(path => (Path: path, IsFolder: true))
+            .Concat(SortBrowsePaths(containers, sortMode, descending, false, metadata, cancellationToken)
+                .Select(path => (Path: path, IsFolder: false))).ToArray();
+        cancellationToken.ThrowIfCancellationRequested();
+        return result;
+    }
+
     private static string SortModeDescription(PageSortMode mode, bool descending) =>
         mode switch
         {
@@ -689,10 +718,15 @@ internal sealed class Book : IDisposable
 
     private static IEnumerable<string> SortBrowsePaths(
         IEnumerable<string> paths, PageSortMode mode, bool descending,
-        bool directories)
+        bool directories, IReadOnlyDictionary<string, FileSystemInfo>? metadata = null,
+        CancellationToken cancellationToken = default)
     {
-        var items = paths.Select(path => CreateSortableBrowsePath(
-            path, mode, directories)).ToArray();
+        var items = paths.Select(path =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return CreateSortableBrowsePath(path, mode, directories,
+                metadata?.GetValueOrDefault(path));
+        }).ToArray();
         Func<SortableBrowsePath, string> name = item => Path.GetFileName(
             Path.TrimEndingDirectorySeparator(item.Path));
         IOrderedEnumerable<SortableBrowsePath> ordered;
@@ -746,7 +780,7 @@ internal sealed class Book : IDisposable
     }
 
     private static SortableBrowsePath CreateSortableBrowsePath(
-        string path, PageSortMode mode, bool directory)
+        string path, PageSortMode mode, bool directory, FileSystemInfo? metadata = null)
     {
         long size = 0;
         var modified = DateTime.MinValue;
@@ -755,7 +789,7 @@ internal sealed class Book : IDisposable
         {
             try
             {
-                modified = directory
+                modified = metadata is not null ? metadata.LastWriteTimeUtc : directory
                     ? Directory.GetLastWriteTimeUtc(path)
                     : File.GetLastWriteTimeUtc(path);
             }
@@ -766,7 +800,7 @@ internal sealed class Book : IDisposable
         {
             try
             {
-                created = directory
+                created = metadata is not null ? metadata.CreationTimeUtc : directory
                     ? Directory.GetCreationTimeUtc(path)
                     : File.GetCreationTimeUtc(path);
             }
@@ -784,7 +818,7 @@ internal sealed class Book : IDisposable
                             try { return new FileInfo(file).Length; }
                             catch { return 0L; }
                         }).Sum()
-                    : new FileInfo(path).Length;
+                    : (metadata as FileInfo ?? new FileInfo(path)).Length;
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
         }

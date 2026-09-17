@@ -4763,17 +4763,25 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private async Task OpenAdjacentBookAsync(int direction, int mode)
     {
         var currentBook = _book;
+        var cancellationToken = _bookCancellation?.Token ?? CancellationToken.None;
+        var timer = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             if (currentBook is null || direction == 0) return;
             var sourcePath = currentBook.SourcePath;
             var folderSort = NormalizeSortMode(_settings.FolderPageSort);
             var descending = _settings.FolderPageSortDescending;
+            ExtendedDiagnostics.Breadcrumb(
+                $"Adjacent lookup started: source={sourcePath}; direction={direction}; mode={mode}; sort={folderSort}; descending={descending}");
             var nextPath = await Task.Run(() => FindAdjacentBook(
-                sourcePath, direction, mode, folderSort, descending));
-            if (nextPath is null || !ReferenceEquals(_book, currentBook)) return;
+                sourcePath, direction, mode, folderSort, descending, cancellationToken), cancellationToken);
+            ExtendedDiagnostics.Breadcrumb(
+                $"Adjacent lookup completed: elapsedMs={timer.ElapsedMilliseconds}; next={nextPath}");
+            if (nextPath is null || cancellationToken.IsCancellationRequested ||
+                IsDisposed || !ReferenceEquals(_book, currentBook)) return;
             await TryOpenAsync(nextPath);
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
         catch (IOException) { }
         catch (UnauthorizedAccessException) { }
         finally { Interlocked.Exchange(ref _adjacentBookOpening, 0); }
@@ -4781,26 +4789,22 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private static string? FindAdjacentBook(
         string sourcePath, int direction, int mode,
-        PageSortMode folderSort, bool descending)
+        PageSortMode folderSort, bool descending, CancellationToken cancellationToken)
     {
         sourcePath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(sourcePath));
         var directory = Path.GetDirectoryName(sourcePath);
         if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory)) return null;
-        var parent = Book.Open(
-            directory, folderSort: folderSort,
-            folderSortDescending: descending);
-        var ordered = parent.Subfolders
-            .Select(path => (Path: path, IsFolder: true))
-            .Concat(parent.Containers.Select(path => (Path: path, IsFolder: false)))
-            .ToArray();
+        cancellationToken.ThrowIfCancellationRequested();
+        var ordered = Book.GetSiblingEntries(directory, folderSort, descending, cancellationToken);
         var current = Array.FindIndex(ordered,
             item => PathsEqual(item.Path, sourcePath));
         if (current < 0) return null;
         var step = Math.Sign(direction);
         for (var index = current + step;
              index >= 0 && index < ordered.Length;
-             index += step)
+            index += step)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var candidate = ordered[index];
             var typeEnabled = candidate.IsFolder
                 ? mode is 1 or 3
