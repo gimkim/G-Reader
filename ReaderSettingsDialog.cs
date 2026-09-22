@@ -41,10 +41,10 @@ internal sealed class ReaderSettingsDialog : Form
 {
     public event EventHandler<bool>? BenchmarkRunningChanged;
     private readonly ComboBox _quality = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
-    private readonly CheckBox _useNvJpeg = new()
+    private readonly CheckBox _useNvJpeg = new SettingsWrapCheckBox()
     {
         Text = "Use NVIDIA nvJPEG when available (automatic libjpeg-turbo fallback)",
-        AutoSize = true, Dock = DockStyle.Fill
+        AutoSize = false, Dock = DockStyle.Fill
     };
     private readonly NumericUpDown _pdfiumProcesses = CreatePdfiumProcessInput();
     private readonly NumericUpDown _jpegCpuFastWorkers = CreateWorkerInput();
@@ -73,10 +73,10 @@ internal sealed class ReaderSettingsDialog : Form
     private readonly NumericUpDown _thumbnailScrollUploadBudget = CreateTimeBudgetInput();
     private readonly NumericUpDown _thumbnailUploadBudget = CreateMemoryInput();
     private readonly NumericUpDown _thumbnailUploadsPerFrame = CreateCountInput(1, 1024);
-    private readonly CheckBox _useMonitorColorProfile = new()
+    private readonly CheckBox _useMonitorColorProfile = new SettingsWrapCheckBox()
     {
         Text = "Use the ICC profile assigned to the current monitor",
-        AutoSize = true, Dock = DockStyle.Fill
+        AutoSize = false, Dock = DockStyle.Fill
     };
     private readonly NumericUpDown _ahead = CreateMemoryInput();
     private readonly NumericUpDown _behind = CreateMemoryInput();
@@ -86,7 +86,7 @@ internal sealed class ReaderSettingsDialog : Form
     private readonly TextBox _persistentCachePath = new() { Width = 420 };
     private readonly NumericUpDown _fullViewDiskCache = CreateMemoryInput();
     private readonly NumericUpDown _thumbnailDiskCache = CreateMemoryInput();
-    private readonly Label _diskCacheTotal = new()
+    private readonly Label _diskCacheTotal = new SettingsWrapLabel()
     {
         Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft,
         ForeColor = Color.FromArgb(70, 79, 94)
@@ -98,16 +98,16 @@ internal sealed class ReaderSettingsDialog : Form
     private readonly NumericUpDown _precacheWorkers = CreateWorkerInput();
     private readonly NumericUpDown _imageMagickThreads = CreateWorkerInput();
     private readonly NumericUpDown _zoomImageMagickThreads = CreateZoomThreadInput();
-    private readonly Label _effectiveFastParallelism = new()
+    private readonly Label _effectiveFastParallelism = new SettingsWrapLabel()
     {
         Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft,
         ForeColor = Color.FromArgb(70, 79, 94), AutoEllipsis = false,
         MinimumSize = new Size(0, 100), Padding = new Padding(0, 3, 0, 3)
     };
-    private readonly CheckBox _autoOptimize = new()
+    private readonly CheckBox _autoOptimize = new SettingsWrapCheckBox()
     {
         Text = "Use automatic initial value suggestions for this computer",
-        AutoSize = true, Dock = DockStyle.Fill
+        AutoSize = false, Dock = DockStyle.Fill
     };
     private readonly CheckBox _useBenchmarkProfile = CreateOption(
         "Use the most recent dataset benchmark profile");
@@ -116,17 +116,17 @@ internal sealed class ReaderSettingsDialog : Form
         DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill
     };
     private readonly TextBox _benchmarkDatasetPath = new() { Width = 420 };
-    private readonly Label _autoOptimizeSummary = new()
+    private readonly Label _autoOptimizeSummary = new SettingsWrapLabel()
     {
         Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft,
         ForeColor = Color.FromArgb(70, 79, 94), AutoEllipsis = false,
         MinimumSize = new Size(0, 76), Padding = new Padding(0, 4, 0, 4)
     };
     private readonly ComboBox _autoMove = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
-    private readonly CheckBox _rememberReadingPosition = new()
+    private readonly CheckBox _rememberReadingPosition = new SettingsWrapCheckBox()
     {
         Text = "Remember the last page separately for each folder, archive, and PDF",
-        AutoSize = true, Dock = DockStyle.Fill
+        AutoSize = false, Dock = DockStyle.Fill
     };
     private readonly CheckBox _historyEnabled = CreateOption(
         "Remember recently opened folders, archives, and PDFs");
@@ -206,6 +206,7 @@ internal sealed class ReaderSettingsDialog : Form
 
     public ReaderSettingsDialog(UserSettings settings)
     {
+        SuspendLayout();
         _sourceSettings = settings;
         _manualInitialValues = AutomaticInitialValueProfile.FromSettings(settings);
         _automaticInitialValues = AutomaticInitialValueProfile.Detect();
@@ -343,7 +344,7 @@ internal sealed class ReaderSettingsDialog : Form
         var chooseColor = CreateSecondaryButton("Choose…");
         chooseColor.Click += (_, _) => ChooseBackground();
         _colorPreview.Click += (_, _) => ChooseBackground();
-        var colorRow = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
+        var colorRow = new SettingsFlowPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = true };
         colorRow.Controls.AddRange([_colorPreview, chooseColor]);
 
         var browseRandomPath = CreateSecondaryButton("Browse…");
@@ -392,7 +393,7 @@ internal sealed class ReaderSettingsDialog : Form
                 if (!IsDisposed) clearDiskCache.Enabled = true;
             }
         };
-        var clearDiskCacheRow = new FlowLayoutPanel
+        var clearDiskCacheRow = new SettingsFlowPanel
         {
             Dock = DockStyle.Fill, AutoSize = true, WrapContents = true,
             Margin = Padding.Empty, MinimumSize = new Size(0, 68)
@@ -417,7 +418,7 @@ internal sealed class ReaderSettingsDialog : Form
             readingPositionsStatus.Text = "Will clear when you save settings";
             clearReadingPositions.Enabled = false;
         };
-        var clearReadingPositionsRow = new FlowLayoutPanel
+        var clearReadingPositionsRow = new SettingsFlowPanel
         {
             Dock = DockStyle.Fill, AutoSize = true, WrapContents = true,
             Margin = Padding.Empty, MinimumSize = new Size(0, 68)
@@ -429,7 +430,7 @@ internal sealed class ReaderSettingsDialog : Form
         var isPackaged = AppPackageContext.IsPackaged;
         var chooseDefaultViewer = CreateSecondaryButton("Choose defaults…");
         chooseDefaultViewer.Click += (_, _) => ChooseDefaultImageViewer();
-        var defaultViewerRow = new FlowLayoutPanel
+        var defaultViewerRow = new SettingsFlowPanel
         {
             Dock = DockStyle.Fill, AutoSize = true, WrapContents = false
         };
@@ -438,7 +439,7 @@ internal sealed class ReaderSettingsDialog : Form
         var copyAutomatic = CreateSecondaryButton("Copy suggested values to Manual");
         copyAutomatic.MinimumSize = new Size(218, 32);
         copyAutomatic.Click += (_, _) => CopyAutomaticToManual();
-        var copyAutomaticRow = new FlowLayoutPanel
+        var copyAutomaticRow = new SettingsFlowPanel
         {
             Dock = DockStyle.Fill, AutoSize = true, WrapContents = false,
             Margin = Padding.Empty
@@ -467,9 +468,9 @@ internal sealed class ReaderSettingsDialog : Form
             Width = 260, Height = 18, Minimum = 0, Maximum = 100,
             Margin = new Padding(10, 8, 0, 0)
         };
-        var benchmarkStatus = new Label
+        var benchmarkStatus = new SettingsWrapLabel
         {
-            Dock = DockStyle.Fill, AutoSize = false,
+            Dock = DockStyle.Top, AutoSize = true,
             TextAlign = ContentAlignment.TopLeft,
             ForeColor = Color.FromArgb(70, 79, 94),
             Margin = new Padding(4, 4, 4, 0),
@@ -554,21 +555,22 @@ internal sealed class ReaderSettingsDialog : Form
                 cancelBenchmark.Enabled = false;
             }
         };
-        var benchmarkButtons = new FlowLayoutPanel
+        var benchmarkButtons = new SettingsFlowPanel
         {
-            Dock = DockStyle.Fill, AutoSize = false, WrapContents = true,
+            Dock = DockStyle.Top, AutoSize = true, WrapContents = true,
             Margin = Padding.Empty
         };
         benchmarkButtons.Controls.AddRange([runBenchmark, cancelBenchmark, benchmarkProgress]);
         var benchmarkCommandRow = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2,
+            Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 1, RowCount = 2,
             Margin = Padding.Empty, Padding = Padding.Empty,
             MinimumSize = new Size(0, 144)
         };
         benchmarkCommandRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        benchmarkCommandRow.RowStyles.Add(new RowStyle(SizeType.Absolute, 80));
-        benchmarkCommandRow.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        benchmarkCommandRow.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        benchmarkCommandRow.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         benchmarkCommandRow.Controls.Add(benchmarkButtons, 0, 0);
         benchmarkCommandRow.Controls.Add(benchmarkStatus, 0, 1);
 
@@ -616,7 +618,7 @@ internal sealed class ReaderSettingsDialog : Form
             }
             finally { if (!IsDisposed) checkForUpdates.Enabled = true; }
         };
-        var updateRow = new FlowLayoutPanel
+        var updateRow = new SettingsFlowPanel
         {
             Dock = DockStyle.Fill, AutoSize = true, WrapContents = true,
             Margin = Padding.Empty, MinimumSize = new Size(0, 68)
@@ -766,8 +768,8 @@ internal sealed class ReaderSettingsDialog : Form
         foreach (var category in ToolbarHotkeyCatalog.All.GroupBy(item => item.Category))
         {
             var categoryRow = hotkeyTable.RowCount++;
-            hotkeyTable.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
-            var categoryHeader = new Label
+            hotkeyTable.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            var categoryHeader = new SettingsWrapLabel
             {
                 Text = category.Key, Dock = DockStyle.Fill,
                 Font = new Font("Segoe UI Semibold", 10f),
@@ -787,8 +789,9 @@ internal sealed class ReaderSettingsDialog : Form
                 };
                 _hotkeyEditors[definition.Id] = editor;
                 var row = hotkeyTable.RowCount++;
-                hotkeyTable.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
-                hotkeyTable.Controls.Add(new Label
+                hotkeyTable.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                editor.Dock = DockStyle.Top;
+                hotkeyTable.Controls.Add(new SettingsWrapLabel
                 {
                     Text = definition.Label, Dock = DockStyle.Fill,
                     TextAlign = ContentAlignment.MiddleLeft, Margin = new Padding(18, 4, 4, 4)
@@ -797,17 +800,17 @@ internal sealed class ReaderSettingsDialog : Form
             }
         }
 
-        var hotkeyHint = new Label
+        var hotkeyHint = new SettingsWrapLabel
         {
             Text = "Press a shortcut. Backspace/Delete clears it. Ctrl+C and Ctrl+V are reserved.",
-            Dock = DockStyle.Top, Height = 48, Padding = new Padding(24, 15, 0, 0),
+            Dock = DockStyle.Top, Padding = new Padding(24, 15, 24, 10),
             ForeColor = Color.FromArgb(91, 99, 112), BackColor = Color.White
         };
         var resetHotkeys = CreateSecondaryButton("Reset defaults");
         resetHotkeys.Click += (_, _) => ResetHotkeys();
         var hotkeyCommands = new FlowLayoutPanel
         {
-            Dock = DockStyle.Bottom, Height = 56, Padding = new Padding(20, 10, 0, 8),
+            Dock = DockStyle.Bottom, AutoSize = true, Padding = new Padding(20, 10, 0, 8),
             BackColor = Color.White
         };
         hotkeyCommands.Controls.Add(resetHotkeys);
@@ -824,7 +827,7 @@ internal sealed class ReaderSettingsDialog : Form
 
         var tabs = new TabControl
         {
-            Dock = DockStyle.Fill, Padding = new Point(18, 7),
+            Dock = DockStyle.Fill, Padding = new Point(18, 7), Multiline = true,
             Font = new Font("Segoe UI Semibold", 10f)
         };
         tabs.TabPages.Add(generalPage);
@@ -836,7 +839,7 @@ internal sealed class ReaderSettingsDialog : Form
 
         var ok = new Button
         {
-            Text = "Save", Width = 104, Height = 34, FlatStyle = FlatStyle.Flat,
+            Text = "Save", AutoSize = true, MinimumSize = new Size(104, 34), FlatStyle = FlatStyle.Flat,
             BackColor = Color.FromArgb(45, 108, 223), ForeColor = Color.White
         };
         ok.FlatAppearance.BorderSize = 0;
@@ -847,7 +850,7 @@ internal sealed class ReaderSettingsDialog : Form
         cancel.DialogResult = DialogResult.Cancel;
         var buttons = new FlowLayoutPanel
         {
-            Dock = DockStyle.Bottom, Height = 64, FlowDirection = FlowDirection.RightToLeft,
+            Dock = DockStyle.Bottom, AutoSize = true, FlowDirection = FlowDirection.RightToLeft,
             Padding = new Padding(0, 14, 20, 10), BackColor = Color.FromArgb(242, 244, 248)
         };
         buttons.Controls.AddRange([cancel, ok]);
@@ -857,12 +860,13 @@ internal sealed class ReaderSettingsDialog : Form
         CancelButton = cancel;
         WireDetailedEffectUpdates();
         UpdateDetailedEffectLabels();
+        ResumeLayout(true);
     }
 
     private void FitToWorkingArea()
     {
         if (IsDisposed || Disposing) return;
-        var workingArea = Screen.FromControl(Owner ?? this).WorkingArea;
+        var workingArea = Screen.FromControl(this).WorkingArea;
         var margin = Math.Max(8, LogicalToDeviceUnits(16));
         var maximumWidth = Math.Max(480, workingArea.Width - margin * 2);
         var maximumHeight = Math.Max(360, workingArea.Height - margin * 2);
@@ -921,7 +925,7 @@ internal sealed class ReaderSettingsDialog : Form
 
     private Control Explain(Control input, string description)
     {
-        var detail = new Label
+        var detail = new SettingsWrapLabel
         {
             Text = description, Dock = DockStyle.Fill,
             ForeColor = Color.FromArgb(91, 99, 112),
@@ -932,17 +936,19 @@ internal sealed class ReaderSettingsDialog : Form
         _settingEffectLabels[input] = detail;
         var layout = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2,
-            MinimumSize = new Size(0, 100), Margin = Padding.Empty,
+            Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 1, RowCount = 2, Margin = Padding.Empty,
             Padding = Padding.Empty
         };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
-        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        input.Dock = DockStyle.Fill;
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.SuspendLayout();
+        input.Dock = DockStyle.Top;
         input.Margin = new Padding(0, 1, 0, 1);
         layout.Controls.Add(input, 0, 0);
         layout.Controls.Add(detail, 0, 1);
+        layout.ResumeLayout(false);
         return layout;
     }
 
@@ -1426,6 +1432,7 @@ internal sealed class ReaderSettingsDialog : Form
             BackColor = Color.FromArgb(242, 244, 248), Margin = Padding.Empty
         };
         stack.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        stack.SuspendLayout();
         foreach (var section in sections)
         {
             var row = stack.RowCount++;
@@ -1433,6 +1440,7 @@ internal sealed class ReaderSettingsDialog : Form
             stack.Controls.Add(section, 0, row);
         }
         viewport.Controls.Add(stack);
+        stack.ResumeLayout(false);
         page.Controls.Add(viewport);
         return page;
     }
@@ -1440,33 +1448,36 @@ internal sealed class ReaderSettingsDialog : Form
     private static Panel CreateSection(
         string title, string description, params (string Label, Control Input)[] fields)
     {
-        var fieldHeights = fields
-            .Select(field => Math.Max(46, field.Input.MinimumSize.Height))
-            .ToArray();
-        const int descriptionHeight = 60;
-        var card = new Panel
+        var card = new TableLayoutPanel
         {
             Dock = DockStyle.Top,
-            Height = 122 + (descriptionHeight - 42) + fieldHeights.Sum(),
+            AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 1, RowCount = 1,
             BackColor = Color.White, BorderStyle = BorderStyle.FixedSingle,
             Margin = new Padding(0, 0, 0, 14)
         };
         var layout = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3,
+            Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 1, RowCount = 3,
             Padding = new Padding(20, 10, 20, 12), BackColor = Color.White
         };
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, descriptionHeight));
-        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        layout.Controls.Add(new Label
+        card.SuspendLayout();
+        layout.SuspendLayout();
+        card.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        card.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.Controls.Add(new SettingsWrapLabel
         {
             Text = title, Dock = DockStyle.Fill,
             Font = new Font("Segoe UI Semibold", 11f),
             ForeColor = Color.FromArgb(31, 38, 50),
             TextAlign = ContentAlignment.MiddleLeft
         }, 0, 0);
-        layout.Controls.Add(new Label
+        layout.Controls.Add(new SettingsWrapLabel
         {
             Text = description, Dock = DockStyle.Fill,
             ForeColor = Color.FromArgb(91, 99, 112),
@@ -1475,9 +1486,10 @@ internal sealed class ReaderSettingsDialog : Form
             Padding = new Padding(0, 1, 0, 3)
         }, 0, 1);
 
-        var fieldTable = new TableLayoutPanel
+        var fieldTable = new SettingsFieldTable
         {
-            Dock = DockStyle.Fill, ColumnCount = 2, RowCount = fields.Length,
+            Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 2, RowCount = fields.Length,
             Margin = Padding.Empty, BackColor = Color.White
         };
         // A proportional label column remains usable when a high-DPI laptop has
@@ -1485,13 +1497,17 @@ internal sealed class ReaderSettingsDialog : Form
         // in their own cell instead of pushing or overlapping the editor.
         fieldTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 36));
         fieldTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 64));
+        fieldTable.SuspendLayout();
         for (var row = 0; row < fields.Length; row++)
         {
-            fieldTable.RowStyles.Add(new RowStyle(SizeType.Absolute, fieldHeights[row]));
+            fieldTable.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             AddField(fieldTable, row, fields[row].Label, fields[row].Input);
         }
         layout.Controls.Add(fieldTable, 0, 2);
         card.Controls.Add(layout);
+        fieldTable.ResumeLayout(false);
+        layout.ResumeLayout(false);
+        card.ResumeLayout(false);
         return card;
     }
 
@@ -1511,7 +1527,8 @@ internal sealed class ReaderSettingsDialog : Form
     {
         var row = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1,
+            Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 2, RowCount = 1,
             Margin = Padding.Empty, Padding = Padding.Empty
         };
         row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -1554,9 +1571,9 @@ internal sealed class ReaderSettingsDialog : Form
         ThousandsSeparator = true, Dock = DockStyle.Fill
     };
 
-    private static CheckBox CreateOption(string text) => new()
+    private static CheckBox CreateOption(string text) => new SettingsWrapCheckBox()
     {
-        Text = text, AutoSize = true, Dock = DockStyle.Fill
+        Text = text, AutoSize = false, Dock = DockStyle.Fill
     };
 
     private static NumericUpDown CreateMillisecondsInput() => new SettingsNumericUpDown()
@@ -1584,13 +1601,14 @@ internal sealed class ReaderSettingsDialog : Form
 
     private static void AddField(TableLayoutPanel table, int row, string label, Control input)
     {
-        table.Controls.Add(new Label
+        table.Controls.Add(new SettingsWrapLabel
         {
             Text = label, Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft,
             ForeColor = Color.FromArgb(45, 52, 64), Margin = new Padding(4, 5, 12, 5)
         }, 0, row);
         input.Margin = new Padding(4, 7, 4, 7);
+        input.Dock = DockStyle.Top;
         table.Controls.Add(input, 1, row);
     }
 }
