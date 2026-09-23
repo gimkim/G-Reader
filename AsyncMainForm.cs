@@ -892,7 +892,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     {
         if (Interlocked.CompareExchange(ref _randomOpenInProgress, 1, 0) != 0) return;
         var root = Environment.ExpandEnvironmentVariables(_settings.RandomLibraryPath ?? string.Empty);
-        if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
+        if (string.IsNullOrWhiteSpace(root))
         {
             Interlocked.Exchange(ref _randomOpenInProgress, 0);
             MessageBox.Show(this,
@@ -903,7 +903,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
         var cancellation = new CancellationTokenSource();
         _randomOpenCancellation = cancellation;
-        var progress = BeginProgress("Scanning random library...", 0, true);
+        var progress = BeginProgress("Opening random book...", 0, true);
         var scanProgress = new Progress<RandomLibraryScanProgress>(status =>
         {
             var total = Math.Max(status.ProcessedDirectories,
@@ -915,8 +915,14 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         try
         {
             var candidates = await Task.Run(
-                () => FindRandomBookCandidates(
-                    root, cancellation.Token, scanProgress), cancellation.Token);
+                () => _services.RandomLibrary.GetOrScan(root, cancellation.Token,
+                    (path, token) =>
+                    {
+                        if (!Directory.Exists(path))
+                            throw new DirectoryNotFoundException(
+                                "The Random library folder is unavailable. Check the path in Settings.");
+                        return FindRandomBookCandidates(path, token, scanProgress);
+                    }), cancellation.Token);
             cancellation.Token.ThrowIfCancellationRequested();
             if (candidates.Length == 0)
             {

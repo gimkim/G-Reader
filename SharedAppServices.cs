@@ -27,6 +27,7 @@ internal sealed class SharedAppServices
     private AsyncMainForm? _activeWindow;
     public UserSettings Settings { get; }
     public FileMutationCoordinator FileMutations { get; } = new();
+    public RandomLibrarySessionCache RandomLibrary { get; } = new();
 
     public event Action<AsyncMainForm, SharedSettingsChange>? SettingsChanged;
     public event Action<AsyncMainForm, string>? SourceChanged;
