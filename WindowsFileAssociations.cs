@@ -5,7 +5,7 @@ namespace CDisplayEx.CSharp;
 
 internal static class WindowsFileAssociations
 {
-    private const string ApplicationName = "G Reader";
+    private const string ApplicationName = "Fast Reader/Viewer";
     private const string ProgId = "GReader.Image";
     private const string CapabilitiesPath = @"Software\GReader\Capabilities";
 
@@ -16,7 +16,7 @@ internal static class WindowsFileAssociations
 
     public static void EnsureRegistered()
     {
-        if (!OperatingSystem.IsWindows()) return;
+        if (!OperatingSystem.IsWindows() || AppPackageContext.IsPackaged) return;
 
         var executablePath = Environment.ProcessPath ?? Application.ExecutablePath;
         if (string.IsNullOrWhiteSpace(executablePath)) return;
@@ -26,7 +26,10 @@ internal static class WindowsFileAssociations
 
         using (var registeredApplications = Registry.CurrentUser.CreateSubKey(
                    @"Software\RegisteredApplications"))
+        {
             registeredApplications?.SetValue(ApplicationName, CapabilitiesPath);
+            registeredApplications?.DeleteValue("G Reader", throwOnMissingValue: false);
+        }
 
         using (var capabilities = Registry.CurrentUser.CreateSubKey(CapabilitiesPath))
         {
@@ -45,8 +48,8 @@ internal static class WindowsFileAssociations
 
         using (var progId = Registry.CurrentUser.CreateSubKey($@"Software\Classes\{ProgId}"))
         {
-            progId?.SetValue(null, "G Reader image");
-            progId?.SetValue("FriendlyTypeName", "G Reader image");
+            progId?.SetValue(null, "Fast Reader/Viewer image");
+            progId?.SetValue("FriendlyTypeName", "Fast Reader/Viewer image");
         }
         using (var defaultIcon = Registry.CurrentUser.CreateSubKey(
                    $@"Software\Classes\{ProgId}\DefaultIcon"))
@@ -73,9 +76,11 @@ internal static class WindowsFileAssociations
 
     public static void OpenDefaultAppsSettings()
     {
-        EnsureRegistered();
-        var target = "ms-settings:defaultapps?registeredAppUser=" +
-                     Uri.EscapeDataString(ApplicationName);
+        if (!AppPackageContext.IsPackaged) EnsureRegistered();
+        var target = AppPackageContext.IsPackaged
+            ? "ms-settings:defaultapps"
+            : "ms-settings:defaultapps?registeredAppUser=" +
+              Uri.EscapeDataString(ApplicationName);
         Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
     }
 }
