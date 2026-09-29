@@ -1,6 +1,6 @@
-# G Reader
+# Fast Reader/Viewer
 
-G Reader is a fast, Windows-native comic and image reader written in C#/.NET 8. It combines Direct2D full-page and thumbnail renderers, responsive background processing, configurable memory caches, and a virtualized library browser for folders, archives, and PDFs.
+Fast Reader/Viewer is a fast, Windows-native comic and image reader written in C#/.NET 8. It combines Direct2D full-page and thumbnail renderers, responsive background processing, configurable memory caches, and a virtualized library browser for folders, archives, and PDFs.
 
 The project focuses on immediate interaction: opening, scrolling, page navigation, zooming, and resizing remain responsive while previews and final Lanczos renders are produced in the background.
 
@@ -88,33 +88,37 @@ Folder view keeps the stable group order **Folder → Archive/PDF → Image**, t
 
 At a book boundary, automatic library navigation can be disabled or limited to folders, archives/PDFs, or both. Navigation follows the same grouped and sorted order shown by the parent thumbnail view.
 
-G Reader can remember the last page separately for every folder, archive, and PDF. This can be disabled or cleared from Settings; without a saved position, every book opens at its first page.
+Fast Reader/Viewer can remember the last page separately for every folder, archive, and PDF. This can be disabled or cleared from Settings; without a saved position, every book opens at its first page.
 
 ## Opening and Windows integration
 
 - Open a file or folder from the toolbar.
-- Drag a file or folder onto the window; G Reader activates and takes focus after the drop.
+- Fast Reader/Viewer keeps one profile-owning process and can host multiple independent reader windows. Use `Ctrl+N` for a new window, `Ctrl+W` to close one window, and `Ctrl+Q` to exit all windows.
+- Starting the executable again, opening an associated file from Explorer, or using the command line forwards the request to that existing process and opens a new window. Settings, worker pools, GPU/PDF admission, history, and persistent caches are shared instead of being multiplied by every launch.
+- Drag a file or folder onto the window; Fast Reader/Viewer activates and takes focus after the drop.
 - Configure a library root and use **Open random** to choose an eligible folder, archive, or PDF recursively.
 - Use **Open in Explorer** to select the current image or archive/PDF source file. In Thumbnail view, a selected folder, archive, or PDF tile is selected in Explorer instead.
-- Register G Reader per-user as an available Windows image viewer from Settings.
+- Register Fast Reader/Viewer per-user as an available Windows image viewer from Settings.
 - Images launched through the Explorer association always open in full-page, single-page mode.
 - When possible, an image opened from Explorer follows the source Explorer window's current item order; natural numeric ordering is the fallback.
 
 Command-line examples:
 
 ```powershell
-& '.\G Reader.exe' 'C:\Books\Volume 01.cbz'
-& '.\G Reader.exe' 'C:\Pictures\Album'
-& '.\G Reader.exe' --open 'C:\Pictures\page001.jpg'
-& '.\G Reader.exe' --file 'C:\Books\book.pdf'
-& '.\G Reader.exe' --folder 'C:\Comics\Series'
+& '.\Fast Reader Viewer.exe' 'C:\Books\Volume 01.cbz'
+& '.\Fast Reader Viewer.exe' 'C:\Pictures\Album'
+& '.\Fast Reader Viewer.exe' --open 'C:\Pictures\page001.jpg'
+& '.\Fast Reader Viewer.exe' --file 'C:\Books\book.pdf'
+& '.\Fast Reader Viewer.exe' --folder 'C:\Comics\Series'
 ```
 
 ## Rendering and responsiveness
 
-G Reader separates interactive display work from decoding, preview generation, Lanczos resizing, and cache cleanup.
+Fast Reader/Viewer separates interactive display work from decoding, preview generation, Lanczos resizing, and cache cleanup.
 
-- Embedded ICC metadata and the active Windows monitor profile are read off the UI thread. Direct2D applies cached source-to-monitor transforms on the GPU for full-page, zoom, and image-thumbnail rendering; color management can be disabled in Settings.
+- Memory cache limits are process-wide across reader windows: one window can use the full configured budget; with multiple windows the active window receives 60% and inactive windows share the remaining 40%. Inactive or minimized windows submit lower-priority work so the focused reader remains responsive.
+- Settings are saved atomically with a recoverable previous copy. Destructive edits are serialized by canonical source path, and cache maintenance coordinates with active writers across compatible Fast Reader/Viewer processes that share the same cache folder.
+- Embedded ICC metadata and the active Windows monitor profile are read off the UI thread. Embedded profiles are structurally validated before Direct2D sees them; profiles with out-of-bounds or partially overlapping tag data fall back to sRGB for that image only. Direct2D applies cached source-to-monitor transforms on the GPU for full-page, zoom, and image-thumbnail rendering; color management can be disabled in Settings.
 - Changing folders, archives, or PDFs retains decoded and resized pages from recent books as low-priority cache entries. Returning can reuse ready pages, while retained entries are evicted before active-book data whenever the configured memory budget is needed.
 - Full-page presentation and the thumbnail grid use independent Direct2D HWND render targets.
 - Thumbnail images and contact sheets upload lazily into a dedicated GPU texture LRU. An adaptive uploader measures observed transfer throughput and limits each frame by both elapsed upload time and bytes: idle frames receive a larger budget to fill high-resolution grids quickly, while scrolling uses a smaller latency budget to preserve input responsiveness.
@@ -128,7 +132,7 @@ G Reader separates interactive display work from decoding, preview generation, L
 - Optional NVIDIA nvJPEG decoding keeps a shared CUDA context warm and reuses decoder states, streams, pinned host buffers, and VRAM allocations. Full view, rotated pages, zoom viewport patches, page thumbnails, and folder/archive contact sheets can remain GPU-resident through NPP and CUDA–D3D11 interop. Background batch concurrency is calculated from current free/total VRAM and each source/output image's estimated working set, with 15% (at least 1 GB) kept as headroom and one stream reserved for visible-page and zoom requests; unsupported paths immediately fall back to TurboJPEG rather than delaying the UI.
 - Zoom keeps up to two full-resolution decoded JPEG sources in a bounded VRAM LRU, then generates only newly exposed viewport regions. GPU-created page thumbnails are encoded by nvJPEG before the reduced compressed bytes are sent to the persistent disk cache.
 - JPEG fit/thumbnail rendering first uses the native TurboJPEG 3.1 decoder directly into BGRA memory, bypassing ImageMagick's decode wrapper. Unsupported precision/colorspace or native failures fall back to the established Magick.NET path.
-- JPEG decode is codec-bound and does not scale well inside one image. G Reader therefore converts otherwise-unused per-image thread capacity into additional concurrent JPEG jobs, capped by the machine's logical CPU count. Generic large-image paths retain their configured worker gate to avoid multiplying full-resolution RAM usage.
+- JPEG decode is codec-bound and does not scale well inside one image. Fast Reader/Viewer therefore converts otherwise-unused per-image thread capacity into additional concurrent JPEG jobs, capped by the machine's logical CPU count. Generic large-image paths retain their configured worker gate to avoid multiplying full-resolution RAM usage.
 - Non-JPEG thumbnails decode their source once and derive both the immediate fast preview and final Lanczos result before releasing the large source bitmap. Worker gates bound the number of decoded PNG, WebP, BMP, GIF, and TIFF sources resident at once.
 - Non-JPEG and animated paths pass BGRA pixels directly between Magick.NET and System.Drawing, avoiding the previous in-memory BMP encode/decode round trip.
 - Window resizing uses stale-while-revalidate: the previous surface remains visible until fast and final replacements arrive.
@@ -209,7 +213,7 @@ In RTL mode, physical Left advances and Right goes backward. Start/End icons and
 
 ## Persistent behavior
 
-G Reader remembers display and application preferences, including:
+Fast Reader/Viewer remembers display and application preferences, including:
 
 - Thumbnail or full-page view
 - Thumbnail images per row
@@ -222,7 +226,7 @@ G Reader remembers display and application preferences, including:
 Settings are stored in:
 
 ```text
-%APPDATA%\G Reader\settings.json
+%APPDATA%\Fast Reader Viewer\settings.json
 ```
 
 General reading history and bookmarks are intentionally not stored. Per-book
@@ -267,7 +271,20 @@ dotnet publish .\CDisplayEx.CSharp.csproj `
   -o .\release
 ```
 
-The repository contains source code and project assets. Local release output and preserved development snapshots are excluded from Git.
+The repository contains source code and project assets. Local release output is excluded from Git.
+
+### Microsoft Store package
+
+The reserved Store identity and MSIX assets live in `packaging/Store`. Build the
+self-contained x64 package with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\packaging\Store\build-store-msix.ps1
+```
+
+The resulting `.msix` is written under `release\store`. Packaged installations
+use Store-managed updates and manifest-owned file associations; unpackaged
+GitHub builds retain the existing updater and per-user registration behavior.
 
 ## Project structure
 
@@ -300,7 +317,7 @@ The following CDisplayEx-style features are outside this project's scope:
 
 ## Notes
 
-G Reader is a Windows-only application. The normal image pipeline uses Magick.NET/ImageMagick on the CPU; the optional nvJPEG/NPP pipeline can decode, resize, cache, and present Full-view JPEG surfaces without leaving GPU memory. Direct2D accelerates full-page and thumbnail presentation, scrolling, zooming, and interactive movement. PDF parsing and rasterization use PDFiumCore/PDFium.
+Fast Reader/Viewer is a Windows-only application. The normal image pipeline uses Magick.NET/ImageMagick on the CPU; the optional nvJPEG/NPP pipeline can decode, resize, cache, and present Full-view JPEG surfaces without leaving GPU memory. Direct2D accelerates full-page and thumbnail presentation, scrolling, zooming, and interactive movement. PDF parsing and rasterization use PDFiumCore/PDFium.
 
 ## License notices
 

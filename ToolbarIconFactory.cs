@@ -7,6 +7,16 @@ internal static class ToolbarIconFactory
     private static readonly Color Ink = Color.FromArgb(225, 231, 242);
     private static readonly Color Accent = Color.FromArgb(91, 153, 255);
 
+    public static Image ClickToNavigate() => Draw(g =>
+    {
+        using var pen = Pen(Ink, 1.8f);
+        using var accent = Pen(Accent, 2f);
+        g.DrawEllipse(pen, 8, 3, 8, 17);
+        g.DrawLine(pen, 12, 3, 12, 10);
+        g.DrawLines(accent, new Point[] { new(5, 9), new(2, 12), new(5, 15) });
+        g.DrawLines(accent, new Point[] { new(19, 9), new(22, 12), new(19, 15) });
+    });
+
     public static Image OpenFile() => Draw(g =>
     {
         using var pen = Pen(Ink, 2);
@@ -38,6 +48,17 @@ internal static class ToolbarIconFactory
         g.DrawLine(accent, 17, 6, 21, 6);
         g.DrawLine(accent, 21, 6, 18, 3);
         g.DrawLine(accent, 21, 6, 18, 9);
+    });
+
+    public static Image History() => Draw(g =>
+    {
+        using var pen = Pen(Ink, 1.9f);
+        using var accent = Pen(Accent, 2.2f);
+        g.DrawArc(pen, 4, 4, 16, 16, -65, 300);
+        g.DrawLine(accent, 4, 5, 4, 11);
+        g.DrawLine(accent, 4, 5, 10, 5);
+        g.DrawLine(pen, 12, 7, 12, 13);
+        g.DrawLine(pen, 12, 13, 17, 16);
     });
 
     public static Image OpenInExplorer() => Draw(g =>

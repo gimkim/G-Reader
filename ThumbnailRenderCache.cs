@@ -121,6 +121,37 @@ internal sealed class ThumbnailRenderCache : IDisposable
         DisposeInBackground(images);
     }
 
+    public void RemapPages(IReadOnlyDictionary<int, int> oldToNewPage)
+    {
+        List<Bitmap> discarded = [];
+        lock (_gate)
+        {
+            var previous = _items.ToArray();
+            _items.Clear();
+            _keysByPage.Clear();
+            _bytes = 0;
+            foreach (var pair in previous)
+            {
+                if (!oldToNewPage.TryGetValue(pair.Key.Page, out var newPage))
+                {
+                    discarded.Add(pair.Value.Bitmap);
+                    continue;
+                }
+                var key = pair.Key with { Page = newPage };
+                if (!_items.TryAdd(key, pair.Value))
+                {
+                    discarded.Add(pair.Value.Bitmap);
+                    continue;
+                }
+                if (!_keysByPage.TryGetValue(newPage, out var pageKeys))
+                    _keysByPage[newPage] = pageKeys = [];
+                pageKeys.Add(key);
+                _bytes += pair.Value.Bytes;
+            }
+        }
+        DisposeInBackground(discarded);
+    }
+
     public void Dispose() => Clear();
 
     private Lease Acquire(Entry entry, bool exact)

@@ -15,7 +15,10 @@ internal static unsafe class PdfiumWorkerServer
     private const int PageObjectImage = 3;
     private const int RenderAnnotations = 0x01;
     private const int RenderLcdText = 0x02;
-    private const int MaximumOpenDocumentsPerWorker = 8;
+    // A pool worker only needs the actively opened book and at most one cover
+    // document. Keeping eight large PDFs per process retained hundreds of MB
+    // after long folder-browsing sessions.
+    private const int MaximumOpenDocumentsPerWorker = 2;
     private const ulong MaximumExtractedJpegBytes = 1024UL * 1024 * 1024;
 
     private enum Command : byte
@@ -24,6 +27,8 @@ internal static unsafe class PdfiumWorkerServer
         PageSize = 2,
         RenderBgra = 3,
         ExtractImageOnlyJpeg = 4,
+        CloseDocument = 5,
+        DeletePageCopy = 6,
         Shutdown = 255
     }
 
@@ -33,7 +38,12 @@ internal static unsafe class PdfiumWorkerServer
                 args[0], WorkerArgument, StringComparison.OrdinalIgnoreCase)) return false;
         using var input = new AnonymousPipeClientStream(PipeDirection.In, args[1]);
         using var output = new AnonymousPipeClientStream(PipeDirection.Out, args[2]);
-        Run(input, output);
+        try { Run(input, output); }
+        catch (IOException)
+        {
+            // BinaryWriter.Dispose may flush after Run's loop has already left
+            // its pipe-error guard. A vanished parent is a normal worker exit.
+        }
         return true;
     }
 
@@ -64,6 +74,12 @@ internal static unsafe class PdfiumWorkerServer
                 writer.Flush();
             }
         }
+        catch (IOException)
+        {
+            // The parent owns both anonymous pipes. If it exits or cancels while
+            // a response is being written, the worker should terminate quietly
+            // instead of surfacing a second, misleading crash.
+        }
         finally
         {
             foreach (var document in documents.Values)
@@ -75,6 +91,27 @@ internal static unsafe class PdfiumWorkerServer
         BinaryWriter writer, Dictionary<string, FpdfDocumentT> documents)
     {
         var path = reader.ReadString();
+        if (command == Command.CloseDocument)
+        {
+            path = Path.GetFullPath(path);
+            if (documents.Remove(path, out var openDocument))
+                fpdfview.FPDF_CloseDocument(openDocument);
+            writer.Write(true);
+            return;
+        }
+        if (command == Command.DeletePageCopy)
+        {
+            var pageCount = reader.ReadInt32();
+            if (pageCount <= 0 || pageCount > 1_000_000)
+                throw new InvalidDataException("Invalid PDF page deletion count.");
+            var pageIndices = new int[pageCount];
+            for (var i = 0; i < pageIndices.Length; i++)
+                pageIndices[i] = reader.ReadInt32();
+            var outputPath = reader.ReadString();
+            DeletePageCopy(path, pageIndices, outputPath);
+            writer.Write(true);
+            return;
+        }
         var document = GetDocument(path, documents);
         switch (command)
         {
@@ -122,6 +159,79 @@ internal static unsafe class PdfiumWorkerServer
             default:
                 throw new InvalidDataException("Unknown PDFium worker command.");
         }
+    }
+
+    private static void DeletePageCopy(
+        string sourcePath, IReadOnlyCollection<int> requestedPageIndices, string outputPath)
+    {
+        sourcePath = Path.GetFullPath(sourcePath);
+        outputPath = Path.GetFullPath(outputPath);
+        var document = fpdfview.FPDF_LoadDocument(sourcePath, null!)
+            ?? throw CreatePdfiumException("open document for editing");
+        var expectedPageCount = 0;
+        try
+        {
+            var pageCount = fpdfview.FPDF_GetPageCount(document);
+            var pageIndices = requestedPageIndices.Distinct().OrderDescending().ToArray();
+            if (pageIndices.Length == 0)
+                throw new InvalidOperationException("Select at least one PDF page to delete.");
+            if (pageIndices.Length >= pageCount)
+                throw new InvalidOperationException("A PDF must keep at least one page.");
+            if (pageIndices.Any(index => (uint)index >= (uint)pageCount))
+                throw new ArgumentOutOfRangeException(nameof(requestedPageIndices));
+            expectedPageCount = pageCount - pageIndices.Length;
+
+            // Delete backwards so earlier indices remain stable.
+            foreach (var pageIndex in pageIndices)
+                fpdf_edit.FPDFPageDelete(document, pageIndex);
+            using var output = new FileStream(outputPath, FileMode.CreateNew,
+                FileAccess.Write, FileShare.None, 1024 * 1024,
+                FileOptions.SequentialScan);
+            Exception? writeFailure = null;
+            PDFiumCore.Delegates.Func_int___IntPtr___IntPtr_ulong writeBlock =
+                (_, data, size) =>
+                {
+                    try
+                    {
+                        var remaining = size;
+                        var address = data;
+                        while (remaining > 0)
+                        {
+                            var length = (int)Math.Min(remaining, (ulong)int.MaxValue);
+                            output.Write(new ReadOnlySpan<byte>(address.ToPointer(), length));
+                            address += length;
+                            remaining -= (ulong)length;
+                        }
+                        return 1;
+                    }
+                    catch (Exception exception)
+                    {
+                        writeFailure = exception;
+                        return 0;
+                    }
+                };
+            using var writer = new FPDF_FILEWRITE_
+            {
+                Version = 1,
+                WriteBlock = writeBlock
+            };
+            // FPDF_NO_INCREMENTAL produces a self-contained replacement file.
+            if (fpdf_save.FPDF_SaveAsCopy(document, writer, 2) == 0)
+                throw new IOException("PDFium could not save the edited PDF.", writeFailure);
+            output.Flush(flushToDisk: true);
+            GC.KeepAlive(writeBlock);
+        }
+        finally { fpdfview.FPDF_CloseDocument(document); }
+
+        var verification = fpdfview.FPDF_LoadDocument(outputPath, null!)
+            ?? throw CreatePdfiumException("open the edited PDF for verification");
+        try
+        {
+            if (fpdfview.FPDF_GetPageCount(verification) != expectedPageCount)
+                throw new InvalidDataException(
+                    "The edited PDF did not contain the expected number of pages.");
+        }
+        finally { fpdfview.FPDF_CloseDocument(verification); }
     }
 
     private static FpdfDocumentT GetDocument(
@@ -276,6 +386,9 @@ internal static unsafe class PdfiumWorkerServer
 
 internal sealed class PdfiumWorkerClient : IDisposable
 {
+    private const int InteractiveTimeoutMilliseconds = 30_000;
+    private const int BackgroundTimeoutMilliseconds = 45_000;
+    private const int CancellationAbortGraceMilliseconds = 750;
     private readonly string _workerArgument;
     private Process? _process;
     private AnonymousPipeServerStream? _requestPipe;
@@ -283,6 +396,8 @@ internal sealed class PdfiumWorkerClient : IDisposable
     private BinaryWriter? _writer;
     private BinaryReader? _reader;
     private int _disposed;
+    private int _commandSequence;
+    private int _activeCommand;
 
     public PdfiumWorkerClient(string workerArgument)
     {
@@ -290,19 +405,115 @@ internal sealed class PdfiumWorkerClient : IDisposable
         Start();
     }
 
-    public T Execute<T>(Action<BinaryWriter> writeRequest, Func<BinaryReader, T> readResponse)
+    public T Execute<T>(Action<BinaryWriter> writeRequest, Func<BinaryReader, T> readResponse,
+        CancellationToken cancellationToken = default, bool background = false)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-        try { return ExecuteCore(writeRequest, readResponse); }
-        catch (Exception first) when (first is IOException or EndOfStreamException or ObjectDisposedException)
+        var timeout = background ? BackgroundTimeoutMilliseconds : InteractiveTimeoutMilliseconds;
+        try { return ExecuteWithWatchdog(writeRequest, readResponse, cancellationToken, timeout); }
+        catch (OperationCanceledException)
         {
+            // Cancellation aborts the native process to break a blocking pipe read.
+            // Replace it before the pool makes this client available again.
             Restart();
-            try { return ExecuteCore(writeRequest, readResponse); }
+            throw;
+        }
+        catch (Exception first) when (first is IOException or EndOfStreamException or
+            ObjectDisposedException or TimeoutException)
+        {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                Restart();
+                throw new OperationCanceledException(cancellationToken);
+            }
+            Restart();
+            try
+            {
+                return ExecuteWithWatchdog(
+                    writeRequest, readResponse, cancellationToken, timeout);
+            }
+            catch (OperationCanceledException)
+            {
+                Restart();
+                throw;
+            }
             catch (Exception second)
             {
+                // The retry may itself have tripped the watchdog. Do not return a
+                // killed process to the pool; leave a fresh worker ready instead.
+                try { Restart(); }
+                catch (Exception restartException)
+                {
+                    ExtendedDiagnostics.LogException(
+                        "PDFium worker restart after repeated failure failed",
+                        restartException);
+                }
                 throw new InvalidDataException(
                     $"PDFium worker process failed after restart: {second.Message}", second);
             }
+        }
+    }
+
+    private T ExecuteWithWatchdog<T>(Action<BinaryWriter> writeRequest,
+        Func<BinaryReader, T> readResponse, CancellationToken cancellationToken, int timeout)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var sequence = Interlocked.Increment(ref _commandSequence);
+        Volatile.Write(ref _activeCommand, sequence);
+        var timedOut = 0;
+        using var cancellation = cancellationToken.Register(() =>
+            _ = AbortCancelledCommandAfterGraceAsync(sequence));
+        using var watchdog = new System.Threading.Timer(_ =>
+        {
+            if (Volatile.Read(ref _activeCommand) != sequence) return;
+            Interlocked.Exchange(ref timedOut, 1);
+            ExtendedDiagnostics.Breadcrumb(
+                $"PDFium watchdog fired: pid={TryGetProcessId()}; timeoutMs={timeout}");
+            AbortActiveCommand(sequence, timedOut: true);
+        }, null, timeout, Timeout.Infinite);
+        try
+        {
+            return ExecuteCore(writeRequest, readResponse);
+        }
+        catch (Exception exception) when (Volatile.Read(ref timedOut) != 0)
+        {
+            throw new TimeoutException(
+                $"PDFium worker did not respond within {timeout} ms.", exception);
+        }
+        catch (Exception) when (cancellationToken.IsCancellationRequested)
+        {
+            throw new OperationCanceledException(cancellationToken);
+        }
+        finally
+        {
+            Interlocked.CompareExchange(ref _activeCommand, 0, sequence);
+        }
+    }
+
+    private int TryGetProcessId()
+    {
+        try { return _process?.Id ?? 0; }
+        catch { return 0; }
+    }
+
+    private async Task AbortCancelledCommandAfterGraceAsync(int sequence)
+    {
+        await Task.Delay(CancellationAbortGraceMilliseconds).ConfigureAwait(false);
+        AbortActiveCommand(sequence, timedOut: false);
+    }
+
+    private void AbortActiveCommand(int sequence, bool timedOut)
+    {
+        if (Volatile.Read(ref _activeCommand) != sequence) return;
+        try
+        {
+            if (_process is { HasExited: false }) _process.Kill(entireProcessTree: true);
+        }
+        catch (Exception exception)
+        {
+            if (timedOut)
+                ExtendedDiagnostics.LogException("PDFium watchdog could not terminate worker",
+                    exception, $"pid={TryGetProcessId()}");
         }
     }
 
@@ -319,7 +530,7 @@ internal sealed class PdfiumWorkerClient : IDisposable
     private void Start()
     {
         var executable = Environment.ProcessPath
-            ?? throw new InvalidOperationException("Cannot locate the G Reader executable.");
+            ?? throw new InvalidOperationException("Cannot locate the Fast Reader/Viewer executable.");
         var start = new ProcessStartInfo
         {
             FileName = executable,
@@ -330,8 +541,14 @@ internal sealed class PdfiumWorkerClient : IDisposable
         if (Path.GetFileNameWithoutExtension(executable).Equals(
                 "dotnet", StringComparison.OrdinalIgnoreCase))
         {
-            start.ArgumentList.Add(Assembly.GetEntryAssembly()?.Location
-                ?? throw new InvalidOperationException("Cannot locate G Reader.dll."));
+            var entryAssemblyName = Assembly.GetEntryAssembly()?.GetName().Name
+                ?? throw new InvalidOperationException("Cannot identify Fast Reader Viewer.dll.");
+            var entryAssemblyPath = Path.Combine(
+                AppContext.BaseDirectory, $"{entryAssemblyName}.dll");
+            if (!File.Exists(entryAssemblyPath))
+                throw new InvalidOperationException(
+                    $"Cannot locate Fast Reader Viewer.dll at '{entryAssemblyPath}'.");
+            start.ArgumentList.Add(entryAssemblyPath);
         }
         start.ArgumentList.Add(_workerArgument);
         var requestPipe = new AnonymousPipeServerStream(
@@ -411,9 +628,16 @@ internal sealed class PdfiumProcessPool : IDisposable
     private readonly ConcurrentQueue<PdfiumWorkerClient> _available = [];
     private readonly PdfiumWorkerClient[] _workers;
     private readonly SemaphoreSlim _slots;
+    private readonly SemaphoreSlim _backgroundSlots;
+    private readonly SemaphoreSlim _documentCloseGate = new(1, 1);
+    private readonly ConcurrentDictionary<string, int> _documentReferences =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> _pendingDocumentCloses =
+        new(StringComparer.OrdinalIgnoreCase);
     private int _referenceCount;
     private int _retired;
     private int _disposed;
+    private int _disposeScheduled;
 
     public int Count => _workers.Length;
 
@@ -433,43 +657,185 @@ internal sealed class PdfiumProcessPool : IDisposable
         _workers = workers.ToArray();
         foreach (var worker in _workers) _available.Enqueue(worker);
         _slots = new SemaphoreSlim(count, count);
+        // Keep one process free for opening/reading the file the user selected.
+        // Folder contact sheets and PDF thumbnail renders must not occupy the
+        // complete pool and make navigation look hung.
+        var backgroundCount = count == 1 ? 1 : count - 1;
+        _backgroundSlots = new SemaphoreSlim(backgroundCount, backgroundCount);
     }
 
     public void AddReference() => Interlocked.Increment(ref _referenceCount);
 
+    public void AddDocumentReference(string path)
+    {
+        path = Path.GetFullPath(path);
+        _documentReferences.AddOrUpdate(path, 1, static (_, count) => count + 1);
+    }
+
+    public void ReleaseDocumentReference(string path)
+    {
+        path = Path.GetFullPath(path);
+        while (_documentReferences.TryGetValue(path, out var count))
+        {
+            if (count > 1)
+            {
+                if (_documentReferences.TryUpdate(path, count - 1, count)) return;
+                continue;
+            }
+            if (!_documentReferences.TryRemove(
+                    new KeyValuePair<string, int>(path, count))) continue;
+            QueueDocumentClose(path);
+            return;
+        }
+    }
+
     public void ReleaseReference()
     {
         if (Interlocked.Decrement(ref _referenceCount) == 0 &&
-            Volatile.Read(ref _retired) != 0) Dispose();
+            Volatile.Read(ref _retired) != 0) ScheduleDispose();
     }
 
     public void Retire()
     {
         Volatile.Write(ref _retired, 1);
-        if (Volatile.Read(ref _referenceCount) == 0) Dispose();
+        if (Volatile.Read(ref _referenceCount) == 0) ScheduleDispose();
     }
 
-    public T Execute<T>(Func<PdfiumWorkerClient, T> operation)
+    private void ScheduleDispose()
+    {
+        if (Interlocked.Exchange(ref _disposeScheduled, 1) != 0) return;
+        _ = Task.Run(Dispose);
+    }
+
+    public T Execute<T>(Func<PdfiumWorkerClient, T> operation,
+        bool background = false, CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-        _slots.Wait();
-        if (!_available.TryDequeue(out var worker))
+        cancellationToken.ThrowIfCancellationRequested();
+        if (background) _backgroundSlots.Wait(cancellationToken);
+        try
         {
-            _slots.Release();
-            throw new InvalidOperationException("PDFium process pool lost a worker.");
+            _slots.Wait(cancellationToken);
+            if (!_available.TryDequeue(out var worker))
+            {
+                _slots.Release();
+                throw new InvalidOperationException("PDFium process pool lost a worker.");
+            }
+            try { return operation(worker); }
+            finally
+            {
+                _available.Enqueue(worker);
+                _slots.Release();
+            }
         }
-        try { return operation(worker); }
+        finally { if (background) _backgroundSlots.Release(); }
+    }
+
+    public void CloseDocument(string path)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        _documentCloseGate.Wait();
+        try { CloseDocumentCore(path); }
+        finally { _documentCloseGate.Release(); }
+    }
+
+    private void QueueDocumentClose(string path)
+    {
+        if (!_pendingDocumentCloses.TryAdd(path, 0)) return;
+        // Keep a retired pool alive until its queued native handles are closed.
+        AddReference();
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                _documentCloseGate.Wait();
+                try
+                {
+                    // A new renderer may have acquired the same path while this
+                    // cleanup waited behind active page renders.
+                    if (!_documentReferences.ContainsKey(path) &&
+                        Volatile.Read(ref _disposed) == 0)
+                        CloseDocumentOnAvailableWorkers(path);
+                }
+                finally { _documentCloseGate.Release(); }
+            }
+            catch (ObjectDisposedException) { }
+            catch (Exception exception)
+            {
+                ExtendedDiagnostics.LogException(
+                    "PDFium idle document cleanup failed", exception,
+                    $"path={path}");
+            }
+            finally
+            {
+                _pendingDocumentCloses.TryRemove(path, out _);
+                ReleaseReference();
+            }
+        });
+    }
+
+    private void CloseDocumentOnAvailableWorkers(string path)
+    {
+        var workers = new List<PdfiumWorkerClient>(_workers.Length);
+        try
+        {
+            // Idle cleanup must never reserve part of the pool while waiting for
+            // one long native PDFium command. Take only workers that are already
+            // idle; busy workers will evict the document through their bounded
+            // two-document cache when they process later work.
+            while (_slots.Wait(0))
+            {
+                if (_available.TryDequeue(out var worker))
+                    workers.Add(worker);
+                else
+                {
+                    _slots.Release();
+                    break;
+                }
+            }
+            foreach (var worker in workers)
+                CloseDocument(worker, path);
+        }
         finally
         {
-            _available.Enqueue(worker);
-            _slots.Release();
+            foreach (var worker in workers) _available.Enqueue(worker);
+            for (var i = 0; i < workers.Count; i++) _slots.Release();
         }
     }
+
+    private void CloseDocumentCore(string path)
+    {
+        var acquired = 0;
+        var workers = new List<PdfiumWorkerClient>(_workers.Length);
+        try
+        {
+            for (; acquired < _workers.Length; acquired++) _slots.Wait();
+            while (_available.TryDequeue(out var worker)) workers.Add(worker);
+            if (workers.Count != _workers.Length)
+                throw new InvalidOperationException("PDFium process pool lost a worker.");
+            foreach (var worker in workers)
+                CloseDocument(worker, path);
+        }
+        finally
+        {
+            foreach (var worker in workers) _available.Enqueue(worker);
+            for (var i = 0; i < acquired; i++) _slots.Release();
+        }
+    }
+
+    private static void CloseDocument(PdfiumWorkerClient worker, string path) =>
+        worker.Execute(writer =>
+        {
+            writer.Write((byte)5);
+            writer.Write(Path.GetFullPath(path));
+        }, _ => true, background: true);
 
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        foreach (var worker in _workers) worker.Dispose();
+        Parallel.ForEach(_workers, worker => worker.Dispose());
+        _documentCloseGate.Dispose();
+        _backgroundSlots.Dispose();
         _slots.Dispose();
     }
 }
@@ -506,5 +872,12 @@ internal static class PdfiumProcessPoolManager
             _current.AddReference();
             return _current;
         }
+    }
+
+    public static void CloseDocument(string path)
+    {
+        PdfiumProcessPool? pool;
+        lock (Gate) pool = _current;
+        pool?.CloseDocument(path);
     }
 }
