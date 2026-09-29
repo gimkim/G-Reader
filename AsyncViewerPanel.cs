@@ -141,6 +141,11 @@ internal sealed class AsyncViewerPanel : Panel
     public event EventHandler<bool>? RenderingStateChanged;
     public event EventHandler? ViewportRenderContextChanged;
     public event EventHandler? RenderDeviceRecovered;
+    public event EventHandler<int>? PageSideClicked;
+    private readonly System.Windows.Forms.Timer _pageClickTimer = new();
+    private Point? _pageClickOrigin;
+    private bool _pageClickDragged;
+    private int _pendingPageDirection;
     public event EventHandler<bool>? ZoomModeChanged;
     public event EventHandler<int>? ZoomPercentChanged;
     public event Action<int, AnimationFrameSet>? AnimationReleased;
@@ -573,6 +578,13 @@ internal sealed class AsyncViewerPanel : Panel
         _direct2DSurface.MouseMove += OnViewerMouseMove;
         _direct2DSurface.MouseUp += OnViewerMouseUp;
         _direct2DSurface.MouseCaptureChanged += OnViewerMouseCaptureChanged;
+        _pageClickTimer.Tick += (_, _) =>
+        {
+            _pageClickTimer.Stop();
+            if (!IsDisposed && Visible && FindForm()?.ContainsFocus == true)
+                PageSideClicked?.Invoke(this, _pendingPageDirection);
+        };
+        VisibleChanged += (_, _) => { if (!Visible) CancelPageClick(); };
         _direct2DSurface.DeviceResourcesRecovered += (_, _) =>
         {
             if (IsDisposed || Disposing) return;
@@ -1109,6 +1121,7 @@ internal sealed class AsyncViewerPanel : Panel
 
     public void ReturnToFit()
     {
+        CancelPageClick();
         if (_zoomEntering)
         {
             _zoomInteractionVersion++;
@@ -1120,6 +1133,7 @@ internal sealed class AsyncViewerPanel : Panel
 
     private async void OnViewerMouseDoubleClick(object? sender, MouseEventArgs e)
     {
+        CancelPageClick();
         if (e.Button != MouseButtons.Left) return;
         if (_zoomMode) StartReturnToFitTransition();
         else await EnterZoomAsync(e.Location, fromFitWheel: false);
@@ -1438,6 +1452,13 @@ internal sealed class AsyncViewerPanel : Panel
 
     private void OnViewerMouseDown(object? sender, MouseEventArgs e)
     {
+        CancelPageClick();
+        if (e.Button == MouseButtons.Left && e.Clicks == 1 && ModifierKeys == Keys.None)
+        {
+            _pageClickOrigin = e.Location;
+            _pageClickDragged = false;
+            _direct2DSurface.Focus();
+        }
         if (!_zoomMode || e.Button != MouseButtons.Left) return;
         StopZoomTransition(scheduleDetail: false);
         _zoomPanning = true;
@@ -1455,6 +1476,13 @@ internal sealed class AsyncViewerPanel : Panel
 
     private void OnViewerMouseMove(object? sender, MouseEventArgs e)
     {
+        if (_pageClickOrigin is { } origin)
+        {
+            var drag = SystemInformation.DragSize;
+            if (Math.Abs(e.X - origin.X) > drag.Width / 2 ||
+                Math.Abs(e.Y - origin.Y) > drag.Height / 2)
+                _pageClickDragged = true;
+        }
         if (!_zoomMode || !_zoomPanning) return;
         var dx = e.X - _zoomPanLast.X;
         var dy = e.Y - _zoomPanLast.Y;
@@ -1486,6 +1514,20 @@ internal sealed class AsyncViewerPanel : Panel
 
     private void OnViewerMouseUp(object? sender, MouseEventArgs e)
     {
+        if (e.Button == MouseButtons.Left)
+        {
+            if (_pageClickOrigin is { } origin && !_pageClickDragged &&
+                ModifierKeys == Keys.None && _direct2DSurface.ClientRectangle.Contains(e.Location) &&
+                Math.Abs(e.X - origin.X) <= SystemInformation.DragSize.Width / 2 &&
+                Math.Abs(e.Y - origin.Y) <= SystemInformation.DragSize.Height / 2)
+            {
+                _pendingPageDirection = e.X < _direct2DSurface.ClientSize.Width / 2 ? -1 : 1;
+                // Defer single clicks so double-click zoom never also turns a page.
+                _pageClickTimer.Interval = SystemInformation.DoubleClickTime;
+                _pageClickTimer.Start();
+            }
+            _pageClickOrigin = null;
+        }
         if (!_zoomMode || e.Button != MouseButtons.Left || !_zoomPanning) return;
         _zoomPanning = false;
         _direct2DSurface.Capture = false;
@@ -1495,10 +1537,17 @@ internal sealed class AsyncViewerPanel : Panel
 
     private void OnViewerMouseCaptureChanged(object? sender, EventArgs e)
     {
+        if (!_direct2DSurface.Capture) _pageClickOrigin = null;
         if (!_zoomMode || !_zoomPanning || _direct2DSurface.Capture) return;
         _zoomPanning = false;
         Cursor = Cursors.Hand;
         ScheduleZoomDetailRender();
+    }
+
+    private void CancelPageClick()
+    {
+        _pageClickTimer.Stop();
+        _pageClickOrigin = null;
     }
 
     private static RectangleF ToLogicalZoomBounds(
@@ -1934,6 +1983,7 @@ internal sealed class AsyncViewerPanel : Panel
         if (disposing)
         {
             _resizeDebounce.Dispose();
+            _pageClickTimer.Dispose();
             _zoomRenderDebounce.Dispose();
             _zoomTransitionTimer.Dispose();
             StopAnimations();

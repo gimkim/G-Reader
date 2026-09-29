@@ -430,6 +430,12 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             }
         };
         _viewer.ViewportRenderContextChanged += (_, _) => RestartPrecacheForViewport();
+        _viewer.PageSideClicked += (_, direction) =>
+        {
+            if (_thumbnailMode || _book is null || IsDisposed) return;
+            if (direction < 0) NavigatePhysicalLeft();
+            else NavigatePhysicalRight();
+        };
         _viewer.RenderDeviceRecovered += (_, _) =>
         {
             if (!_thumbnailMode) _ = ShowPageAsync();
