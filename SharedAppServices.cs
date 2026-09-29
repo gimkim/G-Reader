@@ -14,7 +14,8 @@ internal enum SharedSettingsChange
     Hotkeys = 8,
     Sorting = 16,
     General = 32,
-    All = Performance | ColorManagement | PdfEngine | Hotkeys | Sorting | General
+    ClickNavigation = 64,
+    All = Performance | ColorManagement | PdfEngine | Hotkeys | Sorting | General | ClickNavigation
 }
 
 internal sealed class SharedAppServices

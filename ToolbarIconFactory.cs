@@ -7,6 +7,16 @@ internal static class ToolbarIconFactory
     private static readonly Color Ink = Color.FromArgb(225, 231, 242);
     private static readonly Color Accent = Color.FromArgb(91, 153, 255);
 
+    public static Image ClickToNavigate() => Draw(g =>
+    {
+        using var pen = Pen(Ink, 1.8f);
+        using var accent = Pen(Accent, 2f);
+        g.DrawEllipse(pen, 8, 3, 8, 17);
+        g.DrawLine(pen, 12, 3, 12, 10);
+        g.DrawLines(accent, new Point[] { new(5, 9), new(2, 12), new(5, 15) });
+        g.DrawLines(accent, new Point[] { new(19, 9), new(22, 12), new(19, 15) });
+    });
+
     public static Image OpenFile() => Draw(g =>
     {
         using var pen = Pen(Ink, 2);

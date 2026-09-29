@@ -296,6 +296,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private ToolStripButton? _endButton;
     private ToolStripButton? _pageLayoutButton;
     private ToolStripButton? _autoSingleLandscapeButton;
+    private ToolStripButton? _clickToNavigateButton;
+    private ToolStripMenuItem? _clickToNavigateItem;
     private ToolStripButton? _thumbnailModeButton;
     private ToolStripButton? _fullscreenButton;
     private ToolStripDropDownButton? _folderSortButton;
@@ -432,7 +434,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _viewer.ViewportRenderContextChanged += (_, _) => RestartPrecacheForViewport();
         _viewer.PageSideClicked += (_, direction) =>
         {
-            if (_thumbnailMode || _book is null || IsDisposed) return;
+            if (!_settings.ClickToNavigate || _thumbnailMode || _book is null || IsDisposed) return;
             if (direction < 0) NavigatePhysicalLeft();
             else NavigatePhysicalRight();
         };
@@ -624,7 +626,9 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _toolbarItem = CheckItem("Too&lbar Visible", (_, _) => _toolbar.Visible = _toolbarItem!.Checked);
         _scrollbarsItem = CheckItem("&Scrollbars", (_, _) => _viewer.AutoScroll = _scrollbarsItem!.Checked);
         _scrollbarsItem.Checked = true;
-        var options = Menu("&Options", doubleMenu, zoom, rotate, fit, Sep(), _directionItem, _scrollbarsItem, _toolbarItem,
+        _clickToNavigateItem = CheckItem("Click to Navigate", (_, _) => ToggleClickToNavigate());
+        _clickToNavigateItem.Checked = _settings.ClickToNavigate;
+        var options = Menu("&Options", doubleMenu, zoom, rotate, fit, Sep(), _clickToNavigateItem, _directionItem, _scrollbarsItem, _toolbarItem,
             Item("&Configure...", (_, _) => ShowConfiguration()));
         var help = Menu("&Help", Item("&Website", (_, _) => OpenWebsite()),
             Item("Check for &Updates...", async (_, _) =>
@@ -656,6 +660,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _pageLayoutButton = AddActionTool(null, "Page layout", ToolbarHotkeyCatalog.PageLayout);
         _autoSingleLandscapeButton = AddActionTool(null, "Auto-single landscape", ToolbarHotkeyCatalog.AutoSingleLandscape);
         _directionButton = AddActionTool(null, "LTR / RTL", ToolbarHotkeyCatalog.ReadingDirection);
+        _clickToNavigateButton = AddActionTool(ToolbarIconFactory.ClickToNavigate(),
+            "Click to Navigate", ToolbarHotkeyCatalog.ClickToNavigate);
         _fullscreenButton = AddActionTool(
             ToolbarIconFactory.Fullscreen(false), "Toggle fullscreen",
             ToolbarHotkeyCatalog.Fullscreen);
@@ -689,6 +695,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             case ToolbarHotkeyCatalog.PageLayout: CyclePageLayout(); break;
             case ToolbarHotkeyCatalog.AutoSingleLandscape: ToggleAutoSingleLandscape(); break;
             case ToolbarHotkeyCatalog.ReadingDirection: SetReadingDirection(!_viewer.JapaneseMode); break;
+            case ToolbarHotkeyCatalog.ClickToNavigate: ToggleClickToNavigate(); break;
             case ToolbarHotkeyCatalog.Fullscreen: ToggleFullscreen(); break;
             case ToolbarHotkeyCatalog.Settings: ShowReaderSettings(); break;
         }
@@ -3635,6 +3642,14 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         UpdateNavigationToolbar();
     }
 
+    private void ToggleClickToNavigate()
+    {
+        _settings.ClickToNavigate = !_settings.ClickToNavigate;
+        _settings.Save();
+        UpdateNavigationToolbar();
+        _services.NotifySettingsChanged(this, SharedSettingsChange.ClickNavigation);
+    }
+
     private void NavigatePhysicalLeft()
     {
         if (_viewer.JapaneseMode) NextPage(); else PreviousPage();
@@ -3647,7 +3662,17 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private void UpdateNavigationToolbar()
     {
+        _viewer.ClickToNavigate = _settings.ClickToNavigate;
         if (_startButton is null) return;
+        if (_clickToNavigateItem is not null)
+            _clickToNavigateItem.Checked = _settings.ClickToNavigate;
+        if (_clickToNavigateButton is not null)
+        {
+            _clickToNavigateButton.Checked = _settings.ClickToNavigate;
+            SetActionTooltip(_clickToNavigateButton, _settings.ClickToNavigate
+                ? "Click to Navigate: On (click to turn off)"
+                : "Click to Navigate: Off (click to turn on)");
+        }
         var rtl = _viewer.JapaneseMode;
         // Use the opposite boundary glyph assignment from the original mapping.
         SetToolImage(_startButton, ToolbarIconFactory.Boundary(pointsRight: rtl, start: false));
@@ -5505,6 +5530,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             return;
         }
 
+        if ((change & SharedSettingsChange.ClickNavigation) != 0)
+            UpdateNavigationToolbar();
         if ((change & (SharedSettingsChange.Performance | SharedSettingsChange.General)) != 0)
         {
             _performance = PerformanceProfile.Resolve(_settings);

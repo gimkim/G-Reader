@@ -23,6 +23,7 @@ internal static class ToolbarHotkeyCatalog
     public const string PageLayout = "page_layout";
     public const string AutoSingleLandscape = "auto_single_landscape";
     public const string ReadingDirection = "reading_direction";
+    public const string ClickToNavigate = "click_to_navigate";
     public const string Fullscreen = "fullscreen";
     public const string Settings = "settings";
 
@@ -45,6 +46,7 @@ internal static class ToolbarHotkeyCatalog
         new(PageLayout, "Page layout", "Reading view", Keys.Control | Keys.D),
         new(AutoSingleLandscape, "Auto-single landscape", "Reading view", Keys.Control | Keys.Shift | Keys.A),
         new(ReadingDirection, "LTR / RTL", "Reading view", Keys.Control | Keys.J),
+        new(ClickToNavigate, "Toggle Click to Navigate", "Reading view", Keys.None),
         new(Fullscreen, "Toggle fullscreen", "Reading view", Keys.F11),
         new(Settings, "Settings", "Application", Keys.Control | Keys.Oemcomma)
     ];

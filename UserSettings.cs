@@ -32,6 +32,7 @@ internal sealed class UserSettings
     public bool DoublePage { get; set; } = true;
     public bool DoublePageOffset { get; set; }
     public bool AutoSingleLandscape { get; set; } = true;
+    public bool ClickToNavigate { get; set; } = true;
     public bool ThumbnailMode { get; set; }
     public int ThumbnailImagesPerRow { get; set; } = 6;
     public Dictionary<string, int> ToolbarHotkeys { get; set; } = ToolbarHotkeyCatalog.CreateDefaults();
