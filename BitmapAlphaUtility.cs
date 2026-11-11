@@ -22,7 +22,11 @@ internal static class BitmapAlphaUtility
         {
             using var graphics = Graphics.FromImage(converted);
             graphics.CompositingMode = CompositingMode.SourceCopy;
-            graphics.DrawImageUnscaled(source, 0, 0);
+            // DrawImageUnscaled still uses the source's physical DPI: a 72-DPI
+            // page drawn into this 96-DPI bitmap grows by 4/3 and is clipped.
+            // Conversion must copy the complete pixel area, regardless of DPI.
+            var bounds = new Rectangle(0, 0, source.Width, source.Height);
+            graphics.DrawImage(source, bounds, bounds, GraphicsUnit.Pixel);
             return converted;
         }
         catch

@@ -523,15 +523,19 @@ internal static class PersistentPreviewCache
         {
             var source = book.GetCacheSourceIdentity(pageIndex);
             // Alpha-capable formats use a lossless PNG cache so transparency is
-            // not flattened by the JPEG encoder. Opaque formats keep their v3
-            // identity and existing cache entries.
+            // not flattened by the JPEG encoder. Retire image previews that may
+            // have baked in the old DPI-dependent, cropped bitmap conversion.
+            // PDF renderers already produce pixel-normalized surfaces, so their
+            // existing entries (including page-remap sources) remain valid.
             var preserveAlpha = SupportsTransparency(source.PageName);
-            var identity = string.Join('\n', preserveAlpha
-                    ? "greader-preview-v4-premultiplied-alpha"
-                    : "greader-preview-v3-color", kind,
+            var pdfEngineIdentity = GetPdfEngineIdentity(source.SourcePath);
+            var revision = pdfEngineIdentity >= 0
+                ? "greader-preview-v3-color"
+                : "greader-preview-v5-pixel-geometry";
+            var identity = string.Join('\n', revision, kind,
                 source.SourcePath, source.PageName, source.Length, source.ModifiedTicks,
                 normalizedRotation, widthBucket, heightBucket, normalizedQuality,
-                GetPdfEngineIdentity(source.SourcePath));
+                pdfEngineIdentity);
             var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)))
                 .ToLowerInvariant();
             return Path.Combine(GetCategoryRoot(configuration, kind),
@@ -554,10 +558,14 @@ internal static class PersistentPreviewCache
         var heightBucket = RoundUp(Math.Max(32, bounds.Height), 32);
         // Fast and Lanczos contact sheets are independent so a quick placeholder
         // can never mask a completed full-quality disk entry.
-        var identity = string.Join('\n', "greader-browse-preview-v10-front-first",
+        var pdfEngineIdentity = GetPdfEngineIdentity(sourcePath);
+        var revision = pdfEngineIdentity >= 0
+            ? "greader-browse-preview-v10-front-first"
+            : "greader-browse-preview-v11-pixel-geometry";
+        var identity = string.Join('\n', revision,
             fastPreview ? "fast" : "full", sourcePath,
             source.Length, source.ModifiedTicks, widthBucket, heightBucket,
-            fastPreview ? 0 : quality, GetPdfEngineIdentity(sourcePath));
+            fastPreview ? 0 : quality, pdfEngineIdentity);
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)))
             .ToLowerInvariant();
         return Path.Combine(GetCategoryRoot(
@@ -660,7 +668,8 @@ internal static class PersistentPreviewCache
         using (var graphics = Graphics.FromImage(flattened))
         {
             graphics.Clear(Color.FromArgb(42, 45, 51));
-            graphics.DrawImageUnscaled(bitmap, 0, 0);
+            var bounds = new Rectangle(0, 0, bitmap.Width, bitmap.Height);
+            graphics.DrawImage(bitmap, bounds, bounds, GraphicsUnit.Pixel);
         }
         flattened.Save(path, codec, parameters);
     }
