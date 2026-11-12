@@ -26,7 +26,7 @@ internal static class WicFastPreviewDecoder
         {
             using var lease = ImagePipelineTuning.EnterWic(cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
-            using var stream = page.Open();
+            using var stream = page.OpenStream(cancellationToken);
             var decoder = BitmapDecoder.Create(stream,
                 BitmapCreateOptions.PreservePixelFormat | BitmapCreateOptions.IgnoreColorProfile,
                 BitmapCacheOption.OnLoad);

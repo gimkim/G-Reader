@@ -26,25 +26,36 @@ internal sealed class Direct2DViewerSurface : Control
         public LinkedListNode<Bitmap> LruNode { get; } = lruNode;
     }
 
-    private sealed class ZoomDetailLayer(object source, ID2D1Bitmap bitmap, Rectangle bounds)
+    private sealed class ZoomDetailLayer(
+        object source, ID2D1Bitmap bitmap, Rectangle bounds, byte[]? colorProfile)
     {
         public object Source { get; } = source;
         public ID2D1Bitmap Bitmap { get; } = bitmap;
         public Rectangle Bounds { get; set; } = bounds;
+        public byte[]? ColorProfile { get; } = colorProfile;
     }
 
     private sealed class NativeGpuCacheItem(
-        ID2D1Bitmap bitmap, long bytes, LinkedListNode<GpuRenderedImage> lruNode)
+        ID2D1Bitmap bitmap, GpuRenderedImage.UsageLease usage,
+        long bytes, LinkedListNode<GpuRenderedImage> lruNode) : IDisposable
     {
         public ID2D1Bitmap Bitmap { get; } = bitmap;
         public long Bytes { get; } = bytes;
         public LinkedListNode<GpuRenderedImage> LruNode { get; } = lruNode;
+        public void Dispose()
+        {
+            try { Bitmap.Dispose(); }
+            finally { usage.Dispose(); }
+        }
     }
 
     private const long GpuCacheLimitBytes = 512L * 1024 * 1024;
     private const long GpuCleanupHeadroomBytes = 128L * 1024 * 1024;
     private readonly ID2D1Factory1 _factory;
     private readonly System.Windows.Forms.Timer _gpuTrimTimer = new() { Interval = 650 };
+    private readonly System.Windows.Forms.Timer _deviceRecoveryTimer = new() { Interval = 50 };
+    private readonly System.Windows.Forms.Timer _resizeRenderTimer = new() { Interval = 90 };
+    private readonly System.Windows.Forms.Timer _presentRetryTimer = new() { Interval = 16 };
     private readonly Dictionary<Bitmap, GpuCacheItem> _gpuCache =
         new(ReferenceEqualityComparer.Instance);
     private readonly LinkedList<Bitmap> _gpuLru = [];
@@ -53,12 +64,17 @@ internal sealed class Direct2DViewerSurface : Control
     private readonly LinkedList<GpuRenderedImage> _nativeGpuLru = [];
     private ID2D1HwndRenderTarget? _renderTarget;
     private ID2D1Device? _d2dDevice;
+    private GpuInteropDevice.DeviceUsageLease? _sharedDeviceUsage;
+    private Task _swapChainRetirement = Task.CompletedTask;
     private ID2D1DeviceContext? _deviceContext;
     private IDXGISwapChain1? _swapChain;
     private ID2D1Bitmap1? _swapChainTarget;
     private ID2D1Bitmap? _leftBitmap;
     private ID2D1Bitmap? _rightBitmap;
+    private ID2D1Bitmap? _transientBitmap;
+    private GpuRenderedImage.UsageLease? _transientGpuUsage;
     private ID2D1Bitmap? _zoomBaseBitmap;
+    private ID2D1Bitmap? _zoomSecondBitmap;
     private ID2D1Bitmap? _leftAnimatedGpuBitmap;
     private ID2D1Bitmap? _rightAnimatedGpuBitmap;
     private GpuRenderedImage? _leftAnimatedGpuSource;
@@ -72,14 +88,21 @@ internal sealed class Direct2DViewerSurface : Control
     private Rectangle _leftBounds;
     private Rectangle _rightBounds;
     private Rectangle _zoomBaseBounds;
+    private Rectangle _zoomSecondBounds;
     private bool _zoomMode;
     private bool _colorManagementEnabled;
     private byte[]? _monitorColorProfile;
     private byte[]? _leftColorProfile;
     private byte[]? _rightColorProfile;
     private byte[]? _zoomColorProfile;
+    private byte[]? _zoomSecondColorProfile;
     private long _gpuCacheBytes;
+    private long _deviceGeneration = -1;
+    private int _deviceRecoveryAttempt;
+    private bool _renderTargetResizePending;
     private System.Drawing.Color _backgroundColor = System.Drawing.Color.FromArgb(30, 32, 38);
+
+    public event EventHandler? DeviceResourcesRecovered;
 
     public System.Drawing.Color ViewerBackgroundColor
     {
@@ -108,17 +131,37 @@ internal sealed class Direct2DViewerSurface : Control
             _gpuTrimTimer.Stop();
             TrimGpuCache();
         };
+        _deviceRecoveryTimer.Tick += (_, _) => RecoverDeviceResources();
+        _resizeRenderTimer.Tick += (_, _) => ApplyPendingRenderTargetResize();
+        _presentRetryTimer.Tick += (_, _) =>
+        {
+            _presentRetryTimer.Stop();
+            if (!_renderTargetResizePending) DrawFrame();
+        };
     }
 
     public void Present(Bitmap? left, Bitmap? right, Rectangle leftBounds, Rectangle rightBounds)
     {
         ReleaseAnimatedGpuPages();
-        EnsureRenderTarget();
-        _leftBitmap = GetOrCreateBitmap(left);
-        _rightBitmap = GetOrCreateBitmap(right);
-        _leftBounds = leftBounds;
-        _rightBounds = rightBounds;
-        DrawFrame();
+        ReleaseTransientFrame();
+        try
+        {
+            EnsureRenderTarget();
+            var leftBitmap = GetOrCreateBitmap(left);
+            var rightBitmap = GetOrCreateBitmap(right);
+            _leftBitmap = leftBitmap;
+            _rightBitmap = rightBitmap;
+            _leftBounds = leftBounds;
+            _rightBounds = rightBounds;
+            DrawFrame();
+        }
+        catch (Exception exception)
+        {
+            ExtendedDiagnostics.LogException(
+                "Direct2D CPU bitmap import failed", exception);
+            HandleDeviceLoss("CPU bitmap import");
+            return;
+        }
         if (_gpuCacheBytes > GpuCacheLimitBytes + GpuCleanupHeadroomBytes)
         {
             // Device resources belong to this UI thread, so release them only
@@ -149,22 +192,133 @@ internal sealed class Direct2DViewerSurface : Control
         if (IsHandleCreated) DrawFrame();
     }
 
-    public void PresentGpu(
+    public bool PresentGpu(
         GpuRenderedImage? left, GpuRenderedImage? right,
         Rectangle leftBounds, Rectangle rightBounds)
     {
         ReleaseAnimatedGpuPages();
-        EnsureRenderTarget();
-        _leftBitmap = GetOrCreateGpuBitmap(left);
-        _rightBitmap = GetOrCreateGpuBitmap(right);
-        _leftBounds = leftBounds;
-        _rightBounds = rightBounds;
-        DrawFrame();
-        if (_gpuCacheBytes > GpuCacheLimitBytes + GpuCleanupHeadroomBytes)
+        ReleaseTransientFrame();
+        try
         {
-            _gpuTrimTimer.Stop();
-            _gpuTrimTimer.Start();
+            EnsureRenderTarget();
+            // The HWND fallback can display CPU bitmaps, but cannot import a
+            // shared D3D texture. Do not replace the current frame with null
+            // bitmaps while the device-context target is being recovered.
+            if (_deviceContext is null)
+            {
+                ScheduleDeviceRecovery("GPU presentation target unavailable");
+                return false;
+            }
+            var leftBitmap = GetOrCreateGpuBitmap(left);
+            var rightBitmap = GetOrCreateGpuBitmap(right);
+            if ((left is not null && leftBitmap is null) ||
+                (right is not null && rightBitmap is null))
+            {
+                ScheduleDeviceRecovery("GPU bitmap import unavailable");
+                return false;
+            }
+            _leftBitmap = leftBitmap;
+            _rightBitmap = rightBitmap;
+            _leftBounds = leftBounds;
+            _rightBounds = rightBounds;
+            var presented = DrawFrame();
+            if (_gpuCacheBytes > GpuCacheLimitBytes + GpuCleanupHeadroomBytes)
+            {
+                _gpuTrimTimer.Stop();
+                _gpuTrimTimer.Start();
+            }
+            return presented;
         }
+        catch (Exception exception)
+        {
+            ExtendedDiagnostics.LogException(
+                "Direct2D GPU bitmap import failed", exception);
+            HandleDeviceLoss("GPU bitmap import");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Displays a one-use viewport surface without retaining every rendered
+    /// segment in the page LRU. Only the current imported bitmap owns a lease.
+    /// </summary>
+    public bool PresentTransient(Bitmap? source, GpuRenderedImage? gpu, Rectangle bounds)
+    {
+        if (source is null && gpu is null) return false;
+        ID2D1Bitmap? imported = null;
+        GpuRenderedImage.UsageLease? usage = null;
+        try
+        {
+            EnsureRenderTarget();
+            if (gpu is not null)
+            {
+                if (_deviceContext is null || gpu.DeviceGeneration != GpuInteropDevice.Generation)
+                {
+                    ScheduleDeviceRecovery("transient GPU frame unavailable");
+                    return false;
+                }
+                usage = gpu.AcquireUsage();
+                if (usage is null) return false;
+                using var surface = gpu.Texture.QueryInterface<IDXGISurface>();
+                imported = _deviceContext.CreateBitmapFromDxgiSurface(surface,
+                    new BitmapProperties1(new Vortice.DCommon.PixelFormat(
+                        Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Premultiplied),
+                        96f, 96f, BitmapOptions.None));
+            }
+            else
+            {
+                if (_deviceContext is null && _renderTarget is null)
+                {
+                    ScheduleDeviceRecovery("transient bitmap target unavailable");
+                    return false;
+                }
+                imported = CreateUploadedBitmap(source!);
+            }
+
+            ReleaseAnimatedGpuPages();
+            ReleaseTransientFrame();
+            _transientBitmap = imported;
+            _transientGpuUsage = usage;
+            _leftBitmap = imported;
+            _rightBitmap = null;
+            _leftBounds = bounds;
+            _rightBounds = Rectangle.Empty;
+            var accepted = imported;
+            imported = null;
+            usage = null;
+            DrawFrame();
+            // A busy swap chain retries this accepted frame on its timer. A
+            // device failure discards it and needs a newly rendered generation.
+            return ReferenceEquals(_transientBitmap, accepted);
+        }
+        catch (Exception exception)
+        {
+            ExtendedDiagnostics.LogException("Direct2D transient bitmap import failed", exception,
+                $"gpu={gpu is not null}; bounds={bounds}");
+            HandleDeviceLoss("transient bitmap import");
+            return false;
+        }
+        finally
+        {
+            imported?.Dispose();
+            usage?.Dispose();
+        }
+    }
+
+    private void ReleaseTransientFrame()
+    {
+        var bitmap = _transientBitmap;
+        var usage = _transientGpuUsage;
+        _transientBitmap = null;
+        _transientGpuUsage = null;
+        if (ReferenceEquals(_leftBitmap, bitmap)) _leftBitmap = null;
+        if (ReferenceEquals(_rightBitmap, bitmap)) _rightBitmap = null;
+        // All frame draws end before the UI can replace this import. Keep the
+        // texture lease until the D2D bitmap/effect release has completed; the
+        // source then queues actual D3D destruction off the UI thread.
+        DisposeTransientColorEffect(bitmap);
+        try { bitmap?.Dispose(); }
+        finally { usage?.Dispose(); }
     }
 
     public void UpdateLayout(Rectangle leftBounds, Rectangle rightBounds)
@@ -186,6 +340,11 @@ internal sealed class Direct2DViewerSurface : Control
     public void PresentAnimatedPageGpu(
         bool rightPage, GpuRenderedImage frame, int rotation)
     {
+        if (frame.DeviceGeneration != GpuInteropDevice.Generation)
+        {
+            frame.Dispose();
+            return;
+        }
         EnsureRenderTarget();
         if (_deviceContext is null)
         {
@@ -198,7 +357,7 @@ internal sealed class Direct2DViewerSurface : Control
             using var surface = frame.Texture.QueryInterface<IDXGISurface>();
             bitmap = _deviceContext.CreateBitmapFromDxgiSurface(surface,
                 new BitmapProperties1(new Vortice.DCommon.PixelFormat(
-                    Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Ignore),
+                    Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Premultiplied),
                     96f, 96f, BitmapOptions.None));
             ID2D1Bitmap? oldBitmap;
             GpuRenderedImage? oldSource;
@@ -241,6 +400,22 @@ internal sealed class Direct2DViewerSurface : Control
         _zoomBaseBitmap = useRightPage ? _rightBitmap : _leftBitmap;
         _zoomColorProfile = useRightPage ? _rightColorProfile : _leftColorProfile;
         _zoomBaseBounds = baseBounds;
+        _zoomSecondBitmap = null;
+        _zoomSecondColorProfile = null;
+        _zoomSecondBounds = Rectangle.Empty;
+        _zoomDetailLayers.Clear();
+        DrawFrame();
+    }
+
+    public void BeginZoomSpread(Rectangle leftBounds, Rectangle rightBounds)
+    {
+        _zoomMode = true;
+        _zoomBaseBitmap = _leftBitmap;
+        _zoomColorProfile = _leftColorProfile;
+        _zoomBaseBounds = leftBounds;
+        _zoomSecondBitmap = _rightBitmap;
+        _zoomSecondColorProfile = _rightColorProfile;
+        _zoomSecondBounds = rightBounds;
         _zoomDetailLayers.Clear();
         DrawFrame();
     }
@@ -248,6 +423,16 @@ internal sealed class Direct2DViewerSurface : Control
     public void UpdateZoomLayout(Rectangle baseBounds, bool clearDetail)
     {
         _zoomBaseBounds = baseBounds;
+        if (clearDetail)
+            _zoomDetailLayers.Clear();
+        DrawFrame();
+    }
+
+    public void UpdateZoomSpreadLayout(
+        Rectangle leftBounds, Rectangle rightBounds, bool clearDetail)
+    {
+        _zoomBaseBounds = leftBounds;
+        _zoomSecondBounds = rightBounds;
         if (clearDetail)
             _zoomDetailLayers.Clear();
         DrawFrame();
@@ -265,11 +450,27 @@ internal sealed class Direct2DViewerSurface : Control
         DrawFrame();
     }
 
-    public void AddZoomDetail(Bitmap detail, Rectangle bounds)
+    public void PanZoomSpreadLayout(
+        Rectangle leftBounds, Rectangle rightBounds, Point detailOffset)
+    {
+        _zoomBaseBounds = leftBounds;
+        _zoomSecondBounds = rightBounds;
+        foreach (var layer in _zoomDetailLayers)
+        {
+            var bounds = layer.Bounds;
+            bounds.Offset(detailOffset);
+            layer.Bounds = bounds;
+        }
+        DrawFrame();
+    }
+
+    public void AddZoomDetail(Bitmap detail, Rectangle bounds, bool rightPage = false)
     {
         if (!_zoomMode) return;
         if (GetOrCreateBitmap(detail) is not { } bitmap) return;
-        _zoomDetailLayers.Add(new ZoomDetailLayer(detail, bitmap, bounds));
+        _zoomDetailLayers.Add(new ZoomDetailLayer(
+            detail, bitmap, bounds,
+            rightPage ? _rightColorProfile : _leftColorProfile));
         DrawFrame();
     }
 
@@ -278,10 +479,13 @@ internal sealed class Direct2DViewerSurface : Control
         _zoomDetailLayers.RemoveAll(layer => ReferenceEquals(layer.Source, detail));
     }
 
-    public void AddZoomDetailGpu(GpuRenderedImage detail, Rectangle bounds)
+    public void AddZoomDetailGpu(
+        GpuRenderedImage detail, Rectangle bounds, bool rightPage = false)
     {
         if (!_zoomMode || GetOrCreateGpuBitmap(detail) is not { } bitmap) return;
-        _zoomDetailLayers.Add(new ZoomDetailLayer(detail, bitmap, bounds));
+        _zoomDetailLayers.Add(new ZoomDetailLayer(
+            detail, bitmap, bounds,
+            rightPage ? _rightColorProfile : _leftColorProfile));
         DrawFrame();
     }
 
@@ -294,8 +498,10 @@ internal sealed class Direct2DViewerSurface : Control
     {
         _zoomMode = false;
         _zoomBaseBitmap = null;
+        _zoomSecondBitmap = null;
         _zoomDetailLayers.Clear();
         _zoomBaseBounds = Rectangle.Empty;
+        _zoomSecondBounds = Rectangle.Empty;
         DrawFrame();
     }
 
@@ -308,9 +514,11 @@ internal sealed class Direct2DViewerSurface : Control
     public void ClearFrame()
     {
         ReleaseAnimatedGpuPages();
+        ReleaseTransientFrame();
         _leftBitmap = null;
         _rightBitmap = null;
         _zoomBaseBitmap = null;
+        _zoomSecondBitmap = null;
         _zoomDetailLayers.Clear();
         _zoomMode = false;
         if (IsHandleCreated) DrawFrame();
@@ -324,6 +532,9 @@ internal sealed class Direct2DViewerSurface : Control
 
     protected override void OnHandleDestroyed(EventArgs e)
     {
+        _resizeRenderTimer.Stop();
+        _presentRetryTimer.Stop();
+        _renderTargetResizePending = false;
         DiscardDeviceResources();
         base.OnHandleDestroyed(e);
     }
@@ -331,17 +542,50 @@ internal sealed class Direct2DViewerSurface : Control
     protected override void OnResize(EventArgs e)
     {
         base.OnResize(e);
-        if (_deviceContext is not null && _swapChain is not null &&
-            ClientSize.Width > 0 && ClientSize.Height > 0)
+        if ((_deviceContext is null || _swapChain is null) && _renderTarget is null) return;
+        if (ClientSize.Width <= 0 || ClientSize.Height <= 0)
         {
-            try { RecreateSwapChainTarget(resize: true); }
-            catch { DiscardDeviceResources(); }
+            _resizeRenderTimer.Stop();
+            _renderTargetResizePending = false;
+            return;
+        }
+
+        // WM_SIZE can arrive for every pixel while the user drags a window edge.
+        // ResizeBuffers and Present both enter the display driver and can block the
+        // UI thread behind queued background GPU work. Keep the last swap-chain
+        // frame visible (DXGI Scaling.Stretch scales it with the HWND) and resize
+        // the actual target once the viewport has been stable briefly.
+        _renderTargetResizePending = true;
+        _presentRetryTimer.Stop();
+        _resizeRenderTimer.Stop();
+        _resizeRenderTimer.Start();
+    }
+
+    private void ApplyPendingRenderTargetResize()
+    {
+        _resizeRenderTimer.Stop();
+        if (!_renderTargetResizePending || IsDisposed || Disposing ||
+            !IsHandleCreated || ClientSize.Width <= 0 || ClientSize.Height <= 0)
+            return;
+
+        try
+        {
+            if (_deviceContext is not null && _swapChain is not null)
+                RecreateSwapChainTarget(resize: true);
+            else
+                _renderTarget?.Resize(new SizeI(ClientSize.Width, ClientSize.Height));
+            _renderTargetResizePending = false;
+            ExtendedDiagnostics.Breadcrumb(
+                $"Direct2D deferred resize applied: size={ClientSize.Width}x{ClientSize.Height}");
             DrawFrame();
         }
-        else if (_renderTarget is not null && ClientSize.Width > 0 && ClientSize.Height > 0)
+        catch (Exception exception)
         {
-            _renderTarget.Resize(new SizeI(ClientSize.Width, ClientSize.Height));
-            DrawFrame();
+            _renderTargetResizePending = false;
+            ExtendedDiagnostics.LogException(
+                "Direct2D deferred resize failed", exception,
+                $"size={ClientSize.Width}x{ClientSize.Height}");
+            HandleDeviceLoss("deferred resize");
         }
     }
 
@@ -361,6 +605,9 @@ internal sealed class Direct2DViewerSurface : Control
         {
             DiscardDeviceResources();
             _gpuTrimTimer.Dispose();
+            _deviceRecoveryTimer.Dispose();
+            _resizeRenderTimer.Dispose();
+            _presentRetryTimer.Dispose();
             _factory.Dispose();
         }
         base.Dispose(disposing);
@@ -368,9 +615,23 @@ internal sealed class Direct2DViewerSurface : Control
 
     private void EnsureRenderTarget()
     {
+        if (_deviceContext is not null &&
+            _deviceGeneration != GpuInteropDevice.Generation)
+        {
+            ExtendedDiagnostics.Breadcrumb(
+                $"Full-view Direct2D generation changed: " +
+                $"old={_deviceGeneration}; new={GpuInteropDevice.Generation}");
+            DiscardDeviceResources();
+        }
         if (_renderTarget is not null || _deviceContext is not null ||
             !IsHandleCreated || ClientSize.Width <= 0 || ClientSize.Height <= 0) return;
+        if (!_swapChainRetirement.IsCompleted)
+        {
+            ScheduleDeviceRecovery("previous flip swap chain retirement");
+            return;
+        }
         if (TryCreateDeviceContextTarget()) return;
+        if (!_swapChainRetirement.IsCompleted) return;
         var properties = new RenderTargetProperties(
             RenderTargetType.Hardware,
             new Vortice.DCommon.PixelFormat(Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Ignore),
@@ -383,12 +644,26 @@ internal sealed class Direct2DViewerSurface : Control
             PixelSize = new SizeI(ClientSize.Width, ClientSize.Height),
             PresentOptions = PresentOptions.Immediately
         };
-        _renderTarget = _factory.CreateHwndRenderTarget(properties, hwndProperties);
+        try { _renderTarget = _factory.CreateHwndRenderTarget(properties, hwndProperties); }
+        catch (Exception exception)
+        {
+            ExtendedDiagnostics.LogException(
+                "Direct2D HWND target creation failed", exception);
+            _renderTarget = null;
+            ScheduleDeviceRecovery("target creation");
+        }
     }
 
     private bool TryCreateDeviceContextTarget()
     {
-        if (GpuInteropDevice.Device is not { } d3dDevice) return false;
+        if (!_swapChainRetirement.IsCompleted) return false;
+        var deviceUsage = GpuInteropDevice.AcquireUsage();
+        if (deviceUsage is null) return false;
+        var d3dDevice = deviceUsage.Device;
+        // Own the lease during partial creation too: a chain that was created
+        // before a later failure still needs old-device ClearState/Flush.
+        _sharedDeviceUsage = deviceUsage;
+        _deviceGeneration = deviceUsage.Generation;
         try
         {
             using var dxgiDevice = d3dDevice.QueryInterface<IDXGIDevice>();
@@ -413,8 +688,10 @@ internal sealed class Direct2DViewerSurface : Control
             RecreateSwapChainTarget(resize: false);
             return _swapChainTarget is not null;
         }
-        catch
+        catch (Exception exception)
         {
+            ExtendedDiagnostics.LogException(
+                "Direct2D device-context creation failed", exception);
             DisposeDeviceContextTarget();
             return false;
         }
@@ -449,16 +726,36 @@ internal sealed class Direct2DViewerSurface : Control
             return cached.Bitmap;
         }
 
-        var rect = new Rectangle(0, 0, source.Width, source.Height);
-        var data = source.LockBits(rect, ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        var bitmap = CreateUploadedBitmap(source);
+        var node = _gpuLru.AddLast(source);
+        var item = new GpuCacheItem(bitmap,
+            Math.Max(1L, source.Width) * Math.Max(1L, source.Height) * 4L, node);
+        _gpuCache[source] = item;
+        _gpuCacheBytes += item.Bytes;
+        return bitmap;
+    }
+
+    private ID2D1Bitmap CreateUploadedBitmap(Bitmap source)
+    {
+        Bitmap? converted = null;
+        var upload = source;
+        if (source.PixelFormat != System.Drawing.Imaging.PixelFormat.Format32bppPArgb)
+        {
+            converted = BitmapAlphaUtility.CloneToPArgb(source);
+            upload = converted;
+        }
+        var rect = new Rectangle(0, 0, upload.Width, upload.Height);
+        BitmapData? data = null;
         try
         {
+            data = upload.LockBits(rect, ImageLockMode.ReadOnly,
+                System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
             if (data.Stride <= 0) throw new InvalidOperationException("Direct2D requires a top-down bitmap surface.");
             ID2D1Bitmap bitmap;
             if (_deviceContext is not null)
             {
                 var properties = new BitmapProperties1(
-                    new Vortice.DCommon.PixelFormat(Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Ignore),
+                    new Vortice.DCommon.PixelFormat(Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Premultiplied),
                     96f, 96f, BitmapOptions.None);
                 bitmap = _deviceContext.CreateBitmap(
                     new SizeI(source.Width, source.Height), data.Scan0, (uint)data.Stride, properties);
@@ -466,26 +763,23 @@ internal sealed class Direct2DViewerSurface : Control
             else
             {
                 var properties = new BitmapProperties(
-                    new Vortice.DCommon.PixelFormat(Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Ignore), 96f, 96f);
+                    new Vortice.DCommon.PixelFormat(Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Premultiplied), 96f, 96f);
                 bitmap = _renderTarget!.CreateBitmap(
                     new SizeI(source.Width, source.Height), data.Scan0, (uint)data.Stride, properties);
             }
-            var node = _gpuLru.AddLast(source);
-            var item = new GpuCacheItem(bitmap,
-                Math.Max(1L, source.Width) * Math.Max(1L, source.Height) * 4L, node);
-            _gpuCache[source] = item;
-            _gpuCacheBytes += item.Bytes;
             return bitmap;
         }
         finally
         {
-            source.UnlockBits(data);
+            if (data is not null) upload.UnlockBits(data);
+            converted?.Dispose();
         }
     }
 
     private ID2D1Bitmap? GetOrCreateGpuBitmap(GpuRenderedImage? source)
     {
-        if (source is null || _deviceContext is null) return null;
+        if (source is null || _deviceContext is null ||
+            source.DeviceGeneration != GpuInteropDevice.Generation) return null;
         if (_nativeGpuCache.TryGetValue(source, out var cached))
         {
             _nativeGpuLru.Remove(cached.LruNode);
@@ -493,17 +787,27 @@ internal sealed class Direct2DViewerSurface : Control
             return cached.Bitmap;
         }
 
-        using var surface = source.Texture.QueryInterface<IDXGISurface>();
-        var properties = new BitmapProperties1(
-            new Vortice.DCommon.PixelFormat(
-                Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Ignore),
-            96f, 96f, BitmapOptions.None);
-        var bitmap = _deviceContext.CreateBitmapFromDxgiSurface(surface, properties);
-        var node = _nativeGpuLru.AddLast(source);
-        var item = new NativeGpuCacheItem(bitmap, source.Bytes, node);
-        _nativeGpuCache[source] = item;
-        _gpuCacheBytes += item.Bytes;
-        return bitmap;
+        var usage = source.AcquireUsage();
+        if (usage is null) return null;
+        try
+        {
+            using var surface = source.Texture.QueryInterface<IDXGISurface>();
+            var properties = new BitmapProperties1(
+                new Vortice.DCommon.PixelFormat(
+                    Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Premultiplied),
+                96f, 96f, BitmapOptions.None);
+            var bitmap = _deviceContext.CreateBitmapFromDxgiSurface(surface, properties);
+            var node = _nativeGpuLru.AddLast(source);
+            var item = new NativeGpuCacheItem(bitmap, usage, source.Bytes, node);
+            _nativeGpuCache[source] = item;
+            _gpuCacheBytes += item.Bytes;
+            return bitmap;
+        }
+        catch
+        {
+            usage.Dispose();
+            throw;
+        }
     }
 
     private void TrimGpuCache()
@@ -527,6 +831,7 @@ internal sealed class Direct2DViewerSurface : Control
             if (ReferenceEquals(item.Bitmap, _leftBitmap) ||
                 ReferenceEquals(item.Bitmap, _rightBitmap) ||
                 ReferenceEquals(item.Bitmap, _zoomBaseBitmap) ||
+                ReferenceEquals(item.Bitmap, _zoomSecondBitmap) ||
                 _zoomDetailLayers.Any(layer => ReferenceEquals(item.Bitmap, layer.Bitmap)))
             {
                 _gpuLru.Remove(oldest);
@@ -566,21 +871,25 @@ internal sealed class Direct2DViewerSurface : Control
             _gpuCacheBytes -= item.Bytes;
             disposedItems++;
             releasedBytes += item.Bytes;
-            item.Bitmap.Dispose();
+            item.Dispose();
         }
         if (_gpuCacheBytes > GpuCacheLimitBytes)
             _gpuTrimTimer.Start();
     }
 
-    private void DrawFrame()
+    private bool DrawFrame()
     {
-        if (!IsHandleCreated || ClientSize.Width <= 0 || ClientSize.Height <= 0) return;
-        EnsureRenderTarget();
-        var target = (ID2D1RenderTarget?)_deviceContext ?? _renderTarget;
-        if (target is null) return;
-
+        if (!IsHandleCreated || ClientSize.Width <= 0 || ClientSize.Height <= 0 ||
+            _renderTargetResizePending) return false;
         try
         {
+            EnsureRenderTarget();
+            var target = (ID2D1RenderTarget?)_deviceContext ?? _renderTarget;
+            if (target is null) return false;
+            // Direct2D retains context state between BeginDraw calls. Always
+            // begin from a known transform so one interrupted effect or rotated
+            // draw cannot contaminate every page presented afterward.
+            target.Transform = Matrix3x2.Identity;
             target.BeginDraw();
             target.Clear(new Color4(
                 _backgroundColor.R / 255f,
@@ -590,8 +899,10 @@ internal sealed class Direct2DViewerSurface : Control
             if (_zoomMode)
             {
                 DrawBitmap(_zoomBaseBitmap, _zoomBaseBounds, _zoomColorProfile);
+                DrawBitmap(
+                    _zoomSecondBitmap, _zoomSecondBounds, _zoomSecondColorProfile);
                 foreach (var layer in _zoomDetailLayers)
-                    DrawBitmap(layer.Bitmap, layer.Bounds, _zoomColorProfile);
+                    DrawBitmap(layer.Bitmap, layer.Bounds, layer.ColorProfile);
             }
             else
             {
@@ -603,14 +914,120 @@ internal sealed class Direct2DViewerSurface : Control
                         ? _rightAnimationRotation : 0);
             }
             var result = target.EndDraw();
-            if (result.Failure) DiscardDeviceResources();
+            target.Transform = Matrix3x2.Identity;
+            if (result.Failure)
+            {
+                ExtendedDiagnostics.Breadcrumb(
+                    $"Direct2D EndDraw failed: {result.Code}");
+                HandleDeviceLoss($"EndDraw {result.Code}");
+                return false;
+            }
             else if (_swapChain is not null)
-                _swapChain.Present(0, PresentFlags.None);
+            {
+                // Never let a saturated GPU queue turn painting or resizing into
+                // an unbounded UI-thread wait. Retry the newest frame on the next
+                // message-loop turn if DXGI is still drawing the previous one.
+                var presentResult = _swapChain.Present(0, PresentFlags.DoNotWait);
+                if (presentResult == Vortice.DXGI.ResultCode.WasStillDrawing)
+                {
+                    _presentRetryTimer.Stop();
+                    _presentRetryTimer.Start();
+                    return false;
+                }
+                if (presentResult.Failure)
+                {
+                    ExtendedDiagnostics.Breadcrumb(
+                        $"DXGI Present failed: {presentResult.Code}");
+                    HandleDeviceLoss($"Present {presentResult.Code}");
+                    return false;
+                }
+            }
+            return true;
         }
-        catch
+        catch (Exception exception)
         {
-            DiscardDeviceResources();
+            ExtendedDiagnostics.LogException("Direct2D frame presentation failed", exception);
+            HandleDeviceLoss("frame exception");
+            return false;
+        }
+    }
+
+    private void HandleDeviceLoss(string reason)
+    {
+        DiscardDeviceResources();
+        if (_deviceRecoveryAttempt == 0)
+        {
+            var recreated = GpuInteropDevice.RecreateAfterDeviceLoss();
+            ExtendedDiagnostics.Breadcrumb(
+                $"Shared D3D device reset after {reason}: recreated={recreated}; " +
+                $"generation={GpuInteropDevice.Generation}");
+        }
+        ScheduleDeviceRecovery(reason);
+    }
+
+    private void ScheduleDeviceRecovery(string reason)
+    {
+        if (IsDisposed || Disposing || !IsHandleCreated) return;
+        // Navigation can request many frames while the GPU target is down. Do
+        // not keep postponing an already scheduled recovery on every request.
+        if (_deviceRecoveryTimer.Enabled) return;
+        _deviceRecoveryAttempt = Math.Min(_deviceRecoveryAttempt + 1, 6);
+        _deviceRecoveryTimer.Interval = Math.Min(
+            1000, 50 << Math.Min(4, _deviceRecoveryAttempt - 1));
+        ExtendedDiagnostics.Breadcrumb(
+            $"Direct2D recovery scheduled: reason={reason}; " +
+            $"attempt={_deviceRecoveryAttempt}; delayMs={_deviceRecoveryTimer.Interval}");
+        _deviceRecoveryTimer.Start();
+    }
+
+    private void RecoverDeviceResources()
+    {
+        _deviceRecoveryTimer.Stop();
+        if (IsDisposed || Disposing || !IsHandleCreated || !Visible) return;
+        if (!_swapChainRetirement.IsCompleted)
+        {
+            ScheduleDeviceRecovery("previous flip swap chain retirement");
+            return;
+        }
+        try
+        {
+            EnsureRenderTarget();
+            // A hardware-device loss can transiently prevent DXGI from creating
+            // a replacement swap chain for this HWND. EnsureRenderTarget then
+            // creates a CPU-capable HWND target, but that is not a completed GPU
+            // recovery. Remove the fallback and keep retrying until shared GPU
+            // textures can be imported again.
+            if (_deviceContext is null && GpuInteropDevice.Device is not null)
+            {
+                _renderTarget?.Dispose();
+                _renderTarget = null;
+                if (!TryCreateDeviceContextTarget())
+                {
+                    EnsureRenderTarget();
+                    ScheduleDeviceRecovery("device-context retry");
+                    return;
+                }
+            }
+            if (_deviceContext is null && _renderTarget is null)
+            {
+                ScheduleDeviceRecovery("target unavailable");
+                return;
+            }
+            var attempts = _deviceRecoveryAttempt;
+            _deviceRecoveryAttempt = 0;
+            ExtendedDiagnostics.Breadcrumb(
+                $"Direct2D recovery completed: attempts={attempts}; " +
+                $"generation={GpuInteropDevice.Generation}");
+            DeviceResourcesRecovered?.Invoke(this, EventArgs.Empty);
             Invalidate();
+        }
+        catch (Exception exception)
+        {
+            ExtendedDiagnostics.LogException(
+                "Direct2D recovery failed", exception,
+                $"attempt={_deviceRecoveryAttempt}");
+            DiscardDeviceResources();
+            ScheduleDeviceRecovery("recreate exception");
         }
     }
 
@@ -635,19 +1052,25 @@ internal sealed class Direct2DViewerSurface : Control
             _deviceContext is { } context && TryGetColorEffect(bitmap, sourceProfile) is { } effect)
         {
             var previous = context.Transform;
-            context.Transform = Matrix3x2.CreateScale(
-                    drawWidth / bitmap.Size.Width, drawHeight / bitmap.Size.Height) *
-                Matrix3x2.CreateTranslation(drawLeft, drawTop) * rotationTransform;
-            using var output = effect.Output;
-            context.DrawImage(output, Vector2.Zero, null,
-                InterpolationMode.Linear, CompositeMode.SourceOver);
-            context.Transform = previous;
+            try
+            {
+                context.Transform = Matrix3x2.CreateScale(
+                        drawWidth / bitmap.Size.Width, drawHeight / bitmap.Size.Height) *
+                    Matrix3x2.CreateTranslation(drawLeft, drawTop) * rotationTransform;
+                using var output = effect.Output;
+                context.DrawImage(output, Vector2.Zero, null,
+                    InterpolationMode.Linear, CompositeMode.SourceOver);
+            }
+            finally { context.Transform = previous; }
             return;
         }
         var oldTransform = target.Transform;
-        target.Transform = rotationTransform;
-        target.DrawBitmap(bitmap, destination, 1f, BitmapInterpolationMode.Linear, null);
-        target.Transform = oldTransform;
+        try
+        {
+            target.Transform = rotationTransform;
+            target.DrawBitmap(bitmap, destination, 1f, BitmapInterpolationMode.Linear, null);
+        }
+        finally { target.Transform = oldTransform; }
     }
 
     private void ReleaseAnimatedGpuPages()
@@ -688,7 +1111,7 @@ internal sealed class Direct2DViewerSurface : Control
             var destinationPointer = destination.NativePointer;
             var intent = (int)ColorManagementRenderingIntent.RelativeColorimetric;
             var quality = (int)ColormanagementQuality.Best;
-            var alpha = (int)ColorManagementAlphaMode.Straight;
+            var alpha = (int)ColorManagementAlphaMode.Premultiplied;
             effect.SetValue((uint)ColorManagementProperties.SourceColorContext,
                 PropertyType.ColorContext, &sourcePointer, (uint)IntPtr.Size);
             effect.SetValue((uint)ColorManagementProperties.DestinationColorContext,
@@ -748,28 +1171,47 @@ internal sealed class Direct2DViewerSurface : Control
 
     private void DisposeDeviceContextTarget()
     {
+        var hadSwapChain = _swapChain is not null;
+        var oldDeviceUsage = _sharedDeviceUsage;
+        _sharedDeviceUsage = null;
         DisposeColorResources();
         if (_deviceContext is not null) _deviceContext.Target = null;
         _swapChainTarget?.Dispose();
         _swapChainTarget = null;
-        _swapChain?.Dispose();
-        _swapChain = null;
         _deviceContext?.Dispose();
         _deviceContext = null;
         _d2dDevice?.Dispose();
         _d2dDevice = null;
+        _swapChain?.Dispose();
+        _swapChain = null;
+        _deviceGeneration = -1;
+        if (oldDeviceUsage is not null)
+        {
+            if (hadSwapChain)
+            {
+                // Flip chains retain their HWND association until deferred D3D
+                // destruction is flushed on the OLD device. Do not block the
+                // UI, and do not create another chain while this is pending.
+                var retirement = GpuInteropDevice.FlushReleasedSwapChainAsync(oldDeviceUsage);
+                _swapChainRetirement = _swapChainRetirement.IsCompleted
+                    ? retirement : Task.WhenAll(_swapChainRetirement, retirement);
+            }
+            else oldDeviceUsage.Dispose();
+        }
     }
 
     private void DisposeBitmaps()
     {
         _gpuTrimTimer.Stop();
         ReleaseAnimatedGpuPages();
+        ReleaseTransientFrame();
         _leftBitmap = null;
         _rightBitmap = null;
         _zoomBaseBitmap = null;
+        _zoomSecondBitmap = null;
         _zoomDetailLayers.Clear();
         foreach (var item in _gpuCache.Values) item.Bitmap.Dispose();
-        foreach (var item in _nativeGpuCache.Values) item.Bitmap.Dispose();
+        foreach (var item in _nativeGpuCache.Values) item.Dispose();
         _gpuCache.Clear();
         _gpuLru.Clear();
         _nativeGpuCache.Clear();
