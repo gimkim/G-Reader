@@ -259,6 +259,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private bool _currentAutoSingle;
     private bool _thumbnailMode;
     private bool _viewModeChangedAfterStartup;
+    private string? _manhwaThumbnailPageKey;
+    private int _manhwaThumbnailSourceTop;
     private bool _cover;
     private bool _forwardOnePage;
     private bool _fullScreen;
@@ -299,6 +301,10 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private ToolStripButton? _clickToNavigateButton;
     private ToolStripMenuItem? _clickToNavigateItem;
     private ToolStripButton? _thumbnailModeButton;
+    private ToolStripButton? _manhwaModeButton;
+    private ToolStripMenuItem? _manhwaModeItem;
+    private ToolStripDropDownButton? _manhwaWidthButton;
+    private ToolStripMenuItem? _zoomMenuItem;
     private ToolStripButton? _fullscreenButton;
     private ToolStripDropDownButton? _folderSortButton;
     private ToolStripDropDownButton? _archiveSortButton;
@@ -389,6 +395,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _autoSingleLandscape = _settings.AutoSingleLandscape;
         _thumbnailMode = _settings.ThumbnailMode && !_forceInitialFullPage;
         _viewer.JapaneseMode = _settings.JapaneseMode;
+        _viewer.ManhwaWidthPercent = _settings.ManhwaWidthPercent;
         _viewer.ShowShadow = _settings.Shadow;
         // Fast Reader/Viewer always opens and renders pages fitted to the current viewport.
         _viewer.FitToScreen = true;
@@ -444,6 +451,14 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         };
         _viewer.ZoomSourceSizeRequested = GetZoomSourceSizeAsync;
         _viewer.ZoomCropRequested = RenderZoomCropAsync;
+        _viewer.ManhwaCropRequested = RenderManhwaCropAsync;
+        _viewer.ManhwaPartChanged += (_, _) =>
+        {
+            if (!IsManhwaBook || _thumbnailMode) return;
+            PersistentPreviewCache.NotifyUserActivity();
+            RememberCurrentBookPosition();
+            UpdateFileInfoLabel();
+        };
         _viewer.ZoomModeChanged += (_, enabled) =>
         {
             if (enabled)
@@ -584,13 +599,14 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         }, Keys.Control | Keys.T);
         _sliderItem = CheckItem("&Position Slider", (_, _) => _bottomPanel.Visible = _sliderItem!.Checked, Keys.Control | Keys.I);
         _autoSlideItem = CheckItem("&Automatic Slideshow", (_, _) => _slideTimer.Enabled = _autoSlideItem!.Checked, Keys.Control | Keys.H);
+        _manhwaModeItem = CheckItem("&Manhwa mode (long images)", (_, _) => ToggleManhwaMode());
         var read = Menu("&Read",
             Item("&First Page", (_, _) => GoToPage(0)),
             Item("&Last Page", (_, _) => GoToReadingEnd()),
             Item("&Next Page", (_, _) => NextPage()), Item("&Previous Page", (_, _) => PreviousPage()), Sep(),
             Item("S&croll Up", (_, _) => ScrollViewer(0, -80)), Item("Sc&roll Down", (_, _) => ScrollViewer(0, 80)),
             Item("Scr&oll Left", (_, _) => ScrollViewer(-80, 0)), Item("Scroll R&ight", (_, _) => ScrollViewer(80, 0)),
-            Sep(), _thumbItem, _sliderItem, _autoSlideItem);
+            Sep(), _manhwaModeItem, _thumbItem, _sliderItem, _autoSlideItem);
 
         _doublePageItem = CheckItem("&Double Page", (_, _) =>
         {
@@ -620,6 +636,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             Item("Zoo&m 100%", (_, _) => _viewer.SetZoom(1f)), Item("Zoom &125%", (_, _) => _viewer.SetZoom(1.25f)),
             Item("Zoom 1&50%", (_, _) => _viewer.SetZoom(1.5f)), Item("Zoom &200%", (_, _) => _viewer.SetZoom(2f)),
             Item("Zoom &400%", (_, _) => _viewer.SetZoom(4f)));
+        _zoomMenuItem = zoom;
         var rotate = Menu("&Rotate", Item("&Left", (_, _) => RotateCurrent(-90)), Item("&Right", (_, _) => RotateCurrent(90)), Item("R&eset", (_, _) => ResetRotation()));
         var fit = Menu("&Fit", Item("Fi&t to Screen", (_, _) => _viewer.ResetFit(), Keys.Control | Keys.F));
         _directionItem = CheckItem("Right-to-Left Reading", (_, _) => SetReadingDirection(_directionItem!.Checked), Keys.Control | Keys.J);
@@ -657,6 +674,27 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _rightButton = AddActionTool(ToolbarIconFactory.Arrow(true), "Right", ToolbarHotkeyCatalog.Right);
         _endButton = AddActionTool(null, "End", ToolbarHotkeyCatalog.End);
         _thumbnailModeButton = AddActionTool(null, "Full page / Thumbnail grid", ToolbarHotkeyCatalog.ViewMode);
+        _manhwaModeButton = AddActionTool(null, "Manhwa mode (long images)", ToolbarHotkeyCatalog.ManhwaMode);
+        _manhwaWidthButton = new ToolStripDropDownButton
+        {
+            DisplayStyle = ToolStripItemDisplayStyle.Text,
+            AutoToolTip = true, AccessibleName = "Manhwa width",
+            ForeColor = ModernUiTheme.Text, BackColor = ModernUiTheme.HeaderBackground,
+            Margin = new Padding(3, 0, 2, 0), Padding = new Padding(5, 3, 5, 3)
+        };
+        foreach (var percent in new[] { 25, 33, 50, 67, 75, 100 })
+        {
+            var value = percent;
+            _manhwaWidthButton.DropDownItems.Add(new ToolStripMenuItem($"{value}%", null,
+                (_, _) => SetManhwaWidthPercent(value))
+            {
+                Tag = value, ForeColor = ModernUiTheme.Text,
+                BackColor = ModernUiTheme.ControlBackground
+            });
+        }
+        _manhwaWidthButton.DropDownItems.Add(Sep());
+        _manhwaWidthButton.DropDownItems.Add(Item("Custom… (Settings)", (_, _) => ShowConfiguration()));
+        _toolbar.Items.Add(_manhwaWidthButton);
         _pageLayoutButton = AddActionTool(null, "Page layout", ToolbarHotkeyCatalog.PageLayout);
         _autoSingleLandscapeButton = AddActionTool(null, "Auto-single landscape", ToolbarHotkeyCatalog.AutoSingleLandscape);
         _directionButton = AddActionTool(null, "LTR / RTL", ToolbarHotkeyCatalog.ReadingDirection);
@@ -692,6 +730,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 else GoToReadingEnd();
                 break;
             case ToolbarHotkeyCatalog.ViewMode: SetThumbnailMode(!_thumbnailMode); break;
+            case ToolbarHotkeyCatalog.ManhwaMode: ToggleManhwaMode(); break;
             case ToolbarHotkeyCatalog.PageLayout: CyclePageLayout(); break;
             case ToolbarHotkeyCatalog.AutoSingleLandscape: ToggleAutoSingleLandscape(); break;
             case ToolbarHotkeyCatalog.ReadingDirection: SetReadingDirection(!_viewer.JapaneseMode); break;
@@ -745,6 +784,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             if (_book is null || _book.Pages.Count == 0) return;
             CancelPendingThumbnailWarmCenter();
             _viewer.ReturnToFit();
+            _viewer.CancelManhwaPage();
+            _manhwaThumbnailPageKey = null;
             _pageIndex = Math.Clamp(page, 0, _book.Pages.Count - 1);
             UpdatePosition();
             SetThumbnailMode(false);
@@ -1051,7 +1092,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private async Task TryOpenAsync(string path,
         string? preferredPageName = null, string? preferredBrowsePath = null,
         bool forceFreshPageCache = false,
-        PdfReloadCache? pdfReloadCache = null)
+        PdfReloadCache? pdfReloadCache = null, bool manhwaStartAtEnd = false)
     {
         ExtendedDiagnostics.Breadcrumb(
             $"Open requested: {path}; thumbnailMode={_thumbnailMode}");
@@ -1130,6 +1171,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 return;
             }
             _book = book;
+            _viewer.ManhwaMode = IsManhwaBook;
+            UpdateNavigationToolbar();
             RecordHistory(book.SourcePath);
             ExtendedDiagnostics.Breadcrumb(
                 $"Open completed: {book.SourcePath}; pages={book.Pages.Count}; " +
@@ -1172,11 +1215,28 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 ? -1
                 : book.Pages.ToList().FindIndex(page => page.Name.Equals(
                     preferredPageName, StringComparison.OrdinalIgnoreCase));
-            _pageIndex = preferredIndex >= 0
+            _pageIndex = manhwaStartAtEnd && IsManhwaBook
+                ? Math.Max(0, book.Pages.Count - 1)
+                : preferredIndex >= 0
                 ? preferredIndex
                 : File.Exists(path) && Book.IsSupportedImage(path)
                     ? book.IndexOfFile(path)
                     : GetRememberedBookPage(book);
+            if (IsManhwaBook && !manhwaStartAtEnd && preferredIndex < 0 &&
+                !(File.Exists(path) && Book.IsSupportedImage(path)) &&
+                _settings.RememberReadingPosition &&
+                _settings.RememberedManhwaPositions is { } manhwaPositions &&
+                manhwaPositions.TryGetValue(GetReadingPositionKey(book.SourcePath), out var savedPart) &&
+                _pageIndex >= 0 && _pageIndex < book.Pages.Count &&
+                string.Equals(savedPart.PageName, book.Pages[_pageIndex].Name, StringComparison.OrdinalIgnoreCase))
+            {
+                var restorePage = _pageIndex;
+                var rotation = await Task.Run(() => GetPageRotation(book, restorePage), cancellation.Token);
+                cancellation.Token.ThrowIfCancellationRequested();
+                if (!ReferenceEquals(_book, book)) return;
+                if (savedPart.Rotation == rotation)
+                    _viewer.SetManhwaSourceTop(Math.Max(0, savedPart.SourceTop));
+            }
             _ = RefreshCurrentPageInfoAsync(_pageIndex);
             _currentAutoSingle = false;
             _suppressPositionEvent = true;
@@ -1211,7 +1271,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 _thumbnailGrid.Focus();
                 _ = LoadThumbnailsProgressivelyAsync();
             }
-            else await ShowPageAsync();
+            else await ShowPageAsync(manhwaStartAtEnd);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
@@ -1256,6 +1316,18 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var key = GetReadingPositionKey(book.SourcePath);
         positions[key] = book.Pages[_pageIndex].Name;
+        if (IsManhwaBook && !_thumbnailMode && _viewer.ManhwaPartCount > 0)
+        {
+            var parts = _settings.RememberedManhwaPositions ??=
+                new Dictionary<string, ManhwaReadingPosition>(StringComparer.OrdinalIgnoreCase);
+            parts[key] = new ManhwaReadingPosition
+            {
+                PageName = book.Pages[_pageIndex].Name,
+                SourceTop = _viewer.ManhwaSourceTop,
+                Rotation = GetPageRotation(book, _pageIndex)
+            };
+            while (parts.Count > 4096) parts.Remove(parts.Keys.First());
+        }
         // Keep settings lightweight even for very large libraries.
         while (positions.Count > 4096)
             positions.Remove(positions.Keys.First());
@@ -1317,7 +1389,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             preferredBrowsePath: isParentNavigation ? source : null);
     }
 
-    private async Task ShowPageAsync()
+    private async Task ShowPageAsync(bool manhwaStartAtEnd = false)
     {
         if (_book is null || _cache is null || _book.Pages.Count == 0) return;
         PersistentPreviewCache.NotifyUserActivity();
@@ -1340,6 +1412,29 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         UpdatePosition(); HighlightThumbnail();
         var firstIndex = _pageIndex;
         lock (_warmStateGate) _requestedWarmCenter = firstIndex;
+        _viewer.ManhwaMode = IsManhwaBook;
+        if (IsManhwaBook)
+        {
+            _ = PauseFullPagePrecache();
+            _ = UpdateVisibleColorProfilesAsync(book, firstIndex, -1, cancellation.Token);
+            try
+            {
+                await _viewer.ShowManhwaPageAsync(firstIndex,
+                    GetManhwaPageKey(book, firstIndex), manhwaStartAtEnd, cancellation.Token);
+                if (!cancellation.IsCancellationRequested && ReferenceEquals(_book, book) &&
+                    _pageIndex == firstIndex)
+                    UpdateSpreadStatus();
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception exception)
+            {
+                ExtendedDiagnostics.LogException("Manhwa page render failed", exception,
+                    $"source={book.SourcePath}; page={firstIndex}");
+                if (!cancellation.IsCancellationRequested)
+                    _viewer.ShowLoadingPlaceholder("Unable to load this image");
+            }
+            return;
+        }
         var secondCandidate = GetSecondPageIndex(ignoreAutoSingle: true);
         _ = UpdateVisibleColorProfilesAsync(book, firstIndex, secondCandidate, cancellation.Token);
         var total = secondCandidate >= 0 ? 2 : 1;
@@ -1363,6 +1458,15 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 _ = AttachCachedPageSourcesAsync(
                     cache, book, firstIndex, cachedSecondIndex, cancellation,
                     _viewer.IsShowingPreview);
+            }
+            else if (_viewer.IsShowingPreview)
+            {
+                // A directional warm-up can finish the fast preview just as
+                // navigation promotes this page to the visible center. The
+                // remaining warm queue skips that center, so explicitly request
+                // its final render rather than leaving the preview indefinitely.
+                _ = PromoteCachedEncodedPagesAsync(
+                    book, firstIndex, cachedSecondIndex, cancellation.Token);
             }
             StartVisibleAnimations(
                 book, firstIndex, cachedSecondIndex, cancellation.Token);
@@ -1744,6 +1848,44 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             cancellationToken) ? fast : null;
     }, cancellationToken);
 
+    private async Task PromoteCachedEncodedPagesAsync(
+        Book book, int firstIndex, int secondIndex, CancellationToken cancellationToken)
+    {
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var context = _viewer.CapturePreRenderContext();
+            var visiblePageCount = secondIndex >= 0 ? 2 : 1;
+            var firstKey = GetPageCacheKey(book, firstIndex);
+            var secondKey = secondIndex >= 0 ? GetPageCacheKey(book, secondIndex) : null;
+            var firstTask = _viewer.PreRenderEncodedJpegAsync(
+                firstIndex, firstKey, book.Pages[firstIndex], visiblePageCount,
+                GetPageRotation(book, firstIndex), context,
+                generatePreview: false, cancellationToken, interactiveFull: true);
+            var secondTask = secondIndex >= 0
+                ? _viewer.PreRenderEncodedJpegAsync(
+                    secondIndex, secondKey!, book.Pages[secondIndex], visiblePageCount,
+                    GetPageRotation(book, secondIndex), context,
+                    generatePreview: false, cancellationToken, interactiveFull: true)
+                : Task.CompletedTask;
+            await Task.WhenAll(firstTask, secondTask);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (IsDisposed || Disposing || _thumbnailMode || IsManhwaBook ||
+                !ReferenceEquals(_book, book) || _pageIndex != firstIndex ||
+                GetSecondPageIndex() != secondIndex ||
+                _viewer.CapturePreRenderContext().Version != context.Version) return;
+            if (_viewer.TryPresentCachedPages(
+                    firstKey, secondKey, firstIndex, secondIndex))
+                UpdateSpreadStatus();
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception exception)
+        {
+            ExtendedDiagnostics.LogException("Cached JPEG preview promotion failed", exception,
+                $"source={book.SourcePath}; first={firstIndex}; second={secondIndex}");
+        }
+    }
+
     private async Task AttachCachedPageSourcesAsync(
         PageCache cache, Book book, int firstIndex, int secondIndex,
         CancellationTokenSource cancellation, bool attachImmediately)
@@ -1825,6 +1967,9 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         int center, PageCache cache, Book book, bool immediate = false,
         bool rebuildRenderContext = false, bool idlePriority = false)
     {
+        // Manhwa requests only bounded visible image sections; do not decode
+        // full tall pages speculatively, including while its grid is visible.
+        if (IsManhwaBook) return;
         idlePriority |= _thumbnailMode || !_windowActive ||
             WindowState == FormWindowState.Minimized;
         lock (_warmStateGate)
@@ -2250,6 +2395,11 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private string GetPageCacheKey(Book book, int index) =>
         $"{book.SourcePath}|{index}|{GetPageRotation(book, index)}|pdf:1";
 
+    // EXIF belongs to the source and is resolved by the metadata worker. Only
+    // explicit rotations change this identity while that probe is pending.
+    private string GetManhwaPageKey(Book book, int index) =>
+        $"{book.SourcePath}|{index}|{_rotations.GetValueOrDefault(index)}|manhwa:1";
+
     private int GetPageRotation(Book book, int index)
     {
         var rotation = _rotations.GetValueOrDefault(index) +
@@ -2379,10 +2529,26 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken, _bookCancellation?.Token ?? CancellationToken.None);
         var entry = book.Pages[pageIndex];
-        var rotation = GetPageRotation(book, pageIndex);
+        var manhwa = IsManhwaBook;
         return await Task.Run(
-            () => EncodedJpegRenderer.ProbeSize(entry, rotation, linked.Token),
+            () => manhwa
+                ? ManhwaSegmentRenderer.ProbeSize(entry, GetPageRotation(book, pageIndex), linked.Token)
+                : EncodedJpegRenderer.ProbeSize(entry, GetPageRotation(book, pageIndex), linked.Token),
             linked.Token).ConfigureAwait(false);
+    }
+
+    private async Task<ZoomPatchSurface> RenderManhwaCropAsync(
+        int pageIndex, Rectangle sourceCrop, Size outputSize,
+        bool fastPreview, CancellationToken cancellationToken)
+    {
+        var book = _book ?? throw new InvalidOperationException("No book is open.");
+        if (pageIndex < 0 || pageIndex >= book.Pages.Count)
+            throw new ArgumentOutOfRangeException(nameof(pageIndex));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken, _bookCancellation?.Token ?? CancellationToken.None);
+        return await ManhwaSegmentRenderer.RenderAsync(book.Pages[pageIndex],
+            sourceCrop, outputSize, GetPageRotation(book, pageIndex),
+            _settings.LanczosQuality, fastPreview, linked.Token).ConfigureAwait(false);
     }
 
     private async Task<ZoomPatchSurface> RenderZoomCropAsync(
@@ -2574,6 +2740,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private async void RestartPrecacheForViewport()
     {
+        if (IsManhwaBook) return;
         if (_cache is not { } cache || _book is not { } book) return;
         var contextVersion = _viewer.CapturePreRenderContext().Version;
 
@@ -3349,7 +3516,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private int GetSecondPageIndex(bool ignoreAutoSingle = false)
     {
-        if (!_doublePage || _book is null || (IsFirstPageSingle && _pageIndex == 0) ||
+        if (!UseDoublePage || _book is null || (IsFirstPageSingle && _pageIndex == 0) ||
             (!ignoreAutoSingle && _autoSingleLandscape && _currentAutoSingle)) return -1;
         var value = _pageIndex + 1;
         return value < _book.Pages.Count ? value : -1;
@@ -3364,6 +3531,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private void NavigateOnce(int direction)
     {
         if (_book is null) return;
+        if (!_thumbnailMode && IsManhwaBook && _viewer.TryNavigateManhwa(direction)) return;
         // Navigation always leaves the transient viewport zoom immediately,
         // including attempts at a book boundary or adjacent-book navigation.
         _viewer.ReturnToFit();
@@ -3374,7 +3542,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 OpenAdjacentBook(1);
                 return;
             }
-            var target = _doublePage && !_forwardOnePage
+            var target = UseDoublePage && !_forwardOnePage
                 ? SpreadNavigation.FindNextStart(
                     _book.Pages.Count, _pageIndex, IsFirstPageSingle,
                     _autoSingleLandscape, _landscapePages)
@@ -3388,30 +3556,37 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 OpenAdjacentBook(-1);
                 return;
             }
-            var target = _doublePage && !_forwardOnePage
+            var target = UseDoublePage && !_forwardOnePage
                 ? SpreadNavigation.FindPreviousStart(
                     _book.Pages.Count, _pageIndex, IsFirstPageSingle,
                     _autoSingleLandscape, _landscapePages)
                 : Math.Max(0, _pageIndex - 1);
-            GoToPage(target);
+            GoToPage(target, manhwaStartAtEnd: IsManhwaBook);
         }
     }
 
     private void GoToReadingEnd()
     {
         if (_book is null || _book.Pages.Count == 0) return;
-        var target = _doublePage && !_forwardOnePage
+        var target = UseDoublePage && !_forwardOnePage
             ? SpreadNavigation.FindLastStart(
                 _book.Pages.Count, IsFirstPageSingle,
                 _autoSingleLandscape, _landscapePages)
             : _book.Pages.Count - 1;
-        GoToPage(target);
+        GoToPage(target, manhwaStartAtEnd: IsManhwaBook);
     }
+
+    private bool IsManhwaBook => _settings.ManhwaMode &&
+        (_book is null || !Path.GetExtension(_book.SourcePath).Equals(
+            ".pdf", StringComparison.OrdinalIgnoreCase));
+
+    private bool UseDoublePage => _doublePage && !IsManhwaBook;
 
     private bool IsFirstPageSingle => _cover || _doublePageOffset;
 
     private void CyclePageLayout()
     {
+        if (IsManhwaBook) return;
         _pageLayoutChangedAfterStartup = true;
         var pageIndexAdjustment = 0;
         if (!_doublePage)
@@ -3448,6 +3623,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private void ToggleAutoSingleLandscape()
     {
+        if (IsManhwaBook) return;
         _autoSingleLandscape = !_autoSingleLandscape;
         if (_autoSingleLandscapeItem is not null)
             _autoSingleLandscapeItem.Checked = _autoSingleLandscape;
@@ -3457,6 +3633,16 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private void SetThumbnailMode(bool enabled)
     {
+        if (enabled && !_thumbnailMode && IsManhwaBook && _book is { } manhwaBook)
+        {
+            RememberCurrentBookPosition();
+            _manhwaThumbnailPageKey = GetManhwaPageKey(manhwaBook, _pageIndex);
+            _manhwaThumbnailSourceTop = _viewer.ManhwaSourceTop;
+        }
+        _viewer.CancelManhwaPage();
+        if (!enabled && IsManhwaBook && _book is { } resumeBook &&
+            _manhwaThumbnailPageKey == GetManhwaPageKey(resumeBook, _pageIndex))
+            _viewer.SetManhwaSourceTop(_manhwaThumbnailSourceTop);
         if (!enabled) CancelPendingThumbnailWarmCenter();
         var layoutVersion = unchecked(++_viewModeLayoutVersion);
         ExtendedDiagnostics.Breadcrumb(
@@ -3613,10 +3799,12 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         return _pageIndex >= last || GetSecondPageIndex() >= last;
     }
 
-    private void GoToPage(int index)
+    private void GoToPage(int index, bool manhwaStartAtEnd = false)
     {
         if (_book is null || _book.Pages.Count == 0) return;
         _viewer.ReturnToFit();
+        _viewer.CancelManhwaPage();
+        _manhwaThumbnailPageKey = null;
         _pageIndex = Math.Clamp(index, 0, _book.Pages.Count - 1);
         UpdatePosition();
         if (_thumbnailMode)
@@ -3624,7 +3812,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
             HighlightThumbnail();
             return;
         }
-        _ = ShowPageAsync();
+        _ = ShowPageAsync(manhwaStartAtEnd);
     }
 
     private void SetReadingDirection(bool rightToLeft)
@@ -3632,7 +3820,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _viewer.ReturnToFit();
         _viewer.JapaneseMode = rightToLeft;
         UpdateDirectionUi();
-        _viewer.SwapReadingDirection();
+        if (!IsManhwaBook) _viewer.SwapReadingDirection();
     }
 
     private void UpdateDirectionUi()
@@ -3650,6 +3838,42 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _services.NotifySettingsChanged(this, SharedSettingsChange.ClickNavigation);
     }
 
+    private void ToggleManhwaMode()
+    {
+        RememberCurrentBookPosition();
+        _settings.ManhwaMode = !_settings.ManhwaMode;
+        _settings.Save();
+        ApplyManhwaMode();
+        _services.NotifySettingsChanged(this, SharedSettingsChange.ManhwaReading);
+    }
+
+    private void ApplyManhwaMode()
+    {
+        CancelAndDisposeInBackground(_displayCancellation);
+        _displayCancellation = null;
+        _viewer.ReturnToFit();
+        _viewer.CancelManhwaPage();
+        _manhwaThumbnailPageKey = null;
+        _viewer.ManhwaMode = IsManhwaBook;
+        _viewer.ManhwaWidthPercent = _settings.ManhwaWidthPercent;
+        PauseFullPagePrecache();
+        UpdateNavigationToolbar();
+        UpdateSpreadStatus();
+        if (!_thumbnailMode) _ = ShowPageAsync();
+    }
+
+    private void SetManhwaWidthPercent(int percent)
+    {
+        percent = Math.Clamp(percent, 1, 100);
+        if (_settings.ManhwaWidthPercent == percent) return;
+        _settings.ManhwaWidthPercent = percent;
+        _viewer.ManhwaWidthPercent = percent;
+        UpdateNavigationToolbar();
+        UpdateFileInfoLabel();
+        _settings.Save();
+        _services.NotifySettingsChanged(this, SharedSettingsChange.ManhwaWidth);
+    }
+
     private void NavigatePhysicalLeft()
     {
         if (_viewer.JapaneseMode) NextPage(); else PreviousPage();
@@ -3664,6 +3888,32 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     {
         _viewer.ClickToNavigate = _settings.ClickToNavigate;
         if (_startButton is null) return;
+        if (_manhwaModeItem is not null) _manhwaModeItem.Checked = _settings.ManhwaMode;
+        if (_manhwaWidthButton is not null)
+        {
+            _manhwaWidthButton.Text = $"{_settings.ManhwaWidthPercent}%";
+            _manhwaWidthButton.Visible = _settings.ManhwaMode;
+            _manhwaWidthButton.Enabled = IsManhwaBook;
+            _manhwaWidthButton.ToolTipText = $"Manhwa width: {_settings.ManhwaWidthPercent}% of the reading area. " +
+                "Custom values: Settings > General > Reading layout.";
+            foreach (var item in _manhwaWidthButton.DropDownItems.OfType<ToolStripMenuItem>())
+                if (item.Tag is int percent) item.Checked = percent == _settings.ManhwaWidthPercent;
+        }
+        if (_manhwaModeButton is not null)
+        {
+            _manhwaModeButton.Checked = _settings.ManhwaMode;
+            SetToolImage(_manhwaModeButton, ToolbarIconFactory.ManhwaMode(_settings.ManhwaMode));
+            SetActionTooltip(_manhwaModeButton, !_settings.ManhwaMode
+                ? "Manhwa mode: Off (read long images in sections; image folders and archives)"
+                : IsManhwaBook
+                    ? $"Manhwa mode: On ({_settings.ManhwaWidthPercent}% width; next/previous reads image sections)"
+                    : "Manhwa mode: On for images; PDFs use the normal reading layout");
+        }
+        if (_pageLayoutButton is not null) _pageLayoutButton.Enabled = !IsManhwaBook;
+        if (_autoSingleLandscapeButton is not null) _autoSingleLandscapeButton.Enabled = !IsManhwaBook;
+        if (_doublePageItem is not null) _doublePageItem.Enabled = !IsManhwaBook;
+        if (_autoSingleLandscapeItem is not null) _autoSingleLandscapeItem.Enabled = !IsManhwaBook;
+        if (_zoomMenuItem is not null) _zoomMenuItem.Enabled = !IsManhwaBook;
         if (_clickToNavigateItem is not null)
             _clickToNavigateItem.Checked = _settings.ClickToNavigate;
         if (_clickToNavigateButton is not null)
@@ -3679,7 +3929,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         SetToolImage(_endButton, ToolbarIconFactory.Boundary(pointsRight: !rtl, start: true));
         UpdateBoundaryButtonPositions(rtl);
         SetToolImage(_directionButton, ToolbarIconFactory.Direction(rtl));
-        var layoutMode = !_doublePage ? 0 : _doublePageOffset ? 2 : 1;
+        var layoutMode = !UseDoublePage ? 0 : _doublePageOffset ? 2 : 1;
         SetToolImage(_pageLayoutButton, ToolbarIconFactory.PageLayout(layoutMode));
         SetToolImage(_autoSingleLandscapeButton, ToolbarIconFactory.AutoSingleLandscape(_autoSingleLandscape));
         SetToolImage(_thumbnailModeButton, ToolbarIconFactory.ThumbnailMode(_thumbnailMode));
@@ -3904,9 +4154,12 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     private void UpdateFileInfoLabel()
     {
         var parts = new List<string> { GetVisiblePageName() };
+        if (IsManhwaBook && !_thumbnailMode && _viewer.ManhwaPartCount > 0)
+            parts.Add($"Manhwa {_viewer.ManhwaPartIndex + 1}/{_viewer.ManhwaPartCount}");
         if (!string.IsNullOrWhiteSpace(_currentFileSize)) parts.Add(_currentFileSize);
         if (!string.IsNullOrWhiteSpace(_currentResolution)) parts.Add(_currentResolution);
-        parts.Add(_currentZoomPercent > 0 ? $"Zoom {_currentZoomPercent}%" : "Fit");
+        parts.Add(IsManhwaBook && !_thumbnailMode ? $"Width {_settings.ManhwaWidthPercent}%" :
+            _currentZoomPercent > 0 ? $"Zoom {_currentZoomPercent}%" : "Fit");
         _loadStatus.Text = string.Join("   •   ", parts);
     }
 
@@ -3980,6 +4233,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private void CancelBookWork(bool retainPageCache = true)
     {
+        _viewer.CancelManhwaPage();
+        _manhwaThumbnailPageKey = null;
         CancelPendingThumbnailWarmCenter();
         ClearRetainedAnimation();
         _viewerRendering = false;
@@ -4816,7 +5071,8 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
                 $"Adjacent lookup completed: elapsedMs={timer.ElapsedMilliseconds}; next={nextPath}");
             if (nextPath is null || cancellationToken.IsCancellationRequested ||
                 IsDisposed || !ReferenceEquals(_book, currentBook)) return;
-            await TryOpenAsync(nextPath);
+            await TryOpenAsync(nextPath,
+                manhwaStartAtEnd: _settings.ManhwaMode && direction < 0);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
         catch (IOException) { }
@@ -5054,6 +5310,11 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
     private void ScrollViewer(int dx, int dy)
     {
+        if (!_thumbnailMode && IsManhwaBook && dy != 0)
+        {
+            NavigateOnce(Math.Sign(dy));
+            return;
+        }
         var p = _viewer.AutoScrollPosition; _viewer.AutoScrollPosition = new Point(-p.X + dx, -p.Y + dy);
     }
 
@@ -5450,13 +5711,19 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _settings.BackgroundArgb = dialog.ReaderBackground.ToArgb();
         _settings.AutoMoveMode = dialog.AutoMoveMode;
         _settings.RememberReadingPosition = dialog.RememberReadingPosition;
+        var manhwaWidthChanged = _settings.ManhwaWidthPercent != dialog.ManhwaWidthPercent;
+        _settings.ManhwaWidthPercent = dialog.ManhwaWidthPercent;
+        _viewer.ManhwaWidthPercent = _settings.ManhwaWidthPercent;
         _settings.HistoryEnabled = dialog.HistoryEnabled;
         _settings.HistoryMaximumItems = dialog.HistoryMaximumItems;
         TrimHistory();
         _settings.ExtendedLoggingEnabled = dialog.ExtendedLoggingEnabled;
         ExtendedDiagnostics.Configure(_settings.ExtendedLoggingEnabled);
         if (dialog.ClearRememberedReadingPositionsRequested)
+        {
             (_settings.RememberedReadingPositions ??= new()).Clear();
+            (_settings.RememberedManhwaPositions ??= new()).Clear();
+        }
         _settings.RandomLibraryPath = dialog.RandomLibraryPath;
         _settings.ToolbarHotkeys = dialog.ToolbarHotkeys;
         _viewer.ApplyReaderSettings(
@@ -5468,6 +5735,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         _settings.Save();
         var sharedChange = SharedSettingsChange.Performance |
             SharedSettingsChange.Hotkeys | SharedSettingsChange.General;
+        if (manhwaWidthChanged) sharedChange |= SharedSettingsChange.ManhwaWidth;
         if (colorManagementChanged) sharedChange |= SharedSettingsChange.ColorManagement;
         if (pdfiumProcessCountChanged) sharedChange |= SharedSettingsChange.PdfEngine;
         _services.NotifySettingsChanged(this, sharedChange);
@@ -5532,6 +5800,14 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
 
         if ((change & SharedSettingsChange.ClickNavigation) != 0)
             UpdateNavigationToolbar();
+        if ((change & SharedSettingsChange.ManhwaReading) != 0)
+            ApplyManhwaMode();
+        if ((change & SharedSettingsChange.ManhwaWidth) != 0)
+        {
+            _viewer.ManhwaWidthPercent = _settings.ManhwaWidthPercent;
+            UpdateNavigationToolbar();
+            UpdateFileInfoLabel();
+        }
         if ((change & (SharedSettingsChange.Performance | SharedSettingsChange.General)) != 0)
         {
             _performance = PerformanceProfile.Resolve(_settings);
@@ -5699,7 +5975,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
     {
         var source = _book?.SourcePath ?? "none";
         var pageCount = _book?.Pages.Count ?? 0;
-        return $"mode={(_thumbnailMode ? "thumbnail" : _doublePage ? "double" : "single")}; " +
+        return $"mode={(_thumbnailMode ? "thumbnail" : IsManhwaBook ? "manhwa" : _doublePage ? "double" : "single")}; " +
             $"source={source}; page={_pageIndex + 1}/{pageCount}; " +
             $"thumbnailSelection={string.Join(',', _thumbnailGrid.SelectedPages)}; " +
             $"window={WindowState}; size={ClientSize.Width}x{ClientSize.Height}; " +
@@ -5744,6 +6020,7 @@ internal sealed class AsyncMainForm : Form, IMessageFilter
         if (_doublePageItem is not null) _doublePageItem.Checked = _doublePage;
         if (_autoSingleLandscapeItem is not null) _autoSingleLandscapeItem.Checked = _autoSingleLandscape;
         if (_thumbItem is not null) _thumbItem.Checked = _thumbnailMode;
+        if (_manhwaModeItem is not null) _manhwaModeItem.Checked = _settings.ManhwaMode;
         if (_directionItem is not null) _directionItem.Checked = _viewer.JapaneseMode;
         if (_sliderItem is not null) _sliderItem.Checked = _bottomPanel.Visible;
         if (_shadowItem is not null) _shadowItem.Checked = _viewer.ShowShadow;

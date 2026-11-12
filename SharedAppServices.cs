@@ -15,7 +15,9 @@ internal enum SharedSettingsChange
     Sorting = 16,
     General = 32,
     ClickNavigation = 64,
-    All = Performance | ColorManagement | PdfEngine | Hotkeys | Sorting | General | ClickNavigation
+    ManhwaReading = 128,
+    ManhwaWidth = 256,
+    All = Performance | ColorManagement | PdfEngine | Hotkeys | Sorting | General | ClickNavigation | ManhwaReading | ManhwaWidth
 }
 
 internal sealed class SharedAppServices

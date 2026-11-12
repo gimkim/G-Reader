@@ -166,6 +166,21 @@ internal static class ToolbarIconFactory
         }
     });
 
+    public static Image ManhwaMode(bool enabled) => Draw(g =>
+    {
+        using var pen = Pen(enabled ? Accent : Ink, 1.7f);
+        using var fill = new SolidBrush(enabled
+            ? Color.FromArgb(55, 91, 145) : Color.FromArgb(55, 60, 70));
+        g.FillRectangle(fill, 6, 1, 12, 22);
+        g.DrawRectangle(pen, 6, 1, 12, 22);
+        g.DrawLine(pen, 7, 8, 17, 8);
+        g.DrawLine(pen, 7, 16, 17, 16);
+        using var arrow = Pen(enabled ? Accent : Ink, 1.8f);
+        g.DrawLine(arrow, 21, 5, 21, 19);
+        g.DrawLine(arrow, 19, 16, 21, 19);
+        g.DrawLine(arrow, 21, 19, 23, 16);
+    });
+
     public static Image ThumbnailMode(bool gridMode) => Draw(g =>
     {
         using var pen = Pen(gridMode ? Accent : Ink, 1.7f);

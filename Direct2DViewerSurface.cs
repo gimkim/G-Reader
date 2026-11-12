@@ -65,11 +65,14 @@ internal sealed class Direct2DViewerSurface : Control
     private ID2D1HwndRenderTarget? _renderTarget;
     private ID2D1Device? _d2dDevice;
     private GpuInteropDevice.DeviceUsageLease? _sharedDeviceUsage;
+    private Task _swapChainRetirement = Task.CompletedTask;
     private ID2D1DeviceContext? _deviceContext;
     private IDXGISwapChain1? _swapChain;
     private ID2D1Bitmap1? _swapChainTarget;
     private ID2D1Bitmap? _leftBitmap;
     private ID2D1Bitmap? _rightBitmap;
+    private ID2D1Bitmap? _transientBitmap;
+    private GpuRenderedImage.UsageLease? _transientGpuUsage;
     private ID2D1Bitmap? _zoomBaseBitmap;
     private ID2D1Bitmap? _zoomSecondBitmap;
     private ID2D1Bitmap? _leftAnimatedGpuBitmap;
@@ -140,6 +143,7 @@ internal sealed class Direct2DViewerSurface : Control
     public void Present(Bitmap? left, Bitmap? right, Rectangle leftBounds, Rectangle rightBounds)
     {
         ReleaseAnimatedGpuPages();
+        ReleaseTransientFrame();
         try
         {
             EnsureRenderTarget();
@@ -193,6 +197,7 @@ internal sealed class Direct2DViewerSurface : Control
         Rectangle leftBounds, Rectangle rightBounds)
     {
         ReleaseAnimatedGpuPages();
+        ReleaseTransientFrame();
         try
         {
             EnsureRenderTarget();
@@ -231,6 +236,89 @@ internal sealed class Direct2DViewerSurface : Control
             HandleDeviceLoss("GPU bitmap import");
             return false;
         }
+    }
+
+    /// <summary>
+    /// Displays a one-use viewport surface without retaining every rendered
+    /// segment in the page LRU. Only the current imported bitmap owns a lease.
+    /// </summary>
+    public bool PresentTransient(Bitmap? source, GpuRenderedImage? gpu, Rectangle bounds)
+    {
+        if (source is null && gpu is null) return false;
+        ID2D1Bitmap? imported = null;
+        GpuRenderedImage.UsageLease? usage = null;
+        try
+        {
+            EnsureRenderTarget();
+            if (gpu is not null)
+            {
+                if (_deviceContext is null || gpu.DeviceGeneration != GpuInteropDevice.Generation)
+                {
+                    ScheduleDeviceRecovery("transient GPU frame unavailable");
+                    return false;
+                }
+                usage = gpu.AcquireUsage();
+                if (usage is null) return false;
+                using var surface = gpu.Texture.QueryInterface<IDXGISurface>();
+                imported = _deviceContext.CreateBitmapFromDxgiSurface(surface,
+                    new BitmapProperties1(new Vortice.DCommon.PixelFormat(
+                        Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Premultiplied),
+                        96f, 96f, BitmapOptions.None));
+            }
+            else
+            {
+                if (_deviceContext is null && _renderTarget is null)
+                {
+                    ScheduleDeviceRecovery("transient bitmap target unavailable");
+                    return false;
+                }
+                imported = CreateUploadedBitmap(source!);
+            }
+
+            ReleaseAnimatedGpuPages();
+            ReleaseTransientFrame();
+            _transientBitmap = imported;
+            _transientGpuUsage = usage;
+            _leftBitmap = imported;
+            _rightBitmap = null;
+            _leftBounds = bounds;
+            _rightBounds = Rectangle.Empty;
+            var accepted = imported;
+            imported = null;
+            usage = null;
+            DrawFrame();
+            // A busy swap chain retries this accepted frame on its timer. A
+            // device failure discards it and needs a newly rendered generation.
+            return ReferenceEquals(_transientBitmap, accepted);
+        }
+        catch (Exception exception)
+        {
+            ExtendedDiagnostics.LogException("Direct2D transient bitmap import failed", exception,
+                $"gpu={gpu is not null}; bounds={bounds}");
+            HandleDeviceLoss("transient bitmap import");
+            return false;
+        }
+        finally
+        {
+            imported?.Dispose();
+            usage?.Dispose();
+        }
+    }
+
+    private void ReleaseTransientFrame()
+    {
+        var bitmap = _transientBitmap;
+        var usage = _transientGpuUsage;
+        _transientBitmap = null;
+        _transientGpuUsage = null;
+        if (ReferenceEquals(_leftBitmap, bitmap)) _leftBitmap = null;
+        if (ReferenceEquals(_rightBitmap, bitmap)) _rightBitmap = null;
+        // All frame draws end before the UI can replace this import. Keep the
+        // texture lease until the D2D bitmap/effect release has completed; the
+        // source then queues actual D3D destruction off the UI thread.
+        DisposeTransientColorEffect(bitmap);
+        try { bitmap?.Dispose(); }
+        finally { usage?.Dispose(); }
     }
 
     public void UpdateLayout(Rectangle leftBounds, Rectangle rightBounds)
@@ -426,6 +514,7 @@ internal sealed class Direct2DViewerSurface : Control
     public void ClearFrame()
     {
         ReleaseAnimatedGpuPages();
+        ReleaseTransientFrame();
         _leftBitmap = null;
         _rightBitmap = null;
         _zoomBaseBitmap = null;
@@ -536,7 +625,13 @@ internal sealed class Direct2DViewerSurface : Control
         }
         if (_renderTarget is not null || _deviceContext is not null ||
             !IsHandleCreated || ClientSize.Width <= 0 || ClientSize.Height <= 0) return;
+        if (!_swapChainRetirement.IsCompleted)
+        {
+            ScheduleDeviceRecovery("previous flip swap chain retirement");
+            return;
+        }
         if (TryCreateDeviceContextTarget()) return;
+        if (!_swapChainRetirement.IsCompleted) return;
         var properties = new RenderTargetProperties(
             RenderTargetType.Hardware,
             new Vortice.DCommon.PixelFormat(Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Ignore),
@@ -561,9 +656,14 @@ internal sealed class Direct2DViewerSurface : Control
 
     private bool TryCreateDeviceContextTarget()
     {
+        if (!_swapChainRetirement.IsCompleted) return false;
         var deviceUsage = GpuInteropDevice.AcquireUsage();
         if (deviceUsage is null) return false;
         var d3dDevice = deviceUsage.Device;
+        // Own the lease during partial creation too: a chain that was created
+        // before a later failure still needs old-device ClearState/Flush.
+        _sharedDeviceUsage = deviceUsage;
+        _deviceGeneration = deviceUsage.Generation;
         try
         {
             using var dxgiDevice = d3dDevice.QueryInterface<IDXGIDevice>();
@@ -586,9 +686,6 @@ internal sealed class Direct2DViewerSurface : Control
                     d3dDevice, Handle, description);
             }
             RecreateSwapChainTarget(resize: false);
-            _sharedDeviceUsage = deviceUsage;
-            deviceUsage = null;
-            _deviceGeneration = _sharedDeviceUsage.Generation;
             return _swapChainTarget is not null;
         }
         catch (Exception exception)
@@ -598,7 +695,6 @@ internal sealed class Direct2DViewerSurface : Control
             DisposeDeviceContextTarget();
             return false;
         }
-        finally { deviceUsage?.Dispose(); }
     }
 
     private void RecreateSwapChainTarget(bool resize)
@@ -630,6 +726,17 @@ internal sealed class Direct2DViewerSurface : Control
             return cached.Bitmap;
         }
 
+        var bitmap = CreateUploadedBitmap(source);
+        var node = _gpuLru.AddLast(source);
+        var item = new GpuCacheItem(bitmap,
+            Math.Max(1L, source.Width) * Math.Max(1L, source.Height) * 4L, node);
+        _gpuCache[source] = item;
+        _gpuCacheBytes += item.Bytes;
+        return bitmap;
+    }
+
+    private ID2D1Bitmap CreateUploadedBitmap(Bitmap source)
+    {
         Bitmap? converted = null;
         var upload = source;
         if (source.PixelFormat != System.Drawing.Imaging.PixelFormat.Format32bppPArgb)
@@ -638,10 +745,11 @@ internal sealed class Direct2DViewerSurface : Control
             upload = converted;
         }
         var rect = new Rectangle(0, 0, upload.Width, upload.Height);
-        var data = upload.LockBits(rect, ImageLockMode.ReadOnly,
-            System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+        BitmapData? data = null;
         try
         {
+            data = upload.LockBits(rect, ImageLockMode.ReadOnly,
+                System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
             if (data.Stride <= 0) throw new InvalidOperationException("Direct2D requires a top-down bitmap surface.");
             ID2D1Bitmap bitmap;
             if (_deviceContext is not null)
@@ -659,16 +767,11 @@ internal sealed class Direct2DViewerSurface : Control
                 bitmap = _renderTarget!.CreateBitmap(
                     new SizeI(source.Width, source.Height), data.Scan0, (uint)data.Stride, properties);
             }
-            var node = _gpuLru.AddLast(source);
-            var item = new GpuCacheItem(bitmap,
-                Math.Max(1L, source.Width) * Math.Max(1L, source.Height) * 4L, node);
-            _gpuCache[source] = item;
-            _gpuCacheBytes += item.Bytes;
             return bitmap;
         }
         finally
         {
-            upload.UnlockBits(data);
+            if (data is not null) upload.UnlockBits(data);
             converted?.Dispose();
         }
     }
@@ -881,6 +984,11 @@ internal sealed class Direct2DViewerSurface : Control
     {
         _deviceRecoveryTimer.Stop();
         if (IsDisposed || Disposing || !IsHandleCreated || !Visible) return;
+        if (!_swapChainRetirement.IsCompleted)
+        {
+            ScheduleDeviceRecovery("previous flip swap chain retirement");
+            return;
+        }
         try
         {
             EnsureRenderTarget();
@@ -1063,25 +1171,40 @@ internal sealed class Direct2DViewerSurface : Control
 
     private void DisposeDeviceContextTarget()
     {
+        var hadSwapChain = _swapChain is not null;
+        var oldDeviceUsage = _sharedDeviceUsage;
+        _sharedDeviceUsage = null;
         DisposeColorResources();
         if (_deviceContext is not null) _deviceContext.Target = null;
         _swapChainTarget?.Dispose();
         _swapChainTarget = null;
-        _swapChain?.Dispose();
-        _swapChain = null;
         _deviceContext?.Dispose();
         _deviceContext = null;
         _d2dDevice?.Dispose();
         _d2dDevice = null;
-        _sharedDeviceUsage?.Dispose();
-        _sharedDeviceUsage = null;
+        _swapChain?.Dispose();
+        _swapChain = null;
         _deviceGeneration = -1;
+        if (oldDeviceUsage is not null)
+        {
+            if (hadSwapChain)
+            {
+                // Flip chains retain their HWND association until deferred D3D
+                // destruction is flushed on the OLD device. Do not block the
+                // UI, and do not create another chain while this is pending.
+                var retirement = GpuInteropDevice.FlushReleasedSwapChainAsync(oldDeviceUsage);
+                _swapChainRetirement = _swapChainRetirement.IsCompleted
+                    ? retirement : Task.WhenAll(_swapChainRetirement, retirement);
+            }
+            else oldDeviceUsage.Dispose();
+        }
     }
 
     private void DisposeBitmaps()
     {
         _gpuTrimTimer.Stop();
         ReleaseAnimatedGpuPages();
+        ReleaseTransientFrame();
         _leftBitmap = null;
         _rightBitmap = null;
         _zoomBaseBitmap = null;

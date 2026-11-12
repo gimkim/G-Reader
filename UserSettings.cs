@@ -10,6 +10,13 @@ internal sealed class HistoryEntry
     public DateTime LastOpenedUtc { get; set; }
 }
 
+internal sealed class ManhwaReadingPosition
+{
+    public string PageName { get; set; } = string.Empty;
+    public int SourceTop { get; set; }
+    public int Rotation { get; set; }
+}
+
 internal sealed class UserSettings
 {
     private static string NewPersistentCachePath => Path.Combine(
@@ -34,6 +41,10 @@ internal sealed class UserSettings
     public bool AutoSingleLandscape { get; set; } = true;
     public bool ClickToNavigate { get; set; } = true;
     public bool ThumbnailMode { get; set; }
+    public bool ManhwaMode { get; set; }
+    public int ManhwaWidthPercent { get; set; } = 50;
+    public Dictionary<string, ManhwaReadingPosition> RememberedManhwaPositions { get; set; } =
+        new(StringComparer.OrdinalIgnoreCase);
     public int ThumbnailImagesPerRow { get; set; } = 6;
     public Dictionary<string, int> ToolbarHotkeys { get; set; } = ToolbarHotkeyCatalog.CreateDefaults();
     public bool JapaneseMode { get; set; }
@@ -157,6 +168,7 @@ internal sealed class UserSettings
                 settings.GlobalFastPreviewConcurrency = Math.Clamp(
                     settings.FastPreviewWorkerCount * settings.FastPreviewThreadsPerWorker,
                     1, Math.Clamp(Environment.ProcessorCount, 1, 64));
+            settings.ManhwaWidthPercent = Math.Clamp(settings.ManhwaWidthPercent, 1, 100);
             settings.HistoryMaximumItems = Math.Clamp(
                 settings.HistoryMaximumItems, 1, 1000);
             settings.HistoryEntries = (settings.HistoryEntries ?? [])

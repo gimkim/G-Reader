@@ -20,6 +20,7 @@ internal static class ToolbarHotkeyCatalog
     public const string Right = "right";
     public const string End = "end";
     public const string ViewMode = "view_mode";
+    public const string ManhwaMode = "manhwa_mode";
     public const string PageLayout = "page_layout";
     public const string AutoSingleLandscape = "auto_single_landscape";
     public const string ReadingDirection = "reading_direction";
@@ -43,6 +44,7 @@ internal static class ToolbarHotkeyCatalog
         new(Right, "Right", "Page navigation", Keys.Right),
         new(End, "End", "Page navigation", Keys.End),
         new(ViewMode, "Full page / Thumbnail grid", "Reading view", Keys.Control | Keys.T),
+        new(ManhwaMode, "Toggle Manhwa mode", "Reading view", Keys.None),
         new(PageLayout, "Page layout", "Reading view", Keys.Control | Keys.D),
         new(AutoSingleLandscape, "Auto-single landscape", "Reading view", Keys.Control | Keys.Shift | Keys.A),
         new(ReadingDirection, "LTR / RTL", "Reading view", Keys.Control | Keys.J),

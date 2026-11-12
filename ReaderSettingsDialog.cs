@@ -123,6 +123,7 @@ internal sealed class ReaderSettingsDialog : Form
         MinimumSize = new Size(0, 76), Padding = new Padding(0, 4, 0, 4)
     };
     private readonly ComboBox _autoMove = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
+    private readonly NumericUpDown _manhwaWidthPercent = CreateCountInput(1, 100);
     private readonly CheckBox _rememberReadingPosition = new SettingsWrapCheckBox()
     {
         Text = "Remember the last page separately for each folder, archive, and PDF",
@@ -195,6 +196,7 @@ internal sealed class ReaderSettingsDialog : Form
     public string BenchmarkSummary { get; private set; } = string.Empty;
     public Color ReaderBackground { get; private set; }
     public int AutoMoveMode => _autoMove.SelectedIndex;
+    public int ManhwaWidthPercent => (int)_manhwaWidthPercent.Value;
     public bool RememberReadingPosition => _rememberReadingPosition.Checked;
     public bool HistoryEnabled => _historyEnabled.Checked;
     public int HistoryMaximumItems => (int)_historyMaximumItems.Value;
@@ -328,6 +330,7 @@ internal sealed class ReaderSettingsDialog : Form
             "Auto move — both folders and archives/PDFs"
         ]);
         _autoMove.SelectedIndex = Math.Clamp(settings.AutoMoveMode, 0, 3);
+        SetValue(_manhwaWidthPercent, settings.ManhwaWidthPercent);
         _rememberReadingPosition.Checked = settings.RememberReadingPosition;
         _historyEnabled.Checked = settings.HistoryEnabled;
         _historyMaximumItems.Value = Math.Clamp(settings.HistoryMaximumItems,
@@ -630,6 +633,10 @@ internal sealed class ReaderSettingsDialog : Form
                 "Control the canvas appearance and color correction used on the active monitor.",
                 ("Monitor color management", _useMonitorColorProfile),
                 ("Background color", colorRow)),
+            CreateSection("Reading layout",
+                "Control the size of long images in Manhwa mode.",
+                ("Manhwa width (%)", Explain(_manhwaWidthPercent,
+                    "Width as a percentage of the reading area (1–100%). Lower values reduce magnification and recalculate the image sections; 50% uses half the available width."))),
             CreateSection("Library navigation",
                 "At a book boundary, follow the same ordered folder/archive list shown in Thumbnail view.",
                 ("Automatic move", _autoMove),

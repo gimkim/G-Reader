@@ -20,6 +20,7 @@ internal static class GpuInteropDevice
     internal sealed class DeviceHolder(ID3D11Device device, long generation)
     {
         public ID3D11Device Device { get; } = device;
+        public object ImmediateContextGate { get; } = new();
         public long Generation { get; } = generation;
         public int Users;
         public bool Retired;
@@ -41,6 +42,24 @@ internal static class GpuInteropDevice
                     throw new ObjectDisposedException(nameof(DeviceUsageLease));
                 holder.Users++;
                 return new DeviceUsageLease(holder);
+            }
+        }
+        internal void FlushReleasedSwapChain()
+        {
+            var holder = _holder ?? throw new ObjectDisposedException(nameof(DeviceUsageLease));
+            lock (holder.ImmediateContextGate)
+            {
+                // Get a fresh COM reference. Device.ImmediateContext caches its
+                // managed wrapper and must not be disposed by this operation.
+                using var context = holder.Device.ImmediateContext.QueryInterface<ID3D11DeviceContext>();
+                using var multithread = context.QueryInterfaceOrNull<ID3D11Multithread>();
+                multithread?.Enter();
+                try
+                {
+                    context.ClearState();
+                    context.Flush();
+                }
+                finally { multithread?.Leave(); }
             }
         }
         public void Dispose()
@@ -231,6 +250,23 @@ internal static class GpuInteropDevice
         }
     }
 
+    /// <summary>Takes ownership of the old device lease while DXGI releases its HWND association.</summary>
+    public static Task FlushReleasedSwapChainAsync(DeviceUsageLease usage) => Task.Run(() =>
+    {
+        try
+        {
+            usage.FlushReleasedSwapChain();
+            ExtendedDiagnostics.Breadcrumb(
+                $"Released flip swap chain flushed: generation={usage.Generation}");
+        }
+        catch (Exception exception)
+        {
+            ExtendedDiagnostics.LogException("Released flip swap chain flush failed", exception,
+                $"generation={usage.Generation}");
+        }
+        finally { usage.Dispose(); }
+    });
+
     public static bool EnsureCreated()
     {
         if (Volatile.Read(ref _initializationState) != 0)
@@ -248,6 +284,9 @@ internal static class GpuInteropDevice
                 var device = D3D11CreateDevice(
                     DriverType.Hardware, DeviceCreationFlags.BgraSupport,
                     levels[0], levels[1], levels[2], levels[3]);
+                using (var context = device.ImmediateContext.QueryInterface<ID3D11DeviceContext>())
+                using (var multithread = context.QueryInterfaceOrNull<ID3D11Multithread>())
+                    multithread?.SetMultithreadProtected(true);
                 _currentDevice = new DeviceHolder(device, _generation);
             }
             catch { _currentDevice = null; }
@@ -323,7 +362,8 @@ internal static class GpuInteropDevice
     }
 
     public static unsafe GpuRenderedImage? CreateImageFromBgra(
-        byte[] pixels, int width, int height, bool pixelsArePremultiplied = false)
+        byte[] pixels, int width, int height, bool pixelsArePremultiplied = false,
+        byte[]? encodedJpeg = null)
     {
         using var usage = AcquireUsage();
         if (usage is null || width <= 0 || height <= 0) return null;
@@ -354,7 +394,7 @@ internal static class GpuInteropDevice
                 };
                 texture = usage.Device.CreateTexture2D(description, initial);
                 var result = new GpuRenderedImage(
-                    texture, IntPtr.Zero, width, height, _ => { }, usage);
+                    texture, IntPtr.Zero, width, height, _ => { }, usage, encodedJpeg);
                 texture = null;
                 return result;
             }

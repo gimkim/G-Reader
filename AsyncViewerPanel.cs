@@ -10,7 +10,7 @@ internal sealed class ZoomPatchSurface(Bitmap? bitmap, GpuRenderedImage? gpu) : 
     public void Dispose() { Bitmap?.Dispose(); Gpu?.Dispose(); Bitmap = null; Gpu = null; }
 }
 
-internal sealed class AsyncViewerPanel : Panel
+internal sealed partial class AsyncViewerPanel : Panel
 {
     internal readonly record struct PreRenderContext(
         Size ClientSize, bool FitToScreen, float Zoom, long Version, int LanczosQuality);
@@ -596,6 +596,13 @@ internal sealed class AsyncViewerPanel : Panel
             // every pre-rendered page.
             if (Size == _lastRenderControlSize) return;
             _lastRenderControlSize = Size;
+            if (ManhwaMode)
+            {
+                ResizeManhwaPage();
+                _resizeDebounce.Stop();
+                _resizeDebounce.Start();
+                return;
+            }
             if (_zoomMode)
             {
                 StopZoomTransition(scheduleDetail: false);
@@ -615,6 +622,12 @@ internal sealed class AsyncViewerPanel : Panel
         {
             _resizeDebounce.Stop();
             _renderContextVersion++;
+            if (ManhwaMode)
+            {
+                _ = RenderManhwaPartAsync();
+                ViewportRenderContextChanged?.Invoke(this, EventArgs.Empty);
+                return;
+            }
             BeginRender();
             ViewportRenderContextChanged?.Invoke(this, EventArgs.Empty);
         };
@@ -631,6 +644,12 @@ internal sealed class AsyncViewerPanel : Panel
         Image? first, Image? second, string? firstKey, string? secondKey,
         int firstIndex, int secondIndex)
     {
+        if (ManhwaMode)
+        {
+            RetireSource(first);
+            RetireSource(second);
+            return;
+        }
         CancelRender();
         RetireSource(_first);
         RetireSource(_second);
@@ -646,7 +665,7 @@ internal sealed class AsyncViewerPanel : Panel
     public void SetAnimationFrames(
         int pageIndex, AnimationFrameSet frames, int rotation = 0)
     {
-        if ((!frames.IsGpuStream && frames.Count <= 1) || frames.Count == 0 ||
+        if (ManhwaMode || (!frames.IsGpuStream && frames.Count <= 1) || frames.Count == 0 ||
             (pageIndex != _firstIndex && pageIndex != _secondIndex))
         {
             DisposeAnimationFramesInBackground(frames);
@@ -703,6 +722,12 @@ internal sealed class AsyncViewerPanel : Panel
         Bitmap first, Bitmap? second, int firstIndex, int secondIndex,
         bool refitAfterPendingLayout = false)
     {
+        if (ManhwaMode)
+        {
+            RetireSource(first);
+            RetireSource(second);
+            return;
+        }
         CancelRender();
         _renderVersion++;
         RetireSource(_first);
@@ -739,7 +764,7 @@ internal sealed class AsyncViewerPanel : Panel
             // the first hidden viewer's ~512 px/native cached size.
             BeginInvoke(new Action(() =>
             {
-                if (IsDisposed || !FitToScreen || _zoomMode) return;
+                if (IsDisposed || !FitToScreen || _zoomMode || ManhwaMode) return;
                 RelayoutDisplayedFrame();
             }));
         }
@@ -748,6 +773,7 @@ internal sealed class AsyncViewerPanel : Panel
     public bool TryPresentCachedPages(
         string firstKey, string? secondKey, int firstIndex, int secondIndex)
     {
+        if (ManhwaMode) return false;
         var visiblePageCount = secondIndex >= 0 ? 2 : 1;
         if (TryPresentGpuCachedPages(
                 firstKey, secondKey, firstIndex, secondIndex, visiblePageCount))
@@ -847,7 +873,7 @@ internal sealed class AsyncViewerPanel : Panel
     public void AttachSourcesIfCurrent(
         Bitmap first, Bitmap? second, int firstIndex, int secondIndex)
     {
-        if (_firstIndex != firstIndex || _secondIndex != secondIndex)
+        if (ManhwaMode || _firstIndex != firstIndex || _secondIndex != secondIndex)
         {
             DisposeSourceInBackground(first);
             if (second is not null) DisposeSourceInBackground(second);
@@ -893,6 +919,7 @@ internal sealed class AsyncViewerPanel : Panel
 
     public void ClearBookCache()
     {
+        CancelManhwaPage();
         StopAnimations();
         ReturnToFit();
         CancelRender();
@@ -919,6 +946,7 @@ internal sealed class AsyncViewerPanel : Panel
 
     public void RetireBookCache()
     {
+        CancelManhwaPage();
         StopAnimations();
         ReturnToFit();
         CancelRender();
@@ -1058,10 +1086,9 @@ internal sealed class AsyncViewerPanel : Panel
             if (!AddPreviewOwned(previewKey, preview.Bitmap)) preview.Bitmap.Dispose();
         }
 
-        // Direct CUDA-D3D handoff is valuable for the page requested by the user
-        // because it avoids a host copy. Background warming instead uses the
-        // staged nvJPEG path below: it keeps GPU decode/resize performance while
-        // avoiding hundreds of register/unregister operations and driver churn.
+        // Interactive pages keep a GPU-resident output with priority over
+        // background warming. Both routes stage the bounded resized result;
+        // repeatedly registering CUDA-D3D textures can fail inside the driver.
         if (interactiveFull)
         {
             var gpuRendered = await RenderWorkScheduler.RunInteractiveFullAsync(
@@ -1100,6 +1127,7 @@ internal sealed class AsyncViewerPanel : Panel
 
     public void ZoomAtWheel(int delta, Point clientAnchor)
     {
+        if (ManhwaMode) return;
         if (delta == 0) return;
         var factor = Math.Pow(1.0015d, delta);
         if (!_zoomMode)
@@ -1126,7 +1154,7 @@ internal sealed class AsyncViewerPanel : Panel
 
     private async void OnViewerMouseDoubleClick(object? sender, MouseEventArgs e)
     {
-        if (ClickToNavigate) return;
+        if (ClickToNavigate || ManhwaMode) return;
         CancelPageClick();
         if (e.Button != MouseButtons.Left) return;
         if (_zoomMode) StartReturnToFitTransition();
@@ -1135,7 +1163,7 @@ internal sealed class AsyncViewerPanel : Panel
 
     private async Task EnterZoomAsync(Point anchor, bool fromFitWheel)
     {
-        if (_zoomEntering || _zoomMode || ZoomSourceSizeRequested is null) return;
+        if (ManhwaMode || _zoomEntering || _zoomMode || ZoomSourceSizeRequested is null) return;
         if (!TryGetZoomPage(anchor, out var useRight, out var pageIndex, out var fitBounds)) return;
         var dualPage = TryGetVisualPageIndices(out var leftPageIndex, out var rightPageIndex);
         _zoomEntering = true;
@@ -1887,6 +1915,7 @@ internal sealed class AsyncViewerPanel : Panel
 
     public void ZoomBy(float factor)
     {
+        if (ManhwaMode) return;
         factor = Math.Clamp(factor, 0.05f, 20f);
         var center = new Point(ClientSize.Width / 2, ClientSize.Height / 2);
         if (_zoomMode) ApplyZoomFactor(factor, center);
@@ -1900,6 +1929,7 @@ internal sealed class AsyncViewerPanel : Panel
 
     public void SetZoom(float value)
     {
+        if (ManhwaMode) return;
         value = Math.Clamp(value, 0.05f, 8f);
         var center = new Point(ClientSize.Width / 2, ClientSize.Height / 2);
         if (_zoomMode) ApplyZoomFactor(value / Math.Max(0.0001f, _zoomScale), center);
@@ -1916,7 +1946,7 @@ internal sealed class AsyncViewerPanel : Panel
     private void AdvanceAnimations()
     {
         _animationTimer.Stop();
-        if (_zoomMode || _activeAnimations.Count == 0) return;
+        if (ManhwaMode || _zoomMode || _activeAnimations.Count == 0) return;
         var now = Environment.TickCount64;
         foreach (var animation in _activeAnimations.Values)
         {
@@ -1979,6 +2009,7 @@ internal sealed class AsyncViewerPanel : Panel
     {
         if (disposing)
         {
+            CancelManhwaPage();
             _resizeDebounce.Dispose();
             _zoomRenderDebounce.Dispose();
             _zoomTransitionTimer.Dispose();
@@ -2014,6 +2045,11 @@ internal sealed class AsyncViewerPanel : Panel
     private async Task BeginRenderCoreAsync()
     {
         if (IsDisposed || Disposing) return;
+        if (ManhwaMode)
+        {
+            await RenderManhwaPartAsync();
+            return;
+        }
         CancelRender();
         var cancellation = new CancellationTokenSource();
         _renderCancellation = cancellation;

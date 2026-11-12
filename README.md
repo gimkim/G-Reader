@@ -126,6 +126,18 @@ Fast Reader/Viewer separates interactive display work from decoding, preview gen
 - Thumbnail labels, placeholders, vector icons, badges, and the overlay scrollbar use DirectWrite/Direct2D rather than GDI+ painting.
 - Static page navigation can reuse a GPU-side LRU of recently uploaded surfaces.
 - Fast previews are scheduled ahead of final-quality Lanczos work.
+- The Manhwa toolbar button fits images from folders and archives to a configured
+  percentage of the reading area's width and displays a tall image in
+  consecutive screen-height sections. Next/previous, mouse page turns, and the
+  mouse wheel move through sections before changing images; moving back to a
+  previous image opens its last section. The last section keeps its scale and
+  may leave space below. The status bar shows the current section. The mode and
+  reading section are remembered, and resizing keeps the current source area
+  in view. PDFs continue to use the normal reading layout. Single/dual-page
+  preferences are restored when Manhwa mode is turned off.
+  The adjacent percentage button offers common widths. Set any width from
+  1–100% in Settings > General > Reading layout > Manhwa width (%); the default
+  is 50%. Images stay centered and changing width preserves the reading area.
 - Folder, archive, and PDF contact sheets use the same two-stage policy as image thumbnails: a fast contact sheet appears first, then a separately cached Lanczos contact sheet replaces it. Fast and final entries have independent RAM and persistent-disk identities.
 - PDF rendering uses a configurable pool of 1-16 isolated native PDFium worker processes (four by default), allowing multiple pages to render concurrently without sharing PDFium global state. Workers keep document handles warm and return direct BGRA pixels through binary pipes. Eligible single-image JPEG pages can instead pass their original encoded data to nvJPEG; pages with annotations, transforms, additional objects, or unsafe color profiles remain on PDFium.
 - Large JPEG files request a decoder-scaled DCT source near the useful output resolution, avoiding unnecessary full 45 MP managed bitmaps.
